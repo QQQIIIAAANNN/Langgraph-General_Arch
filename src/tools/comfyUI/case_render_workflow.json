@@ -1,0 +1,149 @@
+{
+  "1": {
+    "inputs": {
+      "clip_name1": "t5xxl_fp16.safetensors",
+      "clip_name2": "clip_l.safetensors",
+      "type": "flux",
+      "device": "default"
+    },
+    "class_type": "DualCLIPLoader",
+    "_meta": {
+      "title": "双CLIP加载器"
+    }
+  },
+  "2": {
+    "inputs": {
+      "unet_name": "flux1-dev.sft",
+      "weight_dtype": "fp8_e4m3fn"
+    },
+    "class_type": "UNETLoader",
+    "_meta": {
+      "title": "UNet加载器"
+    }
+  },
+  "3": {
+    "inputs": {
+      "prompt1": "timbercurve,1 building, overall building, nobody",
+      "prompt2": "A sleek, streamlined hyperbolic shell pavilion with a captivating timber grid structure, showcasing precision-crafted wooden components. The design emphasizes geometric elegance, enhancing stability while allowing abundant natural light through strategically placed skylights. The overall aesthetic exudes modernity and sustainability, harmonizing with the environment.",
+      "separator": ","
+    },
+    "class_type": "easy promptConcat",
+    "_meta": {
+      "title": "提示词联结"
+    }
+  },
+  "4": {
+    "inputs": {
+      "seed": "-1",
+      "sampler": "euler_a",
+      "scheduler": "beta",
+      "steps": "20",
+      "guidance": "2.5",
+      "max_shift": "",
+      "base_shift": "",
+      "denoise": "1.0",
+      "model": [
+        "49",
+        0
+      ],
+      "conditioning": [
+        "9",
+        0
+      ],
+      "latent_image": [
+        "11",
+        0
+      ]
+    },
+    "class_type": "FluxSamplerParams+",
+    "_meta": {
+      "title": "🔧 Flux Sampler Parameters"
+    }
+  },
+  "5": {
+    "inputs": {
+      "vae_name": "ae.safetensors"
+    },
+    "class_type": "VAELoader",
+    "_meta": {
+      "title": "加载VAE"
+    }
+  },
+  "6": {
+    "inputs": {
+      "samples": [
+        "4",
+        0
+      ],
+      "vae": [
+        "5",
+        0
+      ]
+    },
+    "class_type": "VAEDecode",
+    "_meta": {
+      "title": "VAE解码"
+    }
+  },
+  "9": {
+    "inputs": {
+      "clip_l": "",
+      "t5xxl": [
+        "3",
+        0
+      ],
+      "guidance": 3,
+      "clip": [
+        "1",
+        0
+      ]
+    },
+    "class_type": "CLIPTextEncodeFlux",
+    "_meta": {
+      "title": "CLIP文本编码Flux"
+    }
+  },
+  "11": {
+    "inputs": {
+      "width": 1024,
+      "height": 768,
+      "batch_size": 1
+    },
+    "class_type": "EmptyLatentImage",
+    "_meta": {
+      "title": "空Latent图像"
+    }
+  },
+  "49": {
+    "inputs": {
+      "lora_name": "FLUX\\timber-pavilion-000012.safetensors",
+      "strength_model": 0.5,
+      "strength_clip": 0.5,
+      "model": [
+        "2",
+        0
+      ],
+      "clip": [
+        "1",
+        0
+      ]
+    },
+    "class_type": "LoraLoader",
+    "_meta": {
+      "title": "加载LoRA"
+    }
+  },
+  "50": {
+    "inputs": {
+      "filename_prefix": "ComfyUI",
+      "images": [
+        "6",
+        0
+      ]
+    },
+    "class_type": "SaveImage",
+    "_meta": {
+      "title": "保存图像"
+    }
+  }
+}

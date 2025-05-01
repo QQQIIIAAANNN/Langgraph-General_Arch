@@ -1,0 +1,484 @@
+{
+  "3": {
+    "inputs": {
+      "seed": 340090360044129,
+      "steps": 30,
+      "cfg": 6,
+      "sampler_name": "dpmpp_2m",
+      "scheduler": "karras",
+      "denoise": 1,
+      "model": [
+        "75",
+        0
+      ],
+      "positive": [
+        "68",
+        0
+      ],
+      "negative": [
+        "68",
+        1
+      ],
+      "latent_image": [
+        "68",
+        2
+      ]
+    },
+    "class_type": "KSampler",
+    "_meta": {
+      "title": "KSampler"
+    }
+  },
+  "4": {
+    "inputs": {
+      "ckpt_name": "ARCHI\\architecturerealmix_v1repair.safetensors"
+    },
+    "class_type": "CheckpointLoaderSimple",
+    "_meta": {
+      "title": "Load Checkpoint"
+    }
+  },
+  "7": {
+    "inputs": {
+      "text": "blurry, noisy, messy, glitch, distorted, malformed, ill, horror, naked",
+      "clip": [
+        "4",
+        1
+      ]
+    },
+    "class_type": "CLIPTextEncode",
+    "_meta": {
+      "title": "CLIP Text Encode (Prompt)"
+    }
+  },
+  "8": {
+    "inputs": {
+      "samples": [
+        "3",
+        0
+      ],
+      "vae": [
+        "4",
+        2
+      ]
+    },
+    "class_type": "VAEDecode",
+    "_meta": {
+      "title": "VAE Decode"
+    }
+  },
+  "62": {
+    "inputs": {
+      "image": "download (1).jpg",
+      "upload": "image"
+    },
+    "class_type": "LoadImage",
+    "_meta": {
+      "title": "Load base Image"
+    }
+  },
+  "63": {
+    "inputs": {
+      "width": 1024,
+      "height": 0,
+      "interpolation": "nearest",
+      "method": "keep proportion",
+      "condition": "always",
+      "multiple_of": 0,
+      "image": [
+        "62",
+        0
+      ]
+    },
+    "class_type": "ImageResize+",
+    "_meta": {
+      "title": "🔧 Image Resize"
+    }
+  },
+  "64": {
+    "inputs": {
+      "ckpt_name": "depth_anything_vitl14.pth",
+      "resolution": 1024,
+      "image": [
+        "63",
+        0
+      ]
+    },
+    "class_type": "DepthAnythingPreprocessor",
+    "_meta": {
+      "title": "Depth Anything"
+    }
+  },
+  "66": {
+    "inputs": {
+      "strength": 1,
+      "start_percent": 0,
+      "end_percent": 1,
+      "positive": [
+        "77",
+        0
+      ],
+      "negative": [
+        "7",
+        0
+      ],
+      "control_net": [
+        "67",
+        0
+      ],
+      "image": [
+        "64",
+        0
+      ],
+      "vae": [
+        "4",
+        2
+      ]
+    },
+    "class_type": "ControlNetApplyAdvanced",
+    "_meta": {
+      "title": "Apply ControlNet"
+    }
+  },
+  "67": {
+    "inputs": {
+      "control_net_name": "models\\control_v11f1p_sd15_depth.pth"
+    },
+    "class_type": "ControlNetLoader",
+    "_meta": {
+      "title": "Load ControlNet Model"
+    }
+  },
+  "68": {
+    "inputs": {
+      "noise_mask": true,
+      "positive": [
+        "66",
+        0
+      ],
+      "negative": [
+        "66",
+        1
+      ],
+      "vae": [
+        "4",
+        2
+      ],
+      "pixels": [
+        "86",
+        0
+      ],
+      "mask": [
+        "76",
+        0
+      ]
+    },
+    "class_type": "InpaintModelConditioning",
+    "_meta": {
+      "title": "InpaintModelConditioning"
+    }
+  },
+  "69": {
+    "inputs": {
+      "rembg_session": [
+        "70",
+        0
+      ],
+      "image": [
+        "63",
+        0
+      ]
+    },
+    "class_type": "ImageRemoveBackground+",
+    "_meta": {
+      "title": "🔧 Image Remove Background"
+    }
+  },
+  "70": {
+    "inputs": {
+      "model": "u2net: general purpose",
+      "providers": "CPU"
+    },
+    "class_type": "RemBGSession+",
+    "_meta": {
+      "title": "🔧 RemBG Session"
+    }
+  },
+  "72": {
+    "inputs": {
+      "weight": 1,
+      "weight_type": "strong style transfer",
+      "combine_embeds": "concat",
+      "start_at": 0,
+      "end_at": 1,
+      "embeds_scaling": "K+V w/ C penalty",
+      "model": [
+        "73",
+        0
+      ],
+      "ipadapter": [
+        "73",
+        1
+      ],
+      "image": [
+        "74",
+        0
+      ]
+    },
+    "class_type": "IPAdapterAdvanced",
+    "_meta": {
+      "title": "IPAdapter Advanced"
+    }
+  },
+  "73": {
+    "inputs": {
+      "preset": "PLUS (high strength)",
+      "model": [
+        "4",
+        0
+      ]
+    },
+    "class_type": "IPAdapterUnifiedLoader",
+    "_meta": {
+      "title": "IPAdapter Unified Loader"
+    }
+  },
+  "74": {
+    "inputs": {
+      "image": "亂網格柵.jpg",
+      "upload": "image"
+    },
+    "class_type": "LoadImage",
+    "_meta": {
+      "title": "Load target Image"
+    }
+  },
+  "75": {
+    "inputs": {
+      "model": [
+        "72",
+        0
+      ]
+    },
+    "class_type": "DifferentialDiffusion",
+    "_meta": {
+      "title": "Differential Diffusion"
+    }
+  },
+  "76": {
+    "inputs": {
+      "expand": 0,
+      "tapered_corners": true,
+      "mask": [
+        "69",
+        1
+      ]
+    },
+    "class_type": "GrowMask",
+    "_meta": {
+      "title": "GrowMask"
+    }
+  },
+  "77": {
+    "inputs": {
+      "text": [
+        "79",
+        2
+      ],
+      "clip": [
+        "4",
+        1
+      ]
+    },
+    "class_type": "CLIPTextEncode",
+    "_meta": {
+      "title": "CLIP Text Encode (Prompt)"
+    }
+  },
+  "78": {
+    "inputs": {
+      "text": [
+        "79",
+        2
+      ],
+      "text2": "No watermark,reality,background buildings simplified,A tall, modern building with a clear blue sky in the background. the building appears to be a high-rise structure with a grid-like structure made of white, textured glass panels that are arranged in a grid pattern. The glass panels are evenly distributed throughout the building, creating a visually striking contrast between the bright blue sky and the white building. on the left side of the image, a tree can be seen, adding a touch of greenery to the otherwise monochromatic scene. the image is taken from a low angle, looking up at the building from below, giving a clear view of the entire structure."
+    },
+    "class_type": "ShowText|pysssss",
+    "_meta": {
+      "title": "Show Text 🐍"
+    }
+  },
+  "79": {
+    "inputs": {
+      "model": "promptgen_base_v2.0",
+      "folder_path": "Path to your image folder",
+      "caption_method": "extra",
+      "max_new_tokens": 1024,
+      "num_beams": 4,
+      "random_prompt": "never",
+      "prefix_caption": "No watermark,reality,background buildings simplified,",
+      "suffix_caption": "",
+      "replace_tags": "3d rendering:real; rendering: reality; black and white: colorful;1girl, solo,: ;night:day",
+      "images": [
+        "74",
+        0
+      ]
+    },
+    "class_type": "Miaoshouai_Tagger",
+    "_meta": {
+      "title": "🐾MiaoshouAI Tagger"
+    }
+  },
+  "81": {
+    "inputs": {
+      "text": "blurry, noisy, messy, glitch, distorted, malformed, ill, horror, naked, sunset",
+      "clip": [
+        "4",
+        1
+      ]
+    },
+    "class_type": "CLIPTextEncode",
+    "_meta": {
+      "title": "CLIP Text Encode (Prompt)"
+    }
+  },
+  "83": {
+    "inputs": {
+      "text": "City, building, tree, car, Modern Architecture, Mixed building",
+      "clip": [
+        "4",
+        1
+      ]
+    },
+    "class_type": "CLIPTextEncode",
+    "_meta": {
+      "title": "CLIP Text Encode (Prompt)"
+    }
+  },
+  "84": {
+    "inputs": {
+      "seed": 7,
+      "steps": 20,
+      "cfg": 6.5,
+      "sampler_name": "euler_ancestral",
+      "scheduler": "normal",
+      "denoise": 1,
+      "model": [
+        "4",
+        0
+      ],
+      "positive": [
+        "87",
+        0
+      ],
+      "negative": [
+        "87",
+        1
+      ],
+      "latent_image": [
+        "85",
+        0
+      ]
+    },
+    "class_type": "KSampler",
+    "_meta": {
+      "title": "KSampler"
+    }
+  },
+  "85": {
+    "inputs": {
+      "pixels": [
+        "62",
+        0
+      ],
+      "vae": [
+        "4",
+        2
+      ]
+    },
+    "class_type": "VAEEncode",
+    "_meta": {
+      "title": "VAE Encode"
+    }
+  },
+  "86": {
+    "inputs": {
+      "samples": [
+        "84",
+        0
+      ],
+      "vae": [
+        "4",
+        2
+      ]
+    },
+    "class_type": "VAEDecode",
+    "_meta": {
+      "title": "VAE Decode"
+    }
+  },
+  "87": {
+    "inputs": {
+      "strength": 1,
+      "start_percent": 0,
+      "end_percent": 1,
+      "positive": [
+        "83",
+        0
+      ],
+      "negative": [
+        "81",
+        0
+      ],
+      "control_net": [
+        "88",
+        0
+      ],
+      "image": [
+        "94",
+        0
+      ]
+    },
+    "class_type": "ControlNetApplyAdvanced",
+    "_meta": {
+      "title": "Apply ControlNet"
+    }
+  },
+  "88": {
+    "inputs": {
+      "control_net_name": "models\\control_v11p_sd15_lineart.pth"
+    },
+    "class_type": "ControlNetLoader",
+    "_meta": {
+      "title": "Load ControlNet Model"
+    }
+  },
+  "94": {
+    "inputs": {
+      "guassian_sigma": 6,
+      "intensity_threshold": 8,
+      "resolution": 1024,
+      "image": [
+        "63",
+        0
+      ]
+    },
+    "class_type": "LineartStandardPreprocessor",
+    "_meta": {
+      "title": "Standard Lineart"
+    }
+  },
+  "95": {
+    "inputs": {
+      "filename_prefix": "ComfyUI",
+      "images": [
+        "8",
+        0
+      ]
+    },
+    "class_type": "SaveImage",
+    "_meta": {
+      "title": "Save Image"
+    }
+  }
+}

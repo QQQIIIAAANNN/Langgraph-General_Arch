@@ -1,0 +1,262 @@
+{
+  "155": {
+    "inputs": {
+      "ckpt_name": "ARCHI\\architecturerealmix_v1repair.safetensors"
+    },
+    "class_type": "CheckpointLoaderSimple",
+    "_meta": {
+      "title": "Load Checkpoint"
+    }
+  },
+  "159": {
+    "inputs": {
+      "filename_prefix": "ComfyUI",
+      "images": [
+        "167",
+        0
+      ]
+    },
+    "class_type": "SaveImage",
+    "_meta": {
+      "title": "Save Image"
+    }
+  },
+  "166": {
+    "inputs": {
+      "seed": 189747157355218,
+      "steps": 25,
+      "cfg": 7.5,
+      "sampler_name": "euler_ancestral",
+      "scheduler": "normal",
+      "denoise": 1,
+      "model": [
+        "196",
+        0
+      ],
+      "positive": [
+        "189",
+        0
+      ],
+      "negative": [
+        "189",
+        1
+      ],
+      "latent_image": [
+        "179",
+        0
+      ]
+    },
+    "class_type": "KSampler",
+    "_meta": {
+      "title": "KSampler"
+    }
+  },
+  "167": {
+    "inputs": {
+      "samples": [
+        "166",
+        0
+      ],
+      "vae": [
+        "155",
+        2
+      ]
+    },
+    "class_type": "VAEDecode",
+    "_meta": {
+      "title": "VAE Decode"
+    }
+  },
+  "168": {
+    "inputs": {
+      "text": "text, watermark, blurry. Deformation, low-resolution, ugly, distortion.",
+      "clip": [
+        "155",
+        1
+      ]
+    },
+    "class_type": "CLIPTextEncode",
+    "_meta": {
+      "title": "Negative Text Encode (Negative Prompt)"
+    }
+  },
+  "177": {
+    "inputs": {
+      "text": "deteriorating building, outdated materials, energy inefficiency, poor ventilation, lack of natural light, high maintenance costs, environmental discomfort, climate vulnerability, structural degradation, user dissatisfaction, uncomfortable interior spaces, obsolete technology, wasted energy, unattractive urban landscape, neglect of ecological impact, compliance challenges, increasing operational issues, potential for future renovations",
+      "clip": [
+        "155",
+        1
+      ]
+    },
+    "class_type": "CLIPTextEncode",
+    "_meta": {
+      "title": "Positive Text Encode (Positive Prompt)"
+    }
+  },
+  "178": {
+    "inputs": {
+      "strength": 0.6,
+      "start_percent": 0.3,
+      "end_percent": 0.7000000000000001,
+      "positive": [
+        "177",
+        0
+      ],
+      "negative": [
+        "168",
+        0
+      ],
+      "control_net": [
+        "200",
+        0
+      ],
+      "image": [
+        "198",
+        0
+      ]
+    },
+    "class_type": "ControlNetApplyAdvanced",
+    "_meta": {
+      "title": "Apply ControlNet"
+    }
+  },
+  "179": {
+    "inputs": {
+      "pixels": [
+        "185",
+        0
+      ],
+      "vae": [
+        "155",
+        2
+      ]
+    },
+    "class_type": "VAEEncode",
+    "_meta": {
+      "title": "VAE Encode"
+    }
+  },
+  "182": {
+    "inputs": {
+      "control_net_name": "models\\control_v11p_sd15_lineart.pth"
+    },
+    "class_type": "ControlNetLoader",
+    "_meta": {
+      "title": "Load ControlNet Model"
+    }
+  },
+  "185": {
+    "inputs": {
+      "image": "image (3).png",
+      "upload": "image"
+    },
+    "class_type": "LoadImage",
+    "_meta": {
+      "title": "Load Image"
+    }
+  },
+  "186": {
+    "inputs": {
+      "guassian_sigma": 5,
+      "intensity_threshold": 16,
+      "resolution": 1024,
+      "image": [
+        "185",
+        0
+      ]
+    },
+    "class_type": "LineartStandardPreprocessor",
+    "_meta": {
+      "title": "Standard Lineart"
+    }
+  },
+  "189": {
+    "inputs": {
+      "strength": 0.6,
+      "start_percent": 0.2,
+      "end_percent": 0.7000000000000001,
+      "positive": [
+        "178",
+        0
+      ],
+      "negative": [
+        "178",
+        1
+      ],
+      "control_net": [
+        "182",
+        0
+      ],
+      "image": [
+        "186",
+        0
+      ]
+    },
+    "class_type": "ControlNetApplyAdvanced",
+    "_meta": {
+      "title": "Apply ControlNet"
+    }
+  },
+  "195": {
+    "inputs": {
+      "preset": "PLUS (high strength)",
+      "model": [
+        "155",
+        0
+      ]
+    },
+    "class_type": "IPAdapterUnifiedLoader",
+    "_meta": {
+      "title": "IPAdapter Unified Loader"
+    }
+  },
+  "196": {
+    "inputs": {
+      "weight": 0.5,
+      "weight_type": "strong style transfer",
+      "combine_embeds": "concat",
+      "start_at": 0,
+      "end_at": 0.5,
+      "embeds_scaling": "K+V",
+      "model": [
+        "195",
+        0
+      ],
+      "ipadapter": [
+        "195",
+        1
+      ],
+      "image": [
+        "185",
+        0
+      ]
+    },
+    "class_type": "IPAdapterAdvanced",
+    "_meta": {
+      "title": "IPAdapter Advanced"
+    }
+  },
+  "198": {
+    "inputs": {
+      "ckpt_name": "depth_anything_vitl14.pth",
+      "resolution": 1024,
+      "image": [
+        "185",
+        0
+      ]
+    },
+    "class_type": "DepthAnythingPreprocessor",
+    "_meta": {
+      "title": "Depth Anything"
+    }
+  },
+  "200": {
+    "inputs": {
+      "control_net_name": "models\\control_v11f1p_sd15_depth.pth"
+    },
+    "class_type": "ControlNetLoader",
+    "_meta": {
+      "title": "Load ControlNet Model"
+    }
+  }
+}

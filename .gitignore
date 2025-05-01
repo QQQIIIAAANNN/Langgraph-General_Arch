@@ -1,0 +1,9 @@
+langgraph-env/ 
+.langgraph_api/ 
+.env 
+.cursorignore 
+knowledge/木構造文獻/
+knowledge/RAG data/
+knowledge/文獻原檔/
+General_Arch_graph2.py
+output/

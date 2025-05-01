@@ -1,0 +1,60 @@
+{
+  "67": {
+    "inputs": {
+      "image": "shell_future_0.png",
+      "upload": "image"
+    },
+    "class_type": "LoadImage",
+    "_meta": {
+      "title": "加载图像"
+    }
+  },
+  "84": {
+    "inputs": {
+      "mode": "single",
+      "seed": 527740594,
+      "ss_guidance_strength": 3,
+      "ss_sampling_steps": 20,
+      "slat_guidance_strength": 1.5,
+      "slat_sampling_steps": 20,
+      "mesh_simplify": 0.5,
+      "texture_size": 1024,
+      "texture_mode": "fast",
+      "fps": 15,
+      "multimode": "multidiffusion",
+      "project_name": "3d",
+      "save_glb": true,
+      "render_video": true,
+      "save_gaussian": false,
+      "save_texture": false,
+      "save_wireframe": false,
+      "model": [
+        "86",
+        0
+      ],
+      "images": [
+        "67",
+        0
+      ]
+    },
+    "class_type": "IF_TrellisImageTo3D",
+    "_meta": {
+      "title": "Trellis Image to 3D 🖼️➡️🎲"
+    }
+  },
+  "86": {
+    "inputs": {
+      "model_name": "TRELLIS-image-large",
+      "dinov2_model": "dinov2_vitl14_reg",
+      "use_fp16": true,
+      "attn_backend": "flash_attn",
+      "sparse_backend": "spconv",
+      "spconv_algo": "auto",
+      "smooth_k": false
+    },
+    "class_type": "IF_TrellisCheckpointLoader",
+    "_meta": {
+      "title": "Trellis Model Loader 💾"
+    }
+  }
+}

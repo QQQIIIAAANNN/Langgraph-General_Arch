@@ -1,0 +1,112 @@
+{
+  "areaMetrics": {
+    "customMetrics": [
+      {
+        "id": "ra",
+        "name": "RA",
+        "unitOfMeasurement": "SQUARE_METER",
+        "functionBreakdown": [
+          {
+            "functionId": "residential",
+            "functionName": "Residential",
+            "functionColor": "#FFEAA5",
+            "value": 0
+          },
+          {
+            "functionId": "commercial",
+            "functionName": "Commercial",
+            "functionColor": "#D8DCFF",
+            "value": 0
+          },
+          {
+            "functionId": "unspecified",
+            "functionName": "Unspecified",
+            "functionColor": "#FFFFFF",
+            "value": 100170.24230453112
+          }
+        ]
+      },
+      {
+        "id": "ef1",
+        "name": "GFA/Site area",
+        "functionBreakdown": [
+          {
+            "functionId": "unspecified",
+            "functionName": "Unspecified",
+            "functionColor": "#FFFFFF",
+            "value": 8.023654666883363
+          }
+        ]
+      },
+      {
+        "id": "ef2",
+        "name": "RA/GFA",
+        "functionBreakdown": [
+          {
+            "functionId": "unspecified",
+            "functionName": "Unspecified",
+            "functionColor": "#FFFFFF",
+            "value": 0.8999999999999998
+          }
+        ]
+      }
+    ],
+    "builtInMetrics": {
+      "grossFloorArea": {
+        "id": "gfa",
+        "name": "GFA",
+        "unitOfMeasurement": "SQUARE_METER",
+        "functionBreakdown": [
+          {
+            "functionId": "residential",
+            "functionName": "Residential",
+            "functionColor": "#FFEAA5",
+            "value": 0
+          },
+          {
+            "functionId": "commercial",
+            "functionName": "Commercial",
+            "functionColor": "#D8DCFF",
+            "value": 0
+          },
+          {
+            "functionId": "unspecified",
+            "functionName": "Unspecified",
+            "functionColor": "#FFFFFF",
+            "value": 111300.26922725682
+          }
+        ]
+      },
+      "siteArea": {
+        "id": "site_area",
+        "name": "Site Area",
+        "unitOfMeasurement": "SQUARE_METER",
+        "value": 13871.517886560454
+      },
+      "buildingCoverage": {
+        "id": "bc",
+        "name": "Building Coverage",
+        "unitOfMeasurement": "SQUARE_METER",
+        "value": 7906.6874255689145
+      }
+    },
+    "unitStatistics": {
+      "count": {
+        "id": "unit_count",
+        "name": "Number of units",
+        "unitOfMeasurement": "COUNT",
+        "value": 0
+      }
+    },
+    "parkingStatistics": {
+      "spots": 0,
+      "area": 0
+    }
+  },
+  "geoLocation": {
+    "latitude": 37.792980197039554,
+    "longitude": -122.39410826390073
+  },
+  "region": "US",
+  "northDirection": "20.112349353519733°"
+}

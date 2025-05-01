@@ -1,0 +1,25 @@
+虛擬環境啟動studio:
+
+
+
+langgraph-env\Scripts\activate
+langgraph dev
+
+
+好看符合低耗能適當成本。回應都市紋理、人文、物環影響。現代主義風格。
+
+高度設計感的臨時性木構造曲面pavilion，展示目的，需要結合地景發想、人文意涵。如同高度前衛的藝術品。
+
+優美的紀念碑兼眺望塔，大約三樓高，整體具有簡約的曲線與前瞻的造型，表面具有清晰且合理的結構分割線，由CLT板材組成
+
+forma:
+
+.venv\Scripts\activate
+
+react_flow
+npm run dev
+http://localhost:5173/
+
+
+請幫我進行有關qa agent的相關調整，當前工作流程是所有任務完成後先進入save final summary，再進入qa agent。  而我想改為: PM單獨連接到save final summary，一樣所有任務完成後進入；PM也單獨連接到qa agent。save final summary不再連接到qa agent，其餘不變。
+修改後的流程為，在PM Handle Interrupt Input時，如果檢測到用戶輸入為要求進行討論或QA時，則轉交給連接到qa agent的條件邊。 或者是所有任務完成後進入qa agent。
