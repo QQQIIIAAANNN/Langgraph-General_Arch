@@ -147,9 +147,9 @@ class ConfigManager:
                 "process_management": AgentConfig(
                     agent_name="process_management",
                     description="Responsible for planning and managing the task workflow.",
-                    llm=default_llm.copy(), # Use copy to avoid modification issues
+                    llm=default_llm.copy(),
                     prompts={
-                        "create_workflow": PromptConfig(  # MODIFIED
+                        "create_workflow": PromptConfig(
                             template="""
 You are a meticulous and **detail-oriented** workflow planner specializing in architecture and design tasks. Your goal is to break down a user's request into a **sequence of granular, executable task objectives** for a team of specialized agents, ensuring smooth data flow between steps.
 
@@ -167,7 +167,7 @@ Analyze the request and generate a **complete, logical, and DETAILED sequence of
 For **each** task in the sequence, you MUST specify:
 1.  `description`: High-level goal for this step (in {llm_output_language}).
 2.  `task_objective`: Specific outcome and method needed from the agent.
-3.  `inputs`: JSON object suggesting initial data needs (e.g., `{{"prompt": "..."}}`, `{{"image_path": "{{output_from_task_id_abc.filename}}"}}`, `{{"user_request": "..."}}`). Use placeholders like `{{output_from_task_id_xyz.key}}` where applicable. For files, suggest the key (`image_paths`, `video_paths`, `image_path`, `render_image`, `initial_image_path`). If a filename is known *from a specific previous output*, suggest it. Otherwise, indicate the need (e.g., `"REQUIRES_IMAGE_FROM_PREVIOUS_STEP"`). **Do not invent paths.** Use `{{"}}` if no input suggestion applies. NEVER use `null`.
+3.  `inputs`: JSON object suggesting initial data needs (e.g., `{{"prompt": "..."}}`, `{{"image_path": "{{output_from_task_id_abc.filename}}"}}`, `{{"user_request": "..."}}`). Use placeholders like `{{output_from_task_id_xyz.key}}` where applicable. For files, suggest the key (`image_paths`, `video_paths`, `image_path`, `render_image`, `initial_image_path`, `keyword`, `address`). If a filename is known *from a specific previous output*, suggest it. Otherwise, indicate the need (e.g., `"REQUIRES_IMAGE_FROM_PREVIOUS_STEP"`). **Do not invent paths.** Use `{{"}}` if no input suggestion applies. NEVER use `null`.
 4.  `requires_evaluation`: Boolean (`true`/`false`). Set to `true` for tasks needing analysis/assessment.
 5.  `selected_agent`: **(CRITICAL)** The **exact name** of the agent from the list below best suited for the `task_objective`. Mandatory for every task.
 
@@ -181,6 +181,8 @@ For **each** task in the sequence, you MUST specify:
 *   `CaseRenderAgent`: Architectural Rendering (ComfyUI) -> Needs `outer_prompt`, `i` (int), `strength` (string "0.0"-"0.8").
 *   `Generate3DAgent`: 3D MESH Model (.glb) Generation (Comfy3D) -> Needs `image_path` (string). Suited for **exploratory form-finding or generating detailed but less precise geometry**.
 *   `RhinoMCPCoordinator`: **Parametric/Precise 3D Modeling (Rhino)** -> Needs `user_request` (string command), optional `initial_image_path` (string path). Ideal for **multi-step Rhino operations, tasks requiring precise coordinates, dimensions, spatial relationships, or modifications to existing geometry**. Coordinates internal planning and tool calls within Rhino.
+*   `PinterestMCPCoordinator`: **Pinterest Image Search & Download** -> Needs `keyword` (string), optional `limit` (int). Downloads images based on the keyword.
+*   `OSMMCPCoordinator`: **Map Screenshot Generation (OpenStreetMap)** -> Needs `user_request` (string address). Geocodes the address and generates a map screenshot.
 *   `SimulateFutureAgent`: Future Scenario Simulation (ComfyUI) -> Needs `outer_prompt`, `render_image` (string filename).
 *   `LLMTaskAgent`: **Intermediate Processing & General Text Tasks** -> Needs `prompt`. Crucial for summarizing, extracting, reformatting, or generating prompts for other agents.
 *   `EvaAgent`: **General Evaluation Agent** -> Used for evaluating task outputs and final holistic review. Requires inputs prepared by `prepare_evaluation_inputs` or `prepare_final_evaluation_inputs`.
@@ -197,7 +199,7 @@ Respond in {llm_output_language}.
 """,
                             input_variables=["user_input", "llm_output_language"]
                         ),
-                        "failure_analysis": PromptConfig( # MODIFIED
+                        "failure_analysis": PromptConfig(
                             template="""
 Context: A task in an automated workflow has FAILED. Analyze the provided context to determine the failure type and suggest the best course of action aimed at RESOLVING the failure.
 
@@ -221,6 +223,8 @@ Last Feedback Log (Includes Eval Results like 'Assessment: Fail' if applicable):
 *   `CaseRenderAgent`: Architectural Rendering (ComfyUI) -> Needs `outer_prompt`, `i` (int), `strength` (string "0.0"-"0.8").
 *   `Generate3DAgent`: 3D MESH Model Generation (Comfy3D) -> Needs `image_path` (string).
 *   `RhinoMCPCoordinator`: Parametric/Precise 3D Modeling (Rhino) -> Needs `user_request`, optional `initial_image_path`.
+*   `PinterestMCPCoordinator`: Pinterest Image Search & Download -> Needs `keyword`, optional `limit`.
+*   `OSMMCPCoordinator`: Map Screenshot Generation (OpenStreetMap) -> Needs `user_request` (address).
 *   `SimulateFutureAgent`: Future Scenario Simulation (ComfyUI) -> Needs `outer_prompt`, `render_image` (string filename).
 *   `LLMTaskAgent`: Intermediate Processing & General Text Tasks -> Needs `prompt`.
 --- END AVAILABLE AGENT CAPABILITIES ---
@@ -234,9 +238,9 @@ Last Feedback Log (Includes Eval Results like 'Assessment: Fail' if applicable):
 
 *   **`FALLBACK_GENERAL`:** Propose a new task/sequence to fix the issue or try an alternative approach.
     *   **If Failure Type is 'evaluation'**: MUST return `new_tasks_list` with TWO tasks.
-        1.  **Task 1 (Alternative Generation/Execution):** Create a task based on `feedback_log`. Choose an appropriate agent **EXCEPT `EvaAgent`**. If `feedback_log` mentions geometric precision/modification issues, consider `RhinoMCPCoordinator`. If it needs image generation, consider `ImageGenerationAgent` or `CaseRenderAgent`. If text processing, use `LLMTaskAgent`. Define a **new `task_objective`** addressing the feedback. Suggest inputs `{{"}}`. Set `requires_evaluation=false`.
+        1.  **Task 1 (Alternative Generation/Execution):** Create a task based on `feedback_log`. Choose an appropriate agent **EXCEPT `EvaAgent`**. If `feedback_log` mentions geometric precision/modification issues, consider `RhinoMCPCoordinator`. If it needs image generation, consider `ImageGenerationAgent` or `CaseRenderAgent`. If it needs map screenshot, consider `OSMMCPCoordinator`. If text processing, use `LLMTaskAgent`. Define a **new `task_objective`** addressing the feedback. Suggest inputs `{{"}}`. Set `requires_evaluation=false`.
         2.  **Task 2 (Re-Evaluation):** Create an `EvaAgent` task. Set `selected_agent="EvaAgent"`, `task_objective="Evaluate outcome of the alternative task"`, `inputs={{}}`, `requires_evaluation=true`.
-    *   **If Failure Type is 'execution'**: Return `new_task` or `new_tasks_list`. Analyze `execution_error_log`. If it's an input error (e.g., bad path, wrong parameter), consider suggesting `LLMTaskAgent` first to prepare better inputs for the original agent, or switch to `RhinoMCPCoordinator` if precision is key. Define objective(s) to overcome the error. Suggest inputs `{{"}}`. Keep original `requires_evaluation` (`{original_requires_evaluation}`) unless logical.
+    *   **If Failure Type is 'execution'**: Return `new_task` or `new_tasks_list`. Analyze `execution_error_log`. If it's an input error (e.g., bad path, wrong parameter, geocoding failed), consider suggesting `LLMTaskAgent` first to prepare better inputs for the original agent (e.g., simplify address for `OSMMCPCoordinator`), or switch to `RhinoMCPCoordinator` if precision is key. Define objective(s) to overcome the error. Suggest inputs `{{"}}`. Keep original `requires_evaluation` (`{original_requires_evaluation}`) unless logical.
     *   Output JSON: `{{"action": "FALLBACK_GENERAL", ...}}`
 
 *   **`MODIFY`:** Modify the *current* failed task and retry it.
@@ -257,14 +261,14 @@ Last Feedback Log (Includes Eval Results like 'Assessment: Fail' if applicable):
                             input_variables=[
                                 "failure_context", "is_max_retries", "max_retries",
                                 "selected_agent_name", "task_description", "task_objective",
-                                "inputs_json", # Added original inputs for context
+                                "inputs_json",
                                 "execution_error_log",
                                 "feedback_log",
                                 "llm_output_language",
                                 "original_requires_evaluation"
                             ]
                         ),
-                        "process_interrupt": PromptConfig( # MODIFIED
+                        "process_interrupt": PromptConfig(
                             template="""
 You are a meticulous workflow manager reacting to a user interrupt during task execution. Analyze the user's interrupt request in the context of the overall goal and the currently planned task sequence. Decide the most appropriate action to take.
 
@@ -289,6 +293,8 @@ You are a meticulous workflow manager reacting to a user interrupt during task e
 *   `CaseRenderAgent`: Architectural Rendering (ComfyUI) -> Needs `outer_prompt`, `i`, `strength`.
 *   `Generate3DAgent`: 3D MESH Model Generation (Comfy3D) -> Needs `image_path`.
 *   `RhinoMCPCoordinator`: Parametric/Precise 3D Modeling (Rhino) -> Needs `user_request`, optional `initial_image_path`.
+*   `PinterestMCPCoordinator`: Pinterest Image Search & Download -> Needs `keyword`, optional `limit`.
+*   `OSMMCPCoordinator`: Map Screenshot Generation (OpenStreetMap) -> Needs `user_request` (address).
 *   `SimulateFutureAgent`: Future Scenario Simulation (ComfyUI) -> Needs `outer_prompt`, `render_image`.
 *   `LLMTaskAgent`: Intermediate Processing & General Text Tasks -> Needs `prompt`.
 *   `EvaAgent`: General Evaluation Agent.
@@ -324,8 +330,7 @@ Respond in {llm_output_language}.
                     description="Selects the appropriate specialized agent for a given task objective.",
                     llm=default_llm.copy(),
                     prompts={
-                        # "select_agent_prompt": REMOVED (Handled by PM)
-                        "prepare_tool_inputs_prompt": PromptConfig( # MODIFIED
+                        "prepare_tool_inputs_prompt": PromptConfig(
                             template="""
 You are an expert input preprocessor for specialized AI tools. Your goal is to take a high-level task objective, the overall user request, task history/outputs, and information about the selected tool, then generate the precise JSON input dictionary required by that specific tool using standardized keys.
 
@@ -359,28 +364,29 @@ You are an expert input preprocessor for specialized AI tools. Your goal is to t
 *   `strength`: (String, Default: "0.5") Rendering strength ("0.0"-"1.0"). For `CaseRenderAgent`.
 *   `render_image`: (String) FILENAME of the base image (in RENDER_CACHE_DIR). REQUIRED for `SimulateFutureAgent`. **Find correct FILENAME by parsing `aggregated_files_json` (look for files from previous renders).**
 *   `image_inputs`: (List of Strings, Optional) Input image paths/data for `ImageGenerationAgent`. Find paths in `aggregated_files_json`.
-*   `user_request`: (String) **Specific instruction/command for the MCP tool.** REQUIRED for `RhinoMCPCoordinator`. Generate based on `task_objective`, `task_description`, and `aggregated_outputs_json` if needed.
+*   `user_request`: (String) **Specific instruction/command for the MCP tool.** REQUIRED for `RhinoMCPCoordinator`. Also used for `OSMMCPCoordinator` (should contain the address). Generate based on `task_objective`, `task_description`, and `aggregated_outputs_json` if needed.
 *   `initial_image_path`: (String, Optional) FULL path to an image to be used as initial input/reference by `RhinoMCPCoordinator`. **Find VALID path by parsing `aggregated_files_json`** if the objective requires it.
+*   `keyword`: (String) Search term. REQUIRED for `PinterestMCPCoordinator`. Extract from objective/description.
+*   `limit`: (Integer, Optional, Default: 10) Number of images to search/download. For `PinterestMCPCoordinator`. Extract if specified.
 
 **Instructions:**
 1.  Analyze the **Current Task Objective/Description**, **Selected Tool**, and **Overall Goal**.
-2.  **Generate/Extract `prompt`, `outer_prompt`, or `user_request`**:
-    *   Generate the primary textual input based on the Objective/Description/Goal.
-    *   **For `RhinoMCPCoordinator`**: Synthesize a clear, actionable command for Rhino based on the task objective and description. This is the `user_request`.
-    *   If the task involves analyzing previous *textual* results, parse `aggregated_outputs_json` and incorporate relevant info into the prompt/user_request.
-    *   **For `ImageGenerationAgent`**: If based on previous text, parse `aggregated_outputs_json` to create a rich image generation prompt.
+2.  **Generate/Extract Textual Inputs (`prompt`, `outer_prompt`, `user_request`, `keyword`)**:
+    *   Generate/Extract the primary textual input based on the Objective/Description/Goal.
+    *   **For `RhinoMCPCoordinator`**: Synthesize a clear, actionable command for Rhino.
+    *   **For `PinterestMCPCoordinator`**: Extract the core search term for the `keyword`.
+    *   **For `OSMMCPCoordinator`**: Extract or formulate the target address/location string for the `user_request`. Ensure it's a clear address.
+    *   If analyzing previous *textual* results, parse `aggregated_outputs_json` and incorporate relevant info.
 3.  **Determine and Validate File Paths/Filenames (CRITICAL - Use Aggregated Data ONLY)**:
     *   If the tool requires file inputs (`image_paths`, `video_paths`, `image_path`, `render_image`, `initial_image_path`):
-        *   **Parse `aggregated_files_json`.** Identify files potentially relevant to the `{task_objective}`. Use `source_task_id` and context if needed.
-        *   Select the most appropriate file(s).
-        *   For path keys (`image_paths`, `video_paths`, `image_path`, `initial_image_path`), extract the `path` value.
-        *   For `render_image`, extract the `filename`.
-        *   **Verify paths exist** using the `path` value (or constructed path for `render_image`).
-        *   **If a required path/filename cannot be found/validated, RETURN THE ERROR JSON (step 7).** Do NOT invent paths.
-4.  **Handle Specific Parameters (`i`, `strength`, `top_k`)**: Extract/validate from suggestion/objective.
-5.  **Handle Retries**: Use `{error_feedback}` to modify inputs if appropriate.
+        *   **Parse `aggregated_files_json`.** Identify relevant files.
+        *   Select the most appropriate file(s). Extract `path` or `filename` as needed.
+        *   **Verify paths exist.**
+        *   **If a required path/filename cannot be found/validated, RETURN ERROR JSON (step 6).** Do NOT invent paths.
+4.  **Handle Specific Parameters (`i`, `strength`, `top_k`, `limit`)**: Extract/validate from suggestion/objective. Provide defaults if applicable (e.g., `limit` for Pinterest).
+5.  **Handle Retries**: Use `{error_feedback}` to modify inputs if appropriate (e.g., simplify address for `OSMMCPCoordinator` if previous geocoding failed).
 6.  **Construct Final JSON**: Create the final JSON dictionary using only the required standardized keys for `{selected_agent_name}`.
-7.  **Error Handling**: If critical inputs are missing/invalid (esp. unvalidated paths), return error JSON: `{{"error": "Missing/Invalid critical input [specify] for {selected_agent_name}, could not find/validate required data in aggregated history."}}`
+7.  **Error Handling**: If critical inputs are missing/invalid (esp. unvalidated paths or missing required text like `keyword` or `user_request` for MCP coordinators), return error JSON: `{{"error": "Missing/Invalid critical input [specify] for {selected_agent_name}, could not find/validate required data in aggregated history or objective."}}`
 
 **Output:** Return ONLY the final JSON input dictionary for the tool, or the error JSON. No other text.
 Language: {llm_output_language}
@@ -388,7 +394,6 @@ Language: {llm_output_language}
                             input_variables=[
                                 "selected_agent_name", "agent_description", "user_input",
                                 "task_objective", "task_description",
-                                # "initial_plan_suggestion_json", # Removed as LLM should derive from objective/history
                                 "aggregated_summary",
                                 "aggregated_outputs_json",
                                 "aggregated_files_json",
@@ -397,7 +402,7 @@ Language: {llm_output_language}
                         )
                     },
                     parameters={
-                         "specialized_agents_description": { # Ensure this matches create_workflow list
+                         "specialized_agents_description": {
                             "ArchRAGAgent": "Retrieves information from the architectural knowledge base based on a query.",
                             "ImageRecognitionAgent": "Analyzes and describes the content of one or more images based on a prompt.",
                             "VideoRecognitionAgent": "Analyzes the content of one or more videos or 3D models based on a prompt.",
@@ -406,6 +411,8 @@ Language: {llm_output_language}
                             "CaseRenderAgent": "Renders architectural images using ComfyUI based on a prompt, count, and strength.",
                             "Generate3DAgent": "Generates a 3D model and preview video from a single input image using ComfyUI diffusion.",
                             "RhinoMCPCoordinator": "Coordinates complex tasks within Rhino 3D using planning and multiple tool calls. Ideal for multi-step Rhino operations, tasks requiring precise coordinates/dimensions, or modifications to existing geometry.",
+                            "PinterestMCPCoordinator": "Searches for images on Pinterest based on a keyword and downloads them to a predefined cache directory.",
+                            "OSMMCPCoordinator": "Generates a map screenshot for a given address using OpenStreetMap and geocoding. Takes the address string as input.",
                             "SimulateFutureAgent": "Simulates future scenarios on a previously rendered image using ComfyUI based on a prompt.",
                             "LLMTaskAgent": "Handles general text-based tasks like analysis, summarization, reformatting, complex reasoning, or generating prompts.",
                             "EvaAgent": "Evaluates task outputs or the entire workflow based on criteria.",

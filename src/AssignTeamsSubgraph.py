@@ -39,15 +39,24 @@ from src.state import WorkflowState, TaskState # 從 state.py 導入狀態
 try:
     from src.mcp_test import (
         MCPAgentState, # Keep for type hinting internal state if desired
-        call_rhino_agent, agent_tool_executor,
+        call_rhino_agent,
+        # --- <<< ADDED: Import Pinterest and OSM agent functions >>> ---
+        call_pinterest_agent,
+        call_osm_agent, # <--- Add OSM import
+        # --- <<< END ADDED >>> ---
+        agent_tool_executor,
         should_continue as mcp_should_continue
     )
-    print("Successfully imported MCP components from src.mcp_test")
+    print("Successfully imported MCP components from src.mcp_test (Rhino, Pinterest, OSM, Executor, ShouldContinue)") # Update print
 except ImportError as e:
     print(f"WARNING: Could not import MCP components from src.mcp_test: {e}")
     # Define MCPAgentState as a simple Dict if import fails, for type hinting robustness
     MCPAgentState = Dict[str, Any]
     async def call_rhino_agent(*args, **kwargs): raise NotImplementedError("MCP import failed")
+    async def call_pinterest_agent(*args, **kwargs): raise NotImplementedError("MCP import failed")
+    # --- <<< ADDED: Dummy OSM function on import error >>> ---
+    async def call_osm_agent(*args, **kwargs): raise NotImplementedError("MCP import failed")
+    # --- <<< END ADDED >>> ---
     async def agent_tool_executor(*args, **kwargs): raise NotImplementedError("MCP import failed")
     def mcp_should_continue(*args, **kwargs): return END
 
@@ -78,11 +87,16 @@ _ta_file_handling_static = _full_static_config.agents.get("tool_agent", {}).para
 
 # --- Get static tool descriptions for AssignAgent ---
 agent_descriptions = _full_static_config.agents.get("assign_agent", {}).parameters.get("specialized_agents_description", {})
-# --- <<< NEW: Add RhinoMCPCoordinator Description if missing >>> ---
+# --- <<< NEW/UPDATED: Add/Ensure Agent Descriptions (including OSM) >>> ---
 # Ensure the description is available for prepare_tool_inputs_node
 if "RhinoMCPCoordinator" not in agent_descriptions:
      agent_descriptions["RhinoMCPCoordinator"] = "Coordinates complex tasks within Rhino 3D using planning and multiple tool calls. Ideal for multi-step Rhino operations or requests involving existing Rhino geometry analysis and modification. Takes the user request and optional image path."
-# --- <<< END NEW >>> ---
+if "PinterestMCPCoordinator" not in agent_descriptions:
+    agent_descriptions["PinterestMCPCoordinator"] = "Searches for images on Pinterest based on keywords and downloads them. Ideal for finding visual references or inspiration. Takes the user request (keywords) as input."
+# --- <<< ADDED: OSM Description >>> ---
+if "OSMMCPCoordinator" not in agent_descriptions:
+    agent_descriptions["OSMMCPCoordinator"] = "Generates a map screenshot for a given address using OpenStreetMap and geocoding. Takes the address string as input."
+# --- <<< END ADDED >>> ---
 
 # =============================================================================
 # 3. 常數設定 (Mostly static, okay to load from config or define here)
@@ -157,7 +171,7 @@ def _update_task_state_after_tool(
     outputs: Optional[Dict[str, Any]] = None,
     output_files: Optional[List[Dict[str, str]]] = None,
     error: Optional[Exception] = None,
-    mcp_result: Optional[Dict[str, Any]] = None # <<< NEW: Specific field for MCP results
+    mcp_result: Optional[Dict[str, Any]] = None # Still expecting a dict from MCP node
 ) -> TaskState:
     """Updates task state fields based on tool execution outcome, including MCP results."""
     if error:
@@ -172,37 +186,59 @@ def _update_task_state_after_tool(
         print(f"Task {current_task['task_id']}: Failure recorded. Status set to 'failed'.")
     else:
         # Success Path
-        # Prioritize standard outputs/files if provided
         current_task["outputs"] = outputs if outputs is not None else {}
         current_task["output_files"] = output_files if output_files is not None else []
 
-        # <<< NEW: Merge MCP results if available >>>
         if mcp_result:
-            print(f"Merging MCP result into task outputs: {mcp_result}")
-            # Add MCP result under a specific key to avoid conflicts
-            current_task["outputs"]["mcp_final_result"] = mcp_result.get("message", "MCP completed without specific message.")
-            # If MCP returned an image path/URI, add it to output_files
+            print(f"Merging MCP result into task outputs...")
+            mcp_history = mcp_result.get("mcp_message_history")
+            if mcp_history:
+                current_task["outputs"]["mcp_internal_messages"] = mcp_history
+                print(f"  Added {len(mcp_history)} messages from MCP internal history (raw objects).")
+
             saved_path = mcp_result.get("saved_image_path")
             saved_uri = mcp_result.get("saved_image_data_uri")
             if saved_path:
-                # Attempt to create a file entry
                 filename = os.path.basename(saved_path)
+                mime_type = "image/png" # Default
+                if saved_uri and saved_uri.startswith("data:image/"):
+                     try: mime_type = saved_uri.split(";", 1)[0].split(":", 1)[1]
+                     except IndexError: pass
+                elif saved_path:
+                    ext = os.path.splitext(saved_path)[1].lower()
+                    if ext in [".jpg", ".jpeg"]: mime_type = "image/jpeg"
+                    elif ext == ".gif": mime_type = "image/gif"
+                    elif ext == ".webp": mime_type = "image/webp"
+
                 file_entry = {
                     "filename": filename,
                     "path": saved_path,
-                    "type": "image/png", # Assuming PNG, adjust if needed
+                    "type": mime_type,
                     "description": "Final screenshot from MCP agent.",
                 }
-                # Add base64 if URI available
+                # <<< MODIFIED: Store full data URI in base64_data if available >>>
                 if saved_uri:
-                    file_entry["base64_data"] = saved_uri
+                    if saved_uri.startswith("data:"):
+                        # Store the full data URI directly
+                        file_entry["base64_data"] = saved_uri
+                        print(f"  Storing full data URI in base64_data: {saved_uri[:60]}...")
+                    else:
+                         # If not a data URI, attempt to read from path as fallback
+                         print(f"  Note: saved_uri provided ('{saved_uri[:50]}...') is not a data URI. Attempting to read base64 from path '{saved_path}'.")
+                         try:
+                              with open(saved_path, "rb") as f: encoded_string = base64.b64encode(f.read()).decode('utf-8')
+                              # Construct the data URI from path data
+                              file_entry["base64_data"] = f"data:{mime_type};base64,{encoded_string}"
+                              print(f"  Constructed and stored data URI from path in base64_data.")
+                         except Exception as e:
+                              print(f"  Warning: Could not read/encode image from path {saved_path}: {e}. base64_data will be missing.")
+                # <<< END MODIFIED >>>
+
                 current_task["output_files"].append(file_entry)
-        # <<< END NEW >>>
+                print(f"  Added MCP screenshot '{filename}' (type: {mime_type}) to output_files.")
 
         current_task["error_log"] = None
         current_task["feedback_log"] = None
-
-        # Status Logic remains the same: "completed", let PM/Eva handle next steps
         current_task["status"] = "completed"
         print(f"Task {current_task['task_id']}: Execution successful. Status: {current_task['status']}")
 
@@ -255,11 +291,11 @@ def _save_tool_output_file(filename: str, cache_dir: str, mime_type: str, descri
 # 6. Subgraph Node Definitions
 # =============================================================================
 
-# --- Node: Prepare Tool Inputs ---
+# --- Node: Prepare Tool Inputs (Modified) ---
 async def prepare_tool_inputs_node(state: WorkflowState, config: RunnableConfig) -> Dict[str, Any]:
     """
     Uses LLM to prepare the 'task_inputs' field in the current TaskState.
-    Includes logic for the new RhinoMCPCoordinator.
+    Includes logic for Rhino, Pinterest, and OSM MCP Coordinators.
     """
     node_name = "Prepare Tool Inputs"
     print(f"--- Running Node: {node_name} ---")
@@ -328,8 +364,13 @@ async def prepare_tool_inputs_node(state: WorkflowState, config: RunnableConfig)
     llm_output_language = runtime_config.get("global_llm_output_language", LLM_OUTPUT_LANGUAGE_DEFAULT)
     agent_description = agent_descriptions.get(selected_agent_name, "No description available.")
 
-    prompt_config_obj = config_manager.get_prompt("assign_agent", "prepare_tool_inputs_prompt")
-    prepare_inputs_prompt_template_str = prompt_config_obj.template if prompt_config_obj else None
+    # --- Updated Prompt Handling to use config_manager ---
+    prepare_inputs_prompt_template_str = None
+    aa_prompts_config = config_manager.get_agent_config("assign_agent").prompts
+    if aa_prompts_config:
+        prompt_config_obj = aa_prompts_config.get("prepare_tool_inputs_prompt")
+        if prompt_config_obj:
+            prepare_inputs_prompt_template_str = prompt_config_obj.template
 
     if not prepare_inputs_prompt_template_str:
         prep_error = "Input Preparation Failed: Missing 'prepare_tool_inputs_prompt' template!"
@@ -368,74 +409,92 @@ async def prepare_tool_inputs_node(state: WorkflowState, config: RunnableConfig)
                 err_msg = f"Input Prep Failed: LLM returned invalid format (expected dict). Content: {prep_content}"
                 _set_task_failed(current_task, err_msg, node_name)
             else:
-                # --- Validation (using imported constants and adding RhinoMCPCoordinator) ---
+                # --- Validation (including OSMMCPCoordinator) ---
                 agent_key_map = {
                     "ArchRAGAgent": ["prompt"], "WebSearchAgent": ["prompt"],
                     "ImageRecognitionAgent": ["image_paths", "prompt"], "VideoRecognitionAgent": ["video_paths", "prompt"],
                     "Generate3DAgent": ["image_path"], "CaseRenderAgent": ["outer_prompt", "i", "strength"],
                     "SimulateFutureAgent": ["outer_prompt", "render_image"], "ImageGenerationAgent": ["prompt"],
                     "LLMTaskAgent": ["prompt"],
-                    # <<< NEW: Define required inputs for Rhino coordinator >>>
-                    # LLM should extract the core request and optional image path here
-                    "RhinoMCPCoordinator": ["user_request"] # initial_image_path is optional
+                    "RhinoMCPCoordinator": ["user_request"], # initial_image_path is optional
+                    "PinterestMCPCoordinator": ["keyword"], # limit is optional
+                    # <<< ADDED: OSMMCPCoordinator inputs >>>
+                    "OSMMCPCoordinator": ["user_request"] # Contains the address
+                    # <<< END ADDED >>>
                 }
-                required_keys = agent_key_map.get(selected_agent_name, [])
+                # --- Optional Keys Handling ---
+                optional_keys = []
+                if selected_agent_name == "RhinoMCPCoordinator":
+                    optional_keys.append("initial_image_path")
+                elif selected_agent_name == "PinterestMCPCoordinator":
+                    optional_keys.append("limit")
+                # Add other optional keys here if needed
+
                 missing_keys = []
                 invalid_paths = []
                 invalid_values = []
 
-                for key in required_keys + (["initial_image_path"] if selected_agent_name == "RhinoMCPCoordinator" else []): # 檢查可選的 key
+                # Check required keys
+                required_keys = agent_key_map.get(selected_agent_name, [])
+                for key in required_keys:
                     value = prepared_inputs.get(key)
-                    is_optional_rhino_path = (selected_agent_name == "RhinoMCPCoordinator" and key == "initial_image_path")
+                    if value is None or (isinstance(value, (str, list)) and not value):
+                        missing_keys.append(key)
 
-                    # 檢查必需鍵是否存在且非空
-                    if key in required_keys and (value is None or (isinstance(value, (str, list)) and not value)):
-                         missing_keys.append(key)
-                         continue
-                    # 如果是可選的 Rhino 路徑，檢查是否存在且有效
-                    elif is_optional_rhino_path and value and (not isinstance(value, str) or not os.path.exists(value)):
-                         invalid_paths.append(f"{key}: '{value}' (Optional path provided but not found or invalid type)")
-                         continue
-                    elif not is_optional_rhino_path and value is None: # Skip if optional and not provided
-                         continue
+                # Check optional keys and validate if present
+                for key in optional_keys:
+                    value = prepared_inputs.get(key)
+                    if value is not None:
+                        if key == "initial_image_path":
+                            if not isinstance(value, str) or not os.path.exists(value):
+                                invalid_paths.append(f"{key}: '{value}' (Optional path provided but not found or invalid type)")
+                        elif key == "limit":
+                            try: int(value)
+                            except (ValueError, TypeError): invalid_values.append(f"{key}: '{value}' (Must be integer)")
+                        # Add other optional key validations
 
-                    # --- Type/Value/Path Validation (對其他 key 的驗證邏輯保持不變) ---
+                # Perform general validation on present keys
+                for key, value in prepared_inputs.items():
+                    if value is None: continue
+                    # --- Path/Value Validation (remains mostly the same) ---
                     if key in ["image_paths", "video_paths"] and isinstance(value, list):
                          for path in value:
                              if not isinstance(path, str) or not os.path.exists(path): invalid_paths.append(f"{key}: '{path}'")
-                    elif key == "image_path" and isinstance(value, str):
+                    elif key == "image_path" and isinstance(value, str) and key not in optional_keys: # Check it's required
                          if not os.path.exists(value): invalid_paths.append(f"{key}: '{value}'")
                     elif key == "render_image" and isinstance(value, str):
-                        # 檢查 cache 或 workspace 路徑
+                        # ... (render_image path check) ...
                         full_path_cache = os.path.join(RENDER_CACHE_DIR, value)
-                        full_path_output = os.path.join(OUTPUT_DIR, value) # 假設也可能在 output 根目錄
+                        full_path_output = os.path.join(OUTPUT_DIR, value) # Check output root
                         if not os.path.exists(full_path_cache) and not os.path.exists(full_path_output) and not os.path.exists(value):
                              invalid_paths.append(f"{key}: '{value}' (Not found in cache, output, or as absolute path)")
                     elif key == "i" and selected_agent_name == "CaseRenderAgent":
                          try: prepared_inputs[key] = int(value)
                          except (ValueError, TypeError): invalid_values.append(f"{key}: '{value}' (Must be int)")
                     elif key == "strength" and selected_agent_name == "CaseRenderAgent":
-                        try:
-                             strength_val = float(value)
-                             if not (0.0 <= strength_val <= 1.0): # Strength range might be 0-1 for some tools
-                                 print(f"Warning: CaseRenderAgent strength {strength_val} outside typical 0.0-0.8 range. Allowing 0.0-1.0.")
-                             prepared_inputs[key] = str(strength_val) # Keep as string if tool expects string
-                        except (ValueError, TypeError): invalid_values.append(f"{key}: '{value}' (Must be float-like string)")
-                    elif key in ["prompt", "outer_prompt", "user_request"] and not isinstance(value, str):
+                         try:
+                             strength_val = float(value); prepared_inputs[key] = str(strength_val) # Keep as string
+                             if not (0.0 <= strength_val <= 1.0): print(f"Warning: CaseRenderAgent strength {strength_val} outside typical 0.0-0.8 range. Allowing 0.0-1.0.")
+                         except (ValueError, TypeError): invalid_values.append(f"{key}: '{value}' (Must be float-like string)")
+                    elif key in ["prompt", "outer_prompt", "user_request", "keyword"] and not isinstance(value, str):
                          invalid_values.append(f"{key}: Value must be a string.")
 
-                if missing_keys or invalid_paths or invalid_values:
+                # Consolidate errors
+                unique_invalid_paths = list(set(invalid_paths))
+                unique_invalid_values = list(set(invalid_values))
+
+                if missing_keys or unique_invalid_paths or unique_invalid_values:
                     error_parts = []
                     if missing_keys: error_parts.append(f"Missing/empty required keys: {', '.join(missing_keys)}")
-                    if invalid_paths: error_parts.append(f"Invalid/missing paths: {', '.join(invalid_paths)}")
-                    if invalid_values: error_parts.append(f"Invalid values: {', '.join(invalid_values)}")
+                    if unique_invalid_paths: error_parts.append(f"Invalid/missing paths: {', '.join(unique_invalid_paths)}")
+                    if unique_invalid_values: error_parts.append(f"Invalid values: {', '.join(unique_invalid_values)}")
                     validation_err_msg = f"Input Validation Failed for {selected_agent_name}: {'. '.join(error_parts)}. LLM Output: {json.dumps(prepared_inputs, ensure_ascii=False)}"
                     _set_task_failed(current_task, validation_err_msg, node_name)
                 else:
                     print(f"{node_name}: Inputs prepared and validated successfully: {list(prepared_inputs.keys())}")
                     current_task["task_inputs"] = prepared_inputs
                     current_task["error_log"] = None; current_task["feedback_log"] = None
-                    current_task["status"] = "in_progress" # Ready for tool/coordinator execution
+                    current_task["status"] = "in_progress"
 
         except json.JSONDecodeError:
             err_msg = f"Input Prep Failed: Could not parse LLM JSON response. Raw content: '{prep_content}'"
@@ -452,41 +511,41 @@ async def prepare_tool_inputs_node(state: WorkflowState, config: RunnableConfig)
     return {"tasks": tasks, "current_task": current_task.copy()}
 
 
-# --- Tool Subgraph Router ---
-def determine_tool_route(state: WorkflowState) -> str: # 返回值改為 str
-    """Determines the next tool node based on the current task's selected agent."""
-    print(f"--- Tool Subgraph Router Node ---")
-    current_idx = state.get("current_task_index", -1)
-    tasks = state.get("tasks", [])
+# # --- Tool Subgraph Router ---
+# def determine_tool_route(state: WorkflowState) -> str: # 返回值改為 str
+#     """Determines the next tool node based on the current task's selected agent."""
+#     print(f"--- Tool Subgraph Router Node ---")
+#     current_idx = state.get("current_task_index", -1)
+#     tasks = state.get("tasks", [])
 
-    # 檢查索引有效性
-    if current_idx < 0 or current_idx >= len(tasks):
-        print("Tool Subgraph Router Error: Invalid task index."); return END # 直接返回 END
+#     # 檢查索引有效性
+#     if current_idx < 0 or current_idx >= len(tasks):
+#         print("Tool Subgraph Router Error: Invalid task index."); return "finished" # 直接返回 END
 
-    current_task = tasks[current_idx]
-    agent_name = current_task.get("selected_agent")
+#     current_task = tasks[current_idx]
+#     agent_name = current_task.get("selected_agent")
 
-    # 檢查 agent_name 是否存在
-    if not agent_name:
-        print(f"Tool Subgraph Router Error: No 'selected_agent'. Routing to END."); return END # 直接返回 END
+#     # 檢查 agent_name 是否存在
+#     if not agent_name:
+#         print(f"Tool Subgraph Router Error: No 'selected_agent'. Routing to END."); return "finished" # 直接返回 END
 
-    print(f"--- Tool Subgraph Router: Routing for agent '{agent_name}' ---")
+#     print(f"--- Tool Subgraph Router: Routing for agent '{agent_name}' ---")
 
-    node_mapping = {
-        "ArchRAGAgent": "rag_agent", "ImageGenerationAgent": "image_gen_agent",
-        "WebSearchAgent": "web_search_agent", "CaseRenderAgent": "case_render_agent",
-        "Generate3DAgent": "generate_3d_agent", "SimulateFutureAgent": "simulate_future_agent",
-        "VideoRecognitionAgent": "video_recognition_agent", "ImageRecognitionAgent": "image_recognition_agent",
-        "LLMTaskAgent": "llm_task_agent",
-        # <<< NEW: Add mapping for Rhino MCP Coordinator >>>
-        "RhinoMCPCoordinator": "rhino_mcp_node" # 使用新節點名稱
-    }
-    target_node = node_mapping.get(agent_name)
+#     node_mapping = {
+#         "ArchRAGAgent": "rag_agent", "ImageGenerationAgent": "image_gen_agent",
+#         "WebSearchAgent": "web_search_agent", "CaseRenderAgent": "case_render_agent",
+#         "Generate3DAgent": "generate_3d_agent", "SimulateFutureAgent": "simulate_future_agent",
+#         "VideoRecognitionAgent": "video_recognition_agent", "ImageRecognitionAgent": "image_recognition_agent",
+#         "LLMTaskAgent": "llm_task_agent",
+#         # <<< NEW: Add mapping for Rhino MCP Coordinator >>>
+#         "RhinoMCPCoordinator": "rhino_mcp_node" # 使用新節點名稱
+#     }
+#     target_node = node_mapping.get(agent_name)
 
-    if target_node:
-        print(f"--- Tool Subgraph Router: Target node: '{target_node}' ---"); return target_node # 返回目標節點名稱
-    else:
-        print(f"Tool Subgraph Router Error: Unknown agent name '{agent_name}'. Routing to END."); return END # 直接返回 END
+#     if target_node:
+#         print(f"--- Tool Subgraph Router: Target node: '{target_node}' ---"); return target_node # 返回目標節點名稱
+#     else:
+#         print(f"Tool Subgraph Router Error: Unknown agent name '{agent_name}'. Routing to END."); return "finished" # 直接返回 END
 
 # --- run_llm_task_node ---
 async def run_llm_task_node(state: WorkflowState, config: RunnableConfig) -> Dict[str, Any]:
@@ -520,7 +579,7 @@ async def run_llm_task_node(state: WorkflowState, config: RunnableConfig) -> Dic
     # Use local helper to update task copy
     tasks[current_idx] = _update_task_state_after_tool(current_task, outputs=final_outputs, output_files=final_output_files, error=error_to_report)
     # Return the modified task list
-    return {"tasks": tasks}
+    return {"tasks": tasks, "current_task": tasks[current_idx].copy()}
 
 # --- run_rag_tool_node ---
 def run_rag_tool_node(state: WorkflowState, config: RunnableConfig) -> Dict[str, Any]:
@@ -633,6 +692,7 @@ def run_image_gen_tool_node(state: WorkflowState, config: RunnableConfig) -> Dic
     tasks[current_idx] = _update_task_state_after_tool(current_task, outputs=final_outputs, output_files=output_files_list or [], error=error_to_report)
     return {"tasks": tasks, "current_task": tasks[current_idx].copy()}
 
+# --- run_web_search_tool_node ---
 def run_web_search_tool_node(state: WorkflowState, config: RunnableConfig) -> Dict[str, Any]:
     print("--- Running Web Search Tool Node (Unified Subgraph) ---")
     current_idx = state.get("current_task_index", -1)
@@ -885,16 +945,17 @@ def run_image_recognition_tool_node(state: WorkflowState, config: RunnableConfig
     tasks[current_idx] = _update_task_state_after_tool(current_task, outputs=final_outputs, output_files=[], error=error_to_report)
     return {"tasks": tasks, "current_task": tasks[current_idx].copy()}
 
-# --- <<< NEW: Rhino MCP Coordinator Node >>> ---
+# --- run_rhino_mcp_node ---
 async def run_rhino_mcp_node(state: WorkflowState, config: RunnableConfig) -> Dict[str, Any]:
     """
     Executes a Rhino task using the MCP agent logic within this node.
     Uses TaskState inputs and updates TaskState outputs/status.
+    Returns MCP message history (raw objects) and necessary file info.
     """
-    node_name = "Rhino MCP Node" # Renamed
+    node_name = "Rhino MCP Node"
     print(f"--- Running Node: {node_name} ---")
     current_idx = state.get("current_task_index", -1)
-    tasks = [t.copy() for t in state.get("tasks", [])] # Operate on a copy
+    tasks = [t.copy() for t in state.get("tasks", [])]
 
     if current_idx < 0 or current_idx >= len(tasks):
         print(f"{node_name} Error: Invalid task index {current_idx}.")
@@ -902,11 +963,12 @@ async def run_rhino_mcp_node(state: WorkflowState, config: RunnableConfig) -> Di
 
     current_task = tasks[current_idx]
     task_inputs = current_task.get("task_inputs")
-    outer_error_to_report = None # Error related to this node's execution
-    final_mcp_outcome = None   # To store the final outcome dict from the MCP loop
+    outer_error_to_report = None
+    final_mcp_outcome = None
+    mcp_loop_messages: List[BaseMessage] = [] # Store raw messages from the loop
 
     try:
-        # 1. Extract inputs from TaskState
+        # 1. Extract inputs (remains the same)
         if not task_inputs or not isinstance(task_inputs, dict):
             raise ValueError("Invalid or missing 'task_inputs' in the current task.")
         user_request = task_inputs.get("user_request")
@@ -918,139 +980,449 @@ async def run_rhino_mcp_node(state: WorkflowState, config: RunnableConfig) -> Di
         print(f"{node_name}: Starting MCP task for request: '{user_request[:100]}...'")
         if initial_image_path: print(f"  with initial image: {initial_image_path}")
 
-        # 2. Construct Initial *Local* MCP State (mimics MCPAgentState)
+        # 2. Construct Initial *Local* MCP State (remains the same)
         local_mcp_state: Dict[str, Any] = { # Use Dict for flexibility
             "messages": [],
-            # Store initial request/image path locally if needed by mcp_should_continue etc.
             "initial_request": user_request,
             "initial_image_path": initial_image_path,
-            "target_mcp": "rhino", # Implicitly rhino for this node
+            "target_mcp": "rhino",
             "task_complete": False,
             "saved_image_path": None,
             "saved_image_data_uri": None
         }
-
-        # Construct initial HumanMessage for the local MCP state
         initial_human_content = [{"type": "text", "text": user_request}]
         if initial_image_path and os.path.exists(initial_image_path):
             try:
                 with open(initial_image_path, "rb") as img_file: img_bytes = img_file.read()
                 img_base64 = base64.b64encode(img_bytes).decode('utf-8')
+                mime_type = "image/png" # Default
+                ext = os.path.splitext(initial_image_path)[1].lower()
+                if ext in [".jpg", ".jpeg"]: mime_type = "image/jpeg"
+                elif ext == ".gif": mime_type = "image/gif"
+                elif ext == ".webp": mime_type = "image/webp"
                 initial_human_content.append({
                     "type": "image_url",
-                    "image_url": {"url": f"data:image/png;base64,{img_base64}"}
+                    "image_url": {"url": f"data:{mime_type};base64,{img_base64}"}
                 })
-                print(f"  Successfully encoded initial image for local MCP state.")
+                print(f"  Successfully encoded initial image ({mime_type}) for local MCP state.")
             except Exception as img_err:
                 print(f"  Warning: Failed to read/encode initial image {initial_image_path} for local MCP state: {img_err}")
         local_mcp_state["messages"] = [HumanMessage(content=initial_human_content)]
 
-        # 3. Run Internal MCP Loop
+        # 3. Run Internal MCP Loop (logic remains mostly the same)
         max_mcp_steps = 15
         step_count = 0
-        mcp_loop_error = None # Error specifically from the internal loop
+        mcp_loop_error = None
         while step_count < max_mcp_steps:
             step_count += 1
             print(f"\n{node_name}: --- MCP Internal Loop Step {step_count} ---")
-            # Pass the local state to MCP functions
-            next_step = mcp_should_continue(local_mcp_state)
-            print(f"  mcp_should_continue result: {next_step}")
+            # Add raw messages to history *before* the next step
+            mcp_loop_messages.extend(local_mcp_state.get("messages", [])) # Extend history with raw objects
+            local_mcp_state["messages"] = [] # Clear messages for the next step's output
+
+            # --- Routing logic (remains the same, including passing target_mcp) ---
+            if step_count == 1:
+                next_step = "rhino_agent"
+                print(f"  First step: Directly routing to {next_step}")
+            else:
+                temp_state_for_should_continue = {
+                    "messages": mcp_loop_messages,
+                    "target_mcp": "rhino"
+                }
+                next_step = mcp_should_continue(temp_state_for_should_continue)
+                print(f"  mcp_should_continue result: {next_step}")
+
 
             if next_step == END:
                 print(f"{node_name}: MCP loop finished based on should_continue.")
                 break
             elif next_step == "rhino_agent":
                 print(f"  Calling call_rhino_agent...")
-                # Pass the existing config down
-                agent_output = await call_rhino_agent(local_mcp_state, config)
-                local_mcp_state["messages"].extend(agent_output.get("messages", []))
-                # Update local state with potential image path/uri from agent output
+                agent_output = await call_rhino_agent({"messages": mcp_loop_messages}, config) # Pass raw history
+                local_mcp_state["messages"].extend(agent_output.get("messages", [])) # Add raw new messages
                 if "saved_image_path" in agent_output: local_mcp_state["saved_image_path"] = agent_output["saved_image_path"]
                 if "saved_image_data_uri" in agent_output: local_mcp_state["saved_image_data_uri"] = agent_output["saved_image_data_uri"]
             elif next_step == "agent_tool_executor":
                 print(f"  Calling agent_tool_executor...")
-                 # Pass the existing config down
-                executor_output = await agent_tool_executor(local_mcp_state, config)
-                local_mcp_state["messages"].extend(executor_output.get("messages", []))
-                 # Update local state with potential image path from tool message content
-                last_tool_msg = local_mcp_state["messages"][-1] if local_mcp_state["messages"] and isinstance(local_mcp_state["messages"][-1], ToolMessage) else None
-                if last_tool_msg and last_tool_msg.name == "capture_viewport" and last_tool_msg.content.startswith("[IMAGE_FILE_PATH]:"):
-                     local_mcp_state["saved_image_path"] = last_tool_msg.content.split(":", 1)[1]
+                last_ai_message = next( (msg for msg in reversed(mcp_loop_messages) if isinstance(msg, AIMessage)), None )
+                if last_ai_message and last_ai_message.tool_calls:
+                     executor_input_state = {"messages": [last_ai_message], "target_mcp": "rhino"}
+                     executor_output = await agent_tool_executor(executor_input_state, config)
+                     local_mcp_state["messages"].extend(executor_output.get("messages", [])) # Add raw tool results
+                     # --- Update local state with path/uri from tool result ---
+                     last_tool_msg = local_mcp_state["messages"][-1] if local_mcp_state["messages"] and isinstance(local_mcp_state["messages"][-1], ToolMessage) else None
+                     if last_tool_msg and last_tool_msg.name == "capture_viewport":
+                          content = last_tool_msg.content
+                          prefix = "[IMAGE_FILE_PATH]:"
+                          error_prefix = "[Error:"
+                          if content.startswith(prefix):
+                              path_from_tool = content[len(prefix):]
+                              local_mcp_state["saved_image_path"] = path_from_tool
+                              print(f"  Tool executor updated saved_image_path: {path_from_tool}")
+                              # Attempt to generate URI here if path exists
+                              if path_from_tool and os.path.exists(path_from_tool):
+                                  try:
+                                      with open(path_from_tool, "rb") as img_file: img_bytes = img_file.read()
+                                      base64_data = base64.b64encode(img_bytes).decode('utf-8')
+                                      mime_type = "image/png"
+                                      ext = os.path.splitext(path_from_tool)[1].lower()
+                                      if ext in [".jpg", ".jpeg"]: mime_type = "image/jpeg"
+                                      local_mcp_state["saved_image_data_uri"] = f"data:{mime_type};base64,{base64_data}"
+                                      print(f"  Generated data URI for screenshot: {local_mcp_state['saved_image_data_uri'][:60]}...")
+                                  except Exception as uri_gen_err:
+                                      print(f"  Warning: Could not generate data URI for screenshot {path_from_tool}: {uri_gen_err}")
+                                      local_mcp_state["saved_image_data_uri"] = None # Reset if generation failed
+                          elif content.startswith(error_prefix):
+                               print(f"  Tool executor received error from capture_viewport: {content}")
+                               if not mcp_loop_error: mcp_loop_error = ValueError(f"MCP Screenshot Error: {content}")
+                else:
+                     print(f"  Warning: Expected AIMessage with tool_calls before agent_tool_executor, but not found.")
+                     local_mcp_state["messages"].append(ToolMessage(content="[Error: No tool calls found in previous AI message]", tool_call_id="internal_error"))
             else:
                 mcp_loop_error = ValueError(f"MCP loop error: Unknown step '{next_step}'")
                 print(f"{node_name} Error: {mcp_loop_error}")
                 break
 
-            # --- Short delay ---
             await asyncio.sleep(1)
 
-        # Check for timeout
+        # Add the very last raw messages from the final step/break
+        mcp_loop_messages.extend(local_mcp_state.get("messages", []))
+
         if step_count >= max_mcp_steps:
             print(f"{node_name} Warning: Reached max MCP steps ({max_mcp_steps}). Ending loop.")
             mcp_loop_error = TimeoutError("MCP task exceeded maximum steps.")
 
-        # 4. Extract Final Result from *local* MCP State
-        final_message_obj = local_mcp_state["messages"][-1] if local_mcp_state["messages"] else None
+        # --- <<< MODIFIED: Create final outcome dict (No 'message', raw history) >>> ---
         final_mcp_outcome = {
-            "message": "MCP task finished without a final message.", # Default message
+            # "message": ..., # REMOVED - Let history speak for itself
             "saved_image_path": local_mcp_state.get("saved_image_path"),
-            "saved_image_data_uri": local_mcp_state.get("saved_image_data_uri")
+            "saved_image_data_uri": local_mcp_state.get("saved_image_data_uri"),
+            "mcp_message_history": mcp_loop_messages # Store raw BaseMessage list
         }
+        print(f"  Stored {len(final_mcp_outcome['mcp_message_history'])} raw MCP messages for history.")
 
-        if isinstance(final_message_obj, AIMessage):
-            final_mcp_outcome["message"] = final_message_obj.content
-        elif isinstance(final_message_obj, ToolMessage):
-             # Handle cases where loop ended after tool call
-             if final_message_obj.name == "capture_viewport" and final_message_obj.content.startswith("[IMAGE_FILE_PATH]:"):
-                  saved_path = final_message_obj.content.split(":", 1)[1]
-                  final_mcp_outcome["message"] = f"MCP task completed with screenshot: {saved_path}"
-                  # Path/URI already set in local_mcp_state
-             elif final_message_obj.content.startswith("[Error"):
-                  final_mcp_outcome["message"] = f"MCP task ended after tool call which reported error: {final_message_obj.content}"
-                  # Report the tool error as the primary error if no loop error occurred yet
-                  if not mcp_loop_error: mcp_loop_error = ValueError(f"MCP Tool Error: {final_message_obj.content}")
-             else:
-                  final_mcp_outcome["message"] = f"MCP task ended after tool '{final_message_obj.name}' call."
-
+        # Store loop error if it occurred
         if mcp_loop_error:
-            final_mcp_outcome["message"] = f"MCP task failed: {str(mcp_loop_error)}"
-            outer_error_to_report = mcp_loop_error # Propagate loop error to task status
+            outer_error_to_report = mcp_loop_error
+            # Optionally add error info to history if needed, though it should be in the messages already
+            print(f"  MCP loop terminated with error: {mcp_loop_error}")
+        # --- <<< END MODIFIED >>> ---
 
     except Exception as e:
         error_msg = f"Error during {node_name} execution: {e}"
         print(error_msg)
         traceback.print_exc()
-        outer_error_to_report = e # Set error for the main task state update
-        # Ensure final_mcp_outcome reflects the error
+        outer_error_to_report = e
+        # Ensure history is still included (raw) in case of outer error
         final_mcp_outcome = {
-             "message": f"MCP coordination failed: {e}",
+             # "message": f"MCP coordination failed: {e}", # REMOVED
              "saved_image_path": None,
-             "saved_image_data_uri": None
-        }
+             "saved_image_data_uri": None,
+             "mcp_message_history": mcp_loop_messages # Include whatever history was gathered
+         }
 
     # 5. Update the main WorkflowState Task using the helper
-    # Pass the extracted outcome to the helper via mcp_result
     tasks[current_idx] = _update_task_state_after_tool(
         current_task,
-        outputs=None, # Standard outputs are usually None for MCP coordinator itself
-        output_files=None, # Output files are derived from mcp_result
-        error=outer_error_to_report, # Report coordination error if any
-        mcp_result=final_mcp_outcome # Pass the final MCP outcome dict
+        outputs=None,
+        output_files=None,
+        error=outer_error_to_report,
+        mcp_result=final_mcp_outcome # Pass dict with history and file info
     )
 
-    # Return the updated task list for WorkflowState
     return {"tasks": tasks, "current_task": tasks[current_idx].copy()}
-# --- <<< END MODIFICATION >>> ---
 
+# --- run_pinterest_mcp_node ---
+async def run_pinterest_mcp_node(state: WorkflowState, config: RunnableConfig) -> Dict[str, Any]:
+    """
+    Executes a Pinterest task using the MCP agent logic within this node.
+    Uses TaskState inputs and updates TaskState outputs/status.
+    Returns MCP message history (raw objects) and necessary file info.
+    """
+    node_name = "Pinterest MCP Node"
+    print(f"--- Running Node: {node_name} ---")
+    current_idx = state.get("current_task_index", -1)
+    tasks = [t.copy() for t in state.get("tasks", [])]
+
+    if current_idx < 0 or current_idx >= len(tasks):
+        print(f"{node_name} Error: Invalid task index {current_idx}.")
+        return {"tasks": [t.copy() for t in state.get("tasks", [])], "current_task": state.get("current_task").copy() if state.get("current_task") else None}
+
+    current_task = tasks[current_idx]
+    task_inputs = current_task.get("task_inputs")
+    outer_error_to_report = None
+    final_mcp_outcome = None
+    mcp_loop_messages: List[BaseMessage] = [] # Store raw messages from the loop
+
+    try:
+        # 1. Extract inputs
+        if not task_inputs or not isinstance(task_inputs, dict):
+            raise ValueError("Invalid or missing 'task_inputs' in the current task.")
+        user_request = task_inputs.get("keyword") # Pinterest uses 'keyword'
+        limit = task_inputs.get("limit") # Optional
+
+        if not user_request:
+            raise ValueError("Missing 'keyword' in task_inputs for PinterestMCPCoordinator")
+
+        print(f"{node_name}: Starting MCP task for keyword: '{user_request[:100]}...' (Limit: {limit or 'Default'})")
+
+        # 2. Construct Initial *Local* MCP State
+        local_mcp_state: Dict[str, Any] = { # Use Dict for flexibility
+            "messages": [HumanMessage(content=user_request)], # Pinterest starts simple
+            "initial_request": user_request,
+            "initial_image_path": None, # Pinterest doesn't take initial image
+            "target_mcp": "pinterest",  # Target is Pinterest
+            "task_complete": False,
+            "saved_image_path": None,
+            "saved_image_data_uri": None,
+            # Add limit to the initial state if provided, so agent can use it
+            "pinterest_limit": limit
+        }
+
+        # 3. Run Internal MCP Loop (Similar structure to Rhino)
+        max_mcp_steps = 5
+        step_count = 0
+        mcp_loop_error = None
+        while step_count < max_mcp_steps:
+            step_count += 1
+            print(f"\n{node_name}: --- MCP Internal Loop Step {step_count} ---")
+            # Add raw messages to history *before* the next step
+            mcp_loop_messages.extend(local_mcp_state.get("messages", [])) # Extend history with raw objects
+            local_mcp_state["messages"] = [] # Clear messages for the next step's output
+
+            # --- Routing logic (using imported mcp_should_continue) ---
+            if step_count == 1:
+                next_step = "pinterest_agent"
+                print(f"  First step: Directly routing to {next_step}")
+            else:
+                temp_state_for_should_continue = {
+                    "messages": mcp_loop_messages,
+                    "target_mcp": "pinterest"
+                }
+                next_step = mcp_should_continue(temp_state_for_should_continue)
+                print(f"  mcp_should_continue result: {next_step}")
+
+            if next_step == END:
+                print(f"{node_name}: MCP loop finished based on should_continue.")
+                break
+            elif next_step == "pinterest_agent":
+                print(f"  Calling call_pinterest_agent...")
+                # Pass limit if available in state
+                agent_input_state = {"messages": mcp_loop_messages}
+                if "pinterest_limit" in local_mcp_state and local_mcp_state["pinterest_limit"] is not None:
+                     # Need to check how the agent expects the limit. Assume it reads from message context for now.
+                     # Or we might need to modify call_pinterest_agent to accept limit directly if possible.
+                     # For simplicity, let's assume the agent can handle it via prompt/messages.
+                     print(f"  (Limit {local_mcp_state['pinterest_limit']} should be handled by agent prompt)")
+                     pass
+                agent_output = await call_pinterest_agent(agent_input_state, config) # Pass raw history
+                local_mcp_state["messages"].extend(agent_output.get("messages", [])) # Add raw new messages
+                if "saved_image_path" in agent_output: local_mcp_state["saved_image_path"] = agent_output["saved_image_path"]
+                if "saved_image_data_uri" in agent_output: local_mcp_state["saved_image_data_uri"] = agent_output["saved_image_data_uri"]
+            elif next_step == "agent_tool_executor":
+                print(f"  Calling agent_tool_executor...")
+                last_ai_message = next( (msg for msg in reversed(mcp_loop_messages) if isinstance(msg, AIMessage)), None )
+                if last_ai_message and last_ai_message.tool_calls:
+                     executor_input_state = {"messages": [last_ai_message], "target_mcp": "pinterest"}
+                     executor_output = await agent_tool_executor(executor_input_state, config)
+                     local_mcp_state["messages"].extend(executor_output.get("messages", []))
+                     # Path/URI handling is done by the agent node after executor returns
+                else:
+                     print(f"  Warning: Expected AIMessage with tool_calls before agent_tool_executor, but not found.")
+                     local_mcp_state["messages"].append(ToolMessage(content="[Error: No tool calls found in previous AI message]", tool_call_id="internal_error"))
+            else:
+                mcp_loop_error = ValueError(f"MCP loop error: Unknown step '{next_step}'")
+                print(f"{node_name} Error: {mcp_loop_error}")
+                break
+
+            await asyncio.sleep(1)
+
+        # Add the very last raw messages from the final step/break
+        mcp_loop_messages.extend(local_mcp_state.get("messages", []))
+
+        if step_count >= max_mcp_steps:
+            print(f"{node_name} Warning: Reached max MCP steps ({max_mcp_steps}). Ending loop.")
+            mcp_loop_error = TimeoutError("MCP task exceeded maximum steps.")
+
+        final_mcp_outcome = {
+            "saved_image_path": local_mcp_state.get("saved_image_path"),
+            "saved_image_data_uri": local_mcp_state.get("saved_image_data_uri"),
+            "mcp_message_history": mcp_loop_messages
+        }
+        print(f"  Stored {len(final_mcp_outcome['mcp_message_history'])} raw MCP messages for history.")
+
+        if mcp_loop_error:
+            outer_error_to_report = mcp_loop_error
+            print(f"  MCP loop terminated with error: {mcp_loop_error}")
+
+    except Exception as e:
+        error_msg = f"Error during {node_name} execution: {e}"
+        print(error_msg)
+        traceback.print_exc()
+        outer_error_to_report = e
+        final_mcp_outcome = {
+             "saved_image_path": None,
+             "saved_image_data_uri": None,
+             "mcp_message_history": mcp_loop_messages
+         }
+
+    tasks[current_idx] = _update_task_state_after_tool(
+        current_task,
+        outputs=None, output_files=None,
+        error=outer_error_to_report,
+        mcp_result=final_mcp_outcome
+    )
+
+    return {"tasks": tasks, "current_task": tasks[current_idx].copy()}
+
+# --- <<< ADDED: OSM MCP Coordinator Node >>> ---
+async def run_osm_mcp_node(state: WorkflowState, config: RunnableConfig) -> Dict[str, Any]:
+    """
+    Executes an OpenStreetMap task using the MCP agent logic within this node.
+    Uses TaskState inputs (address) and updates TaskState outputs/status.
+    Returns MCP message history (raw objects) and necessary file info.
+    """
+    node_name = "OSM MCP Node"
+    print(f"--- Running Node: {node_name} ---")
+    current_idx = state.get("current_task_index", -1)
+    tasks = [t.copy() for t in state.get("tasks", [])]
+
+    if current_idx < 0 or current_idx >= len(tasks):
+        print(f"{node_name} Error: Invalid task index {current_idx}.")
+        return {"tasks": [t.copy() for t in state.get("tasks", [])], "current_task": state.get("current_task").copy() if state.get("current_task") else None}
+
+    current_task = tasks[current_idx]
+    task_inputs = current_task.get("task_inputs")
+    outer_error_to_report = None
+    final_mcp_outcome = None
+    mcp_loop_messages: List[BaseMessage] = [] # Store raw messages from the loop
+
+    try:
+        # 1. Extract inputs
+        if not task_inputs or not isinstance(task_inputs, dict):
+            raise ValueError("Invalid or missing 'task_inputs' in the current task.")
+        user_request = task_inputs.get("user_request") # Should contain the address
+
+        if not user_request:
+            raise ValueError("Missing 'user_request' (address) in task_inputs for OSMMCPCoordinator")
+
+        print(f"{node_name}: Starting MCP task for address: '{user_request[:100]}...'")
+
+        # 2. Construct Initial *Local* MCP State
+        local_mcp_state: Dict[str, Any] = { # Use Dict for flexibility
+            "messages": [HumanMessage(content=user_request)], # OSM starts simple
+            "initial_request": user_request,
+            "initial_image_path": None, # OSM doesn't take initial image
+            "target_mcp": "osm",        # <<< Target is OSM >>>
+            "task_complete": False,
+            "saved_image_path": None,
+            "saved_image_data_uri": None
+        }
+
+        # 3. Run Internal MCP Loop (Similar structure to Rhino/Pinterest)
+        max_mcp_steps = 5 # OSM usually finishes in fewer steps (agent -> executor -> agent -> END)
+        step_count = 0
+        mcp_loop_error = None
+        while step_count < max_mcp_steps:
+            step_count += 1
+            print(f"\n{node_name}: --- MCP Internal Loop Step {step_count} ---")
+            # Add raw messages to history *before* the next step
+            mcp_loop_messages.extend(local_mcp_state.get("messages", [])) # Extend history with raw objects
+            local_mcp_state["messages"] = [] # Clear messages for the next step's output
+
+            # --- Routing logic (using imported mcp_should_continue) ---
+            if step_count == 1:
+                next_step = "osm_agent" # <<< Use OSM Agent >>>
+                print(f"  First step: Directly routing to {next_step}")
+            else:
+                # Need to pass the *correct* target_mcp for should_continue
+                temp_state_for_should_continue = {
+                    "messages": mcp_loop_messages, # Pass full history for context
+                    "target_mcp": "osm"            # <<< Important: Tell should_continue it's OSM >>>
+                }
+                next_step = mcp_should_continue(temp_state_for_should_continue)
+                print(f"  mcp_should_continue result: {next_step}")
+
+            if next_step == END:
+                print(f"{node_name}: MCP loop finished based on should_continue.")
+                break
+            elif next_step == "osm_agent": # <<< Use OSM Agent >>>
+                print(f"  Calling call_osm_agent...")
+                agent_output = await call_osm_agent({"messages": mcp_loop_messages}, config) # Pass raw history
+                local_mcp_state["messages"].extend(agent_output.get("messages", [])) # Add raw new messages
+                # Update state with path/URI if agent node returns them (it does after successful geocode+screenshot)
+                if "saved_image_path" in agent_output: local_mcp_state["saved_image_path"] = agent_output["saved_image_path"]
+                if "saved_image_data_uri" in agent_output: local_mcp_state["saved_image_data_uri"] = agent_output["saved_image_data_uri"]
+            elif next_step == "agent_tool_executor":
+                print(f"  Calling agent_tool_executor...")
+                last_ai_message = next( (msg for msg in reversed(mcp_loop_messages) if isinstance(msg, AIMessage)), None )
+                if last_ai_message and last_ai_message.tool_calls:
+                     # Ensure target_mcp is passed correctly
+                     executor_input_state = {"messages": [last_ai_message], "target_mcp": "osm"} # <<< Target OSM tools >>>
+                     executor_output = await agent_tool_executor(executor_input_state, config)
+                     local_mcp_state["messages"].extend(executor_output.get("messages", [])) # Add raw tool results
+                     # Path/URI handling is done by the agent node after executor returns
+                else:
+                     print(f"  Warning: Expected AIMessage with tool_calls before agent_tool_executor, but not found.")
+                     local_mcp_state["messages"].append(ToolMessage(content="[Error: No tool calls found in previous AI message]", tool_call_id="internal_error"))
+            else:
+                mcp_loop_error = ValueError(f"MCP loop error: Unknown step '{next_step}'")
+                print(f"{node_name} Error: {mcp_loop_error}")
+                break
+
+            await asyncio.sleep(1) # Small delay between steps
+
+        # Add the very last raw messages from the final step/break
+        mcp_loop_messages.extend(local_mcp_state.get("messages", []))
+
+        if step_count >= max_mcp_steps:
+            print(f"{node_name} Warning: Reached max MCP steps ({max_mcp_steps}). Ending loop.")
+            mcp_loop_error = TimeoutError("MCP task exceeded maximum steps.")
+
+        # Create final outcome dict (includes raw history, path, uri)
+        final_mcp_outcome = {
+            "saved_image_path": local_mcp_state.get("saved_image_path"),
+            "saved_image_data_uri": local_mcp_state.get("saved_image_data_uri"),
+            "mcp_message_history": mcp_loop_messages # Store raw BaseMessage list
+        }
+        print(f"  Stored {len(final_mcp_outcome['mcp_message_history'])} raw MCP messages for history.")
+
+        if mcp_loop_error:
+            outer_error_to_report = mcp_loop_error
+            print(f"  MCP loop terminated with error: {mcp_loop_error}")
+
+    except Exception as e:
+        error_msg = f"Error during {node_name} execution: {e}"
+        print(error_msg)
+        traceback.print_exc()
+        outer_error_to_report = e
+        # Ensure history is still included (raw) in case of outer error
+        final_mcp_outcome = {
+             "saved_image_path": None,
+             "saved_image_data_uri": None,
+             "mcp_message_history": mcp_loop_messages # Include whatever history was gathered
+         }
+
+    # 5. Update the main WorkflowState Task using the helper
+    tasks[current_idx] = _update_task_state_after_tool(
+        current_task,
+        outputs=None, # Tool outputs are handled via mcp_result path/uri/history
+        output_files=None, # Tool outputs are handled via mcp_result path/uri/history
+        error=outer_error_to_report,
+        mcp_result=final_mcp_outcome # Pass dict with history and file info
+    )
+
+    return {"tasks": tasks, "current_task": tasks[current_idx].copy()}
+# --- <<< END ADDED >>> ---
 
 # =============================================================================
-# 7. Subgraph Definition & Compilation
+# 7. Subgraph Definition & Compilation (Updated)
 # =============================================================================
 tool_subgraph_builder = StateGraph(WorkflowState) # Use imported WorkflowState
 
-# Add nodes using the functions defined above
+# --- <<< MODIFIED: Add Nodes (including OSM) >>> ---
 tool_subgraph_builder.add_node("prepare_tool_inputs", prepare_tool_inputs_node)
-tool_subgraph_builder.add_node("route_to_tool", determine_tool_route)
+# Standard tool nodes
 tool_subgraph_builder.add_node("rag_agent", run_rag_tool_node)
 tool_subgraph_builder.add_node("image_gen_agent", run_image_gen_tool_node)
 tool_subgraph_builder.add_node("web_search_agent", run_web_search_tool_node)
@@ -1060,59 +1432,95 @@ tool_subgraph_builder.add_node("simulate_future_agent", run_simulate_future_tool
 tool_subgraph_builder.add_node("video_recognition_agent", run_video_recognition_tool_node)
 tool_subgraph_builder.add_node("image_recognition_agent", run_image_recognition_tool_node)
 tool_subgraph_builder.add_node("llm_task_agent", run_llm_task_node)
-# <<< NEW: Add Rhino MCP node with updated name >>>
+# MCP coordinator nodes
 tool_subgraph_builder.add_node("rhino_mcp_node", run_rhino_mcp_node)
+tool_subgraph_builder.add_node("pinterest_mcp_node", run_pinterest_mcp_node)
+# --- <<< ADDED: OSM Node >>> ---
+tool_subgraph_builder.add_node("osm_mcp_node", run_osm_mcp_node)
+# --- <<< END ADDED >>> ---
+# --- <<< END MODIFIED >>> ---
 
-
-# --- Routing logic after input prep (保持不變) ---
-def route_after_input_prep(state: WorkflowState) -> Literal["route_to_tool", "finished"]:
-    # ... (此函數邏輯保持不變) ...
+# --- <<< Routing Function (Updated Mapping including OSM) >>> ---
+def route_after_prepare_inputs(state: WorkflowState) -> str:
+    """
+    Determines the next node after prepare_tool_inputs.
+    Routes to the correct tool node if preparation succeeded, otherwise ENDs.
+    Returns the name of the next node or "finished".
+    """
+    print("--- Routing decision @ route_after_prepare_inputs ---")
     current_idx = state.get("current_task_index", -1)
     tasks = state.get("tasks", [])
-    status = "unknown"
-    if 0 <= current_idx < len(tasks):
-        status = tasks[current_idx].get("status", "unknown")
+
+    if current_idx < 0 or current_idx >= len(tasks):
+        print("  Routing Error: Invalid task index. Routing to END.")
+        return "finished"
+
+    current_task = tasks[current_idx]
+    status = current_task.get("status", "unknown")
+
     if status == "failed":
-        print("--- Tool Subgraph: Routing to END due to input preparation error ---")
+        print(f"  Input preparation failed for task {current_task.get('task_id')}. Routing to END.")
         return "finished"
     elif status == "in_progress":
-        print("--- Tool Subgraph: Input preparation successful, routing to tool selection ---")
-        return "route_to_tool"
-    else:
-        print(f"--- Tool Subgraph: Unexpected status '{status}' after input prep. Routing to END. ---")
-        return "finished"
+        agent_name = current_task.get("selected_agent")
+        if not agent_name:
+            print(f"  Routing Error: Prep succeeded but no 'selected_agent' found for task {current_task.get('task_id')}. Routing to END.")
+            return "finished"
 
-# Set Entry Point (保持不變)
+        print(f"  Input prep successful for '{agent_name}'. Determining target tool node...")
+        node_mapping = {
+            "ArchRAGAgent": "rag_agent", "ImageGenerationAgent": "image_gen_agent",
+            "WebSearchAgent": "web_search_agent", "CaseRenderAgent": "case_render_agent",
+            "Generate3DAgent": "generate_3d_agent", "SimulateFutureAgent": "simulate_future_agent",
+            "VideoRecognitionAgent": "video_recognition_agent", "ImageRecognitionAgent": "image_recognition_agent",
+            "LLMTaskAgent": "llm_task_agent",
+            "RhinoMCPCoordinator": "rhino_mcp_node",
+            "PinterestMCPCoordinator": "pinterest_mcp_node",
+            # --- <<< ADDED: OSM Mapping >>> ---
+            "OSMMCPCoordinator": "osm_mcp_node"
+            # --- <<< END ADDED >>> ---
+        }
+        target_node = node_mapping.get(agent_name)
+
+        if target_node:
+            print(f"  Routing -> {target_node}")
+            return target_node
+        else:
+            print(f"  Routing Error: Unknown agent name '{agent_name}' after successful prep. Routing to END.")
+            return "finished"
+    else:
+        print(f"  Routing Warning: Unexpected status '{status}' after input prep for task {current_task.get('task_id')}. Routing to END.")
+        return "finished"
+# --- <<< END ROUTING FUNCTION >>> ---
+
+# --- <<< MODIFIED: Set Entry Point and Edges (Including OSM) >>> ---
+# Set Entry Point
 tool_subgraph_builder.set_entry_point("prepare_tool_inputs")
 
-# Conditional Edge from Input Prep to Router or END (保持不變)
+# Conditional Edge directly from Input Prep to Tool Nodes or END
 tool_subgraph_builder.add_conditional_edges(
-    "prepare_tool_inputs", 
-    route_after_input_prep, 
+    "prepare_tool_inputs",
+    route_after_prepare_inputs,
     {
-    "route_to_tool": "route_to_tool", 
-    "finished": END
-    }
-)
-
-# Conditional Edges from Router to Specific Tools or END (更新 Rhino 節點名稱)
-tool_subgraph_builder.add_conditional_edges(
-    "route_to_tool",
-    determine_tool_route, # 使用更新後的函數
-    {
-        "rag_agent": "rag_agent", "image_gen_agent": "image_gen_agent",
-        "web_search_agent": "web_search_agent", "case_render_agent": "case_render_agent",
-        "generate_3d_agent": "generate_3d_agent", "simulate_future_agent": "simulate_future_agent",
-        "video_recognition_agent": "video_recognition_agent", "image_recognition_agent": "image_recognition_agent",
+        "rag_agent": "rag_agent",
+        "image_gen_agent": "image_gen_agent",
+        "web_search_agent": "web_search_agent",
+        "case_render_agent": "case_render_agent",
+        "generate_3d_agent": "generate_3d_agent",
+        "simulate_future_agent": "simulate_future_agent",
+        "video_recognition_agent": "video_recognition_agent",
+        "image_recognition_agent": "image_recognition_agent",
         "llm_task_agent": "llm_task_agent",
-        # <<< NEW: Add route to Rhino node with updated name >>>
         "rhino_mcp_node": "rhino_mcp_node",
-        "finished": END # 確保 END 路徑存在
+        "pinterest_mcp_node": "pinterest_mcp_node",
+        # --- <<< ADDED: OSM Route >>> ---
+        "osm_mcp_node": "osm_mcp_node",
+        # --- <<< END ADDED >>> ---
+        "finished": END
     }
 )
 
-# Edges from ALL Tool Nodes (including the new one) to END
-# ... (為其他工具節點添加邊緣) ...
+# Edges from ALL Tool Nodes (including OSM) to END
 tool_subgraph_builder.add_edge("rag_agent", END)
 tool_subgraph_builder.add_edge("image_gen_agent", END)
 tool_subgraph_builder.add_edge("web_search_agent", END)
@@ -1122,13 +1530,16 @@ tool_subgraph_builder.add_edge("simulate_future_agent", END)
 tool_subgraph_builder.add_edge("video_recognition_agent", END)
 tool_subgraph_builder.add_edge("image_recognition_agent", END)
 tool_subgraph_builder.add_edge("llm_task_agent", END)
-# <<< NEW: Add edge from Rhino node with updated name >>>
 tool_subgraph_builder.add_edge("rhino_mcp_node", END)
+tool_subgraph_builder.add_edge("pinterest_mcp_node", END)
+# --- <<< ADDED: OSM Edge to END >>> ---
+tool_subgraph_builder.add_edge("osm_mcp_node", END)
+# --- <<< END ADDED >>> ---
+# --- <<< END MODIFIED >>> ---
 
-
-# Compile the subgraph and assign it to the original variable name (保持不變)
+# Compile the subgraph and assign it to the original variable name
 AssignTeamsSubgraph_Compiled = tool_subgraph_builder.compile()
-AssignTeamsSubgraph_Compiled.name = "AssignTeamsSubgraph_Compiled"
+AssignTeamsSubgraph_Compiled.name = "AssignTeamsSubgraph_Compiled_With_OSM" # Updated name
 assign_teams = AssignTeamsSubgraph_Compiled # Assign back to assign_teams for consistent import
-print("Unified Tool Subgraph ('assign_teams') compiled successfully with Rhino MCP Coordinator.")
+print("Unified Tool Subgraph ('assign_teams') compiled successfully with Rhino, Pinterest, and OSM MCP Coordinators.")
 

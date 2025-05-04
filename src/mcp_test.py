@@ -13,7 +13,7 @@ try:
     from PIL import Image as PILImage
 except ImportError:
     print("錯誤：需要 Pillow 庫來處理圖像。請執行 pip install Pillow")
-    exit(1)
+    PILImage = None # Indicate PIL is not available
 
 if sys.platform.startswith("win"):
     # 強制使用 ProactorEventLoop，以支援 subprocess
@@ -21,7 +21,7 @@ if sys.platform.startswith("win"):
 
 
 from dotenv import load_dotenv
-from typing import TypedDict, Annotated, Sequence, Optional, Dict, Any, List
+from typing import TypedDict, Annotated, Sequence, Optional, Dict, Any, List, Union # Added Union
 from contextlib import asynccontextmanager
 import requests
 import atexit
@@ -63,7 +63,7 @@ except Exception as e:
     traceback.print_exc()
     exit(1)
 
-# --- MCP Server Configurations (保持不變) ---
+# --- MCP Server Configurations (修改 OSM 設定) ---
 MCP_CONFIGS = {
     "rhino": {
         "command": "C:\\Users\\User\\miniconda3\\envs\\rhino_mcp\\python",
@@ -75,6 +75,17 @@ MCP_CONFIGS = {
         "args": ["D:\\MA system\\LangGraph\\src\\mcp\\revit-mcp\\build\\index.js"],
         "transport": "stdio",
     },
+    "pinterest": {
+        "command": "node", # Assuming node runs the JS file
+        "args": ["D:\\MA system\\LangGraph\\src\\mcp\\pinterest-mcp-server\\dist\\pinterest-mcp-server.js"],
+        "transport": "stdio", # Assuming stdio, adjust if needed
+    },
+    # --- 修改 OSM MCP 配置，使用 osm-mcp-server 命令 ---
+    "osm": {
+      "command": "osm-mcp-server", # 使用 osm-mcp-server 命令
+      "args": [],  # 不需要額外參數
+      "transport": "stdio",
+    }
 }
 
 # --- 全局變數 (移除 _mcp_clients_initialized) ---
@@ -91,8 +102,8 @@ class MCPAgentState(TypedDict):
     initial_image_path: Optional[str]
     target_mcp: Optional[str]
     task_complete: bool = False
-    # --- 【修改點】添加用於存儲截圖結果的字段 ---
-    saved_image_path: Optional[str] # Stores the path returned by Rhino
+    # --- 用於存儲截圖/下載結果的字段 ---
+    saved_image_path: Optional[str] # Stores the path returned by Rhino/Pinterest/OSM
     saved_image_data_uri: Optional[str] # Stores the generated data URI
 
 # =============================================================================
@@ -111,7 +122,15 @@ async def initialize_single_mcp(mcp_name: str) -> tuple[Optional[MultiServerMCPC
     try:
         # --- 命令和路徑檢查 (使用 print) ---
         command_path = config_item['command']
-        # ... (省略路徑檢查的 print 輸出以求簡潔) ...
+        # 檢查命令是否存在 (對 'python' 這類通用命令可能不適用)
+        if command_path != "python" and not os.path.exists(command_path) and command_path != sys.executable:
+            print(f"  !!! [Lazy Init] 警告: 命令路徑 '{command_path}' 不存在。")
+        # 檢查 args 中的文件路徑 (如果有的話)
+        for arg in config_item.get('args', []):
+             # Check if it looks like a file path and doesn't exist
+             if ('/' in arg or '\\' in arg) and not os.path.exists(arg):
+                  print(f"  !!! [Lazy Init] 警告: 參數中的路徑 '{arg}' 不存在。")
+
         # print(f"  - [Lazy Init] 使用配置: {config_item}")
         print(f"  - [Lazy Init] 正在初始化 {mcp_name} Client...")
         try:
@@ -234,7 +253,7 @@ async def get_mcp_tools(mcp_name: str) -> List[BaseTool]:
 # =============================================================================
 # 提示詞定義 (修改 AGENT_EXECUTION_PROMPT 加入最終截圖指令)
 # =============================================================================
-AGENT_EXECUTION_PROMPT = SystemMessage(content="""你是一個嚴格按計劃執行任務的助手，專門為 CAD/BIM 環境生成指令。消息歷史中包含了用戶請求和一個分階段目標的計劃。
+AGENT_EXECUTION_PROMPT = SystemMessage(content="""你是一個嚴格按計劃執行任務的助手，專門為 CAD/BIM 環境生成指令或處理地理/圖像請求。消息歷史中包含了用戶請求和一個分階段目標的計劃。
 你的任務是：
 1.  分析計劃和執行歷史。
 2.  識別出計劃中**第一個尚未完成的階段目標**。
@@ -242,30 +261,37 @@ AGENT_EXECUTION_PROMPT = SystemMessage(content="""你是一個嚴格按計劃執
 4.  **如果需要調用工具來執行此動作，請必須生成 `tool_calls` 在首位的 AIMessage 以請求該工具調用**。**不要僅僅用文字描述你要調用哪個工具，而是實際生成工具調用指令。** 一次只生成一個工具調用請求。
 5.  嚴格禁止使用 f-string 格式化字串。請使用 `.format()` 或 `%` 進行字串插值。
 6.  **仔細參考工具描述或 Mcp 文檔確認函數用法與參數正確性，必須實際生成結構化的工具呼叫指令。**
-6.  **最終步驟：當所有用戶請求的目標達成後，計劃的最後一步**應該**是調用 `capture_viewport` 工具來截取最終畫面。** 請生成對應的 `tool_calls` 來執行此操作。
-7.  如果當前階段目標不需要工具即可完成（例如，僅需總結信息），請生成說明性的自然語言回應。
-8.  若遇工具錯誤，分析錯誤原因 (尤其是代碼執行錯誤)，**嘗試修正你的工具調用參數或生成的代碼**，然後再次請求工具調用。如果無法修正，請報告問題。
+    *   **地址處理**: 當你需要呼叫 `geocode_and_screenshot` 時，如果使用者提供的地址比較複雜或包含區等，請**嘗試將其簡化**，例如 "號碼, 街道名稱, 城市, 國家" 再傳遞給 `address` 參數。如果持續地理編碼失敗，可以嘗試進一步簡化。
+7.  **最終步驟：**
+    *   對於 Rhino/Revit 任務，當所有用戶請求的目標達成後，計劃的最後一步**應該**是調用 `capture_focused_view` 工具來截取最終畫面。
+    *   對於 Pinterest 任務，計劃的最後一步應該是調用 `pinterest_search_and_download` (如果尚未完成) 或生成總結訊息。
+    *   對於 OSM，計劃主要使用 (`geocode_and_screenshot`)。
+    請生成對應的 `tool_calls` 或總結訊息。
+8.  如果當前階段目標不需要工具即可完成（例如，僅需總結信息），請生成說明性的自然語言回應。
+9.  若遇工具錯誤，分析錯誤原因 (尤其是代碼執行錯誤)，**嘗試修正你的工具調用參數或生成的代碼**，然後再次請求工具調用。如果無法修正，請報告問題。
 
 **關鍵指令：只要下一步是工具操作，你的回應中**必須**包含 Tool Calls 結構。直到錯誤或是處理完最終任務後，才可生成純文字的完成訊息。**""")
 
-# --- Router Prompt (保持不變) ---
+# --- Router Prompt (MODIFIED) ---
 ROUTER_PROMPT = """你是一個智能路由代理。根據使用者的**初始請求文本**，判斷應將任務分配給哪個專業領域的代理。
 目前可用的代理有：
 - 'revit': 主要處理與 Revit 建築資訊模型相關的請求。
 - 'rhino': 主要處理與 Rhino 3D 模型相關的請求。
+- 'pinterest': 主要處理與 Pinterest 圖片搜索和下載相關的請求。
+- 'osm': 主要處理與 OpenStreetMap 地圖相關的請求。
+
 分析以下**初始使用者請求文本**，並決定最適合處理此請求的代理。
-你的回應必須是 'revit' 或 'rhino'。請只回應目標代理的名稱。
-如果請求不明確或無法判斷，請預設回應 'revit'。
+你的回應必須是 'revit', 'rhino', 'pinterest' 或 'osm'。請只回應目標代理的名稱。
 
 初始使用者請求文本：
 "{user_request_text}"
 """
 
 # =============================================================================
-# 輔助函數：執行工具
+# 輔助函數：執行工具 (修改以處理 Pinterest 下載路徑)
 # =============================================================================
 async def execute_tools(agent_action: AIMessage, selected_tools: List[BaseTool]) -> List[ToolMessage]:
-    """執行 AI Message 中的工具調用，處理 capture_viewport 返回，並確保 ToolMessage content 非空字串。"""
+    """執行 AI Message 中的工具調用，處理 capture_focused_view 和 pinterest download 返回，並確保 ToolMessage content 非空字串。"""
     tool_messages = []
     if not agent_action.tool_calls:
         return tool_messages
@@ -289,7 +315,7 @@ async def execute_tools(agent_action: AIMessage, selected_tools: List[BaseTool])
         observation = None
 
         try:
-            # --- 參數處理 ---
+            # --- 參數處理 (保持不變) ---
             if not isinstance(tool_args, dict):
                  try:
                      tool_args_dict = json.loads(str(tool_args)) if isinstance(tool_args, str) and str(tool_args).strip().startswith('{') else {"input": tool_args}
@@ -298,24 +324,72 @@ async def execute_tools(agent_action: AIMessage, selected_tools: List[BaseTool])
             else:
                  tool_args_dict = tool_args
 
-            # --- 調用工具 (Standard ainvoke) ---
+            # --- 調用工具 (ainvoke) ---
             print(f"        調用 {tool_name}.ainvoke...")
             observation = await tool_to_use.ainvoke(tool_args_dict, config=None)
             print(f"        {tool_name}.ainvoke 調用完成。觀察值類型: {type(observation).__name__}")
 
             # --- 轉換 observation 為字串 ---
 
-            # --- 【修改點】處理 capture_viewport 返回的字符串 (路徑或錯誤) ---
-            if tool_name == "capture_viewport" and isinstance(observation, str):
-                if observation.startswith("[Error]"): # 檢查是否是 rhino_tools.py 返回的錯誤字符串
-                    final_content = f"[Error: Viewport Capture Failed]: {observation}" # 保持錯誤前綴
+            # --- 處理 capture_viewport 返回 (保持不變) ---
+            if tool_name == "capture_focused_view" and isinstance(observation, str):
+                if observation.startswith("[Error]"):
+                    final_content = f"[Error: Viewport Capture Failed]: {observation}"
                     print(f"      !! 工具 '{tool_name}' 返回錯誤信息: {observation}")
                 else:
-                    # 假設是文件路徑
-                    final_content = f"[IMAGE_FILE_PATH]:{observation}" # 特殊前綴標記文件路徑
+                    final_content = f"[IMAGE_FILE_PATH]:{observation}"
                     print(f"      << 工具 '{tool_name}' 返回文件路徑字符串: {observation}")
 
-            # --- 處理 bytes ---
+            # --- 處理 pinterest_search_and_download 返回 (MODIFIED to handle string list) ---
+            elif tool_name == "pinterest_search_and_download" and isinstance(observation, list):
+                 print(f"      << 工具 '{tool_name}' 返回列表。正在解析下載路徑...")
+                 try:
+                     print(f"         DEBUG: Raw observation list received:\n{json.dumps(observation, indent=2, ensure_ascii=False)}")
+                 except Exception as json_e:
+                     print(f"         DEBUG: Could not JSON dump observation: {json_e}")
+                     print(f"         DEBUG: Raw observation list (repr): {repr(observation)}")
+
+                 download_paths = []
+                 full_text_output = []
+                 expected_prefix = "保存位置: " # 使用簡體中文前綴
+
+                 # --- <<< MODIFIED: Iterate through strings directly >>> ---
+                 for text_item in observation:
+                     # Ensure item is a string before processing
+                     if isinstance(text_item, str):
+                         full_text_output.append(text_item) # Add to full output regardless
+                         if text_item.startswith(expected_prefix):
+                             path = text_item.split(expected_prefix, 1)[1].strip()
+                             if path: # Basic check if path is not empty after split
+                                 print(f"         提取到潛在路徑: {path}")
+                                 download_paths.append(path)
+                             else:
+                                 print(f"         警告: 從 '{text_item}' 提取的路徑為空。")
+                     else:
+                         # Log if item is not a string, though based on debug output it should be
+                         print(f"         警告: 觀察列表中的項目不是預期的字串: {type(text_item)} - {repr(text_item)}")
+                         full_text_output.append(str(text_item)) # Add string representation
+                 # --- <<< END MODIFIED >>> ---
+
+                 print(f"         找到 {len(download_paths)} 個下載路徑: {download_paths}")
+                 if download_paths:
+                     last_path = download_paths[-1]
+                     if os.path.exists(last_path):
+                         final_content = f"[PINTEREST_DOWNLOAD_PATH]:{last_path}"
+                         print(f"         標記 ToolMessage content 以傳遞最後存在的路徑: {last_path}")
+                     else:
+                         print(f"         警告: 最後提取的路徑 '{last_path}' 不存在。返回原始文本。")
+                         final_content = "\n".join(full_text_output) if full_text_output else "Pinterest tool ran, paths found but last path invalid."
+                 else:
+                     failure_mentioned = any("失败" in t or "failed" in t.lower() for t in full_text_output)
+                     if failure_mentioned:
+                         final_content = "\n".join(full_text_output) if full_text_output else "Pinterest tool ran with download errors, no paths reported."
+                         print(f"         檢測到下載錯誤，未找到有效下載路徑，返回原始文本輸出。")
+                     else:
+                         final_content = "\n".join(full_text_output) if full_text_output else "Pinterest tool ran but no download paths found in output."
+                         print(f"         未找到有效下載路徑，返回原始文本輸出。")
+
+            # --- 處理 bytes (保持不變) ---
             elif isinstance(observation, bytes):
                 try:
                     observation_str = observation.decode('utf-8', errors='replace')
@@ -325,7 +399,7 @@ async def execute_tools(agent_action: AIMessage, selected_tools: List[BaseTool])
                     print(f"      !! 工具 '{tool_name}' 返回 bytes，解碼失敗: {decode_err}")
                 final_content = observation_str if observation_str else "DECODED_EMPTY_STRING"
 
-            # --- 處理 dict/list (排除上面已處理的 capture_viewport 字符串) ---
+            # --- 處理 dict/list (排除 capture_viewport 和 pinterest) ---
             elif isinstance(observation, (dict, list)):
                 if isinstance(observation, list) and not observation:
                      error_msg = f"工具 '{tool_name}' 的 ainvoke 返回了空列表 `[]`。這可能表示 langchain-mcp-adapters 在處理工具響應時內部出錯，或者工具本身未按預期返回 (檢查工具實現)。"
@@ -343,9 +417,8 @@ async def execute_tools(agent_action: AIMessage, selected_tools: List[BaseTool])
                         print(f"      !! 工具 '{tool_name}' 返回 dict/list，序列化時發生未知錯誤: {ser_err}")
                     final_content = observation_str
 
-            # --- 處理其他類型 ---
+            # --- 處理其他類型 (保持不變) ---
             else:
-                # ... (處理 None, 空字符串等邏輯保持不變) ...
                 try:
                     temp_str = str(observation)
                     if temp_str == "[]":
@@ -365,8 +438,7 @@ async def execute_tools(agent_action: AIMessage, selected_tools: List[BaseTool])
                      print(f"      !! 工具 '{tool_name}' 返回其他類型，str() 轉換失敗: {str_conv_err}")
                 final_content = observation_str
 
-
-            # 最終防線
+            # 最終防線 (保持不變)
             if not final_content:
                 final_content = "FINAL_CONTENT_EMPTY"
                 print(f"      !! 警告：最終 final_content 為空，使用最終佔位符。")
@@ -399,11 +471,11 @@ async def call_llm_with_tools(
     print(f"  >> 調用 Agent LLM ({agent_llm.model}) 執行下一步...")
     try:
         # --- 手動構造工具定義列表 (僅處理 MCP 工具) ---
-        print("     準備 MCP 工具定義列表，手動修正 get_scene_objects_with_metadata...")
+        print("     準備 MCP 工具定義列表，手動修正特殊參數...")
         tools_for_binding = []
-        manual_fix_applied = False
-        for tool in selected_tools: # selected_tools 現在只包含 MCP 工具
+        for tool in selected_tools:
             if tool.name == "get_scene_objects_with_metadata":
+                # 保留原有的手動宣告
                 print(f"     正在為 '{tool.name}' 創建手動 Gemini FunctionDeclaration...")
                 manual_declaration = {
                     "name": tool.name,
@@ -426,14 +498,90 @@ async def call_llm_with_tools(
                     }
                 }
                 tools_for_binding.append(manual_declaration)
-                manual_fix_applied = True
-                print(f"     手動定義已創建:\n{json.dumps(manual_declaration, indent=2, ensure_ascii=False)}")
+                print(f"     手動定義已創建: {tool.name}")
+            elif tool.name == "zoom_to_target" or tool.name == "capture_focused_view":
+                print(f"     正在為含bounding_box參數的工具 '{tool.name}' 創建手動 Gemini FunctionDeclaration...")
+                # 構建共用的基本屬性
+                properties = {
+                    "view": {
+                        "type": "STRING",
+                        "description": "視圖名稱或ID",
+                        "nullable": True
+                    }
+                }
+                
+                # 根據工具名稱添加特定屬性
+                if tool.name == "zoom_to_target":
+                    properties.update({
+                        "object_ids": {
+                            "type": "ARRAY",
+                            "description": "要縮放到的對象ID列表",
+                            "nullable": True,
+                            "items": {"type": "STRING"}
+                        },
+                        "all_views": {
+                            "type": "BOOLEAN",
+                            "description": "是否應用於所有視圖",
+                            "nullable": True
+                        }
+                    })
+                elif tool.name == "capture_focused_view":
+                    properties.update({
+                        "projection_type": {
+                            "type": "STRING",
+                            "description": "投影類型: 'parallel', 'perspective', 或 'two_point'",
+                            "nullable": True
+                        },
+                        "lens_angle": {
+                            "type": "NUMBER",
+                            "description": "透視或兩點投影的鏡頭角度",
+                            "nullable": True
+                        },
+                        "layer": {
+                            "type": "STRING",
+                            "description": "用於篩選顯示註釋的圖層名稱",
+                            "nullable": True
+                        },
+                        "show_annotations": {
+                            "type": "BOOLEAN",
+                            "description": "是否顯示物件註釋",
+                            "nullable": True
+                        },
+                        "max_size": {
+                            "type": "INTEGER",
+                            "description": "截圖的最大尺寸",
+                            "nullable": True
+                        }
+                    })
+                
+                # 為兩個工具都添加正確的bounding_box結構
+                properties["bounding_box"] = {
+                    "type": "ARRAY",
+                    "description": "邊界框的8個角點坐標 [[x,y,z], [x,y,z], ...]",
+                    "nullable": True,
+                    "items": {
+                        "type": "ARRAY",
+                        "items": {
+                            "type": "NUMBER"
+                        }
+                    }
+                }
+                
+                # 創建完整的手動宣告
+                manual_declaration = {
+                    "name": tool.name,
+                    "description": tool.description,
+                    "parameters": {
+                        "type": "OBJECT",
+                        "properties": properties
+                    }
+                }
+                
+                tools_for_binding.append(manual_declaration)
+                print(f"     手動定義已創建: {tool.name}")
             else:
                 tools_for_binding.append(tool)
                 print(f"     保留標準 MCP BaseTool 對象: {tool.name}")
-
-        if not manual_fix_applied:
-             print(f"     警告：未在 MCP 工具列表中找到 'get_scene_objects_with_metadata' 進行手動修正。")
 
         # --- 綁定工具到 agent_llm ---
         print("     正在將 MCP 工具 (含手動定義) 綁定到 LLM...")
@@ -526,11 +674,11 @@ async def call_llm_with_tools(
 
 RPM_DELAY = 6 # 比 6 秒稍長一點，留點餘裕
 
-# --- Router Node ---
+# --- Router Node (MODIFIED to handle pinterest) ---
 async def route_mcp_target(state: MCPAgentState, config: RunnableConfig) -> Dict:
-    """使用 utility_llm 判斷用戶初始請求文本應路由到哪個 MCP (使用 print)。"""
+    """使用 utility_llm 判斷用戶初始請求文本應路由到哪個 MCP (revit, rhino, pinterest)。"""
     print("--- 執行 MCP 路由節點 ---")
-    initial_request_text = state.get('initial_request', '') # 從狀態獲取
+    initial_request_text = state.get('initial_request', '')
     if not initial_request_text:
         print("錯誤：狀態中未找到 'initial_request'。默認為 revit。")
         return {"target_mcp": "revit"}
@@ -541,7 +689,7 @@ async def route_mcp_target(state: MCPAgentState, config: RunnableConfig) -> Dict
         response = await utility_llm.ainvoke([SystemMessage(content=prompt)], config=config)
         route_decision = response.content.strip().lower()
         print(f"  LLM 路由決定: {route_decision}")
-        if route_decision in ["revit", "rhino"]:
+        if route_decision in ["revit", "rhino", "pinterest", "osm"]:
             return {"target_mcp": route_decision}
         else:
             print(f"  警告: LLM 路由器的回應無法識別 ('{route_decision}')。預設為 revit。")
@@ -552,104 +700,147 @@ async def route_mcp_target(state: MCPAgentState, config: RunnableConfig) -> Dict
         return {"target_mcp": "revit"}
 
 # =============================================================================
-# Agent Nodes (修改：處理截圖 ToolMessage，返回最終結果)
+# Agent Nodes (修改：處理 Pinterest ToolMessage，返回最終結果)
 # =============================================================================
 async def agent_node_logic(state: MCPAgentState, config: RunnableConfig, mcp_name: str) -> Dict:
-    """通用 Agent 節點邏輯：檢查截圖消息，規劃，或執行下一步。現在直接處理圖片輸入。"""
+    """通用 Agent 節點邏輯：處理特定工具消息 (截圖, Pinterest 下載)，規劃，或執行下一步。"""
     print(f"--- 執行 {mcp_name.upper()} Agent 節點 ---")
     current_messages = list(state['messages'])
     last_message = current_messages[-1] if current_messages else None
 
-    # --- 【修改點】步驟 0: 處理 capture_viewport 返回的文件路徑 ---
+    # --- 處理 capture_viewport 返回的文件路徑 (Rhino/Revit) ---
     IMAGE_PATH_PREFIX = "[IMAGE_FILE_PATH]:"
-    if isinstance(last_message, ToolMessage) and last_message.name == "capture_viewport" and last_message.content.startswith(IMAGE_PATH_PREFIX):
+    if isinstance(last_message, ToolMessage) and last_message.name == "capture_focused_view" and last_message.content.startswith(IMAGE_PATH_PREFIX):
         print("  檢測到 capture_viewport 工具返回的文件路徑。")
         image_path = last_message.content[len(IMAGE_PATH_PREFIX):]
         print(f"    文件路徑: {image_path}")
-
         try:
-            # 檢查文件是否存在
             if not os.path.exists(image_path):
-                print(f"  !! 錯誤：收到的圖像文件路徑不存在: {image_path}")
-                # 返回錯誤信息，但仍標記任務理論上完成（截圖步驟已嘗試）
-                return {"messages": [AIMessage(content=f"任務處理完畢，但最終截圖文件未找到: {image_path}")]}
+                 print(f"  !! 錯誤：收到的圖像文件路徑不存在: {image_path}")
+                 return {"messages": [AIMessage(content=f"任務處理完畢，但最終截圖文件未找到: {image_path}")], "task_complete": True}
 
-            # 讀取文件內容
-            with open(image_path, "rb") as f:
-                image_bytes = f.read()
-
-            # Base64 編碼
+            with open(image_path, "rb") as f: image_bytes = f.read()
             base64_data = base64.b64encode(image_bytes).decode('utf-8')
-
-            # 確定 MIME 類型
             file_extension = os.path.splitext(image_path)[1].lower()
-            mime_type = "image/png" # 預設為 png
-            if file_extension == ".jpeg" or file_extension == ".jpg":
-                mime_type = "image/jpeg"
+            mime_type = "image/png"
+            if file_extension == ".jpeg" or file_extension == ".jpg": mime_type = "image/jpeg"
+            data_uri = f"data:{mime_type};base64,{base64_data}"
             print(f"    推斷 MIME 類型: {mime_type}")
 
-            # 構造 Data URI
-            data_uri = f"data:{mime_type};base64,{base64_data}"
-
-            # 返回成功消息和狀態更新
             return {
-                "messages": [AIMessage(content=f"任務已完成。\n最終畫面已截取並保存至 {image_path}。\n\n截圖預覽:\n![Final Screenshot]({data_uri})")],
+                "messages": [AIMessage(content=f"任務已完成。\n最終畫面已截取並保存至 {image_path}。")], # 簡化消息，URI 在狀態中
                 "saved_image_path": image_path,
-                "saved_image_data_uri": data_uri
+                "saved_image_data_uri": data_uri,
+                "task_complete": True # 標記任務完成
             }
         except Exception as img_proc_err:
             print(f"  !! 處理截圖文件 '{image_path}' 或編碼時出錯: {img_proc_err}")
             traceback.print_exc()
-            # 即使處理失敗，也標記任務完成，但報告錯誤
-            return {"messages": [AIMessage(content=f"任務已完成，但處理截圖文件 '{image_path}' 時失敗: {img_proc_err}")]}
+            return {"messages": [AIMessage(content=f"任務已完成，但處理截圖文件 '{image_path}' 時失敗: {img_proc_err}")], "task_complete": True}
+
+    # --- 處理 OSM 返回的文件路徑 (新增) ---
+    OSM_IMAGE_PATH_PREFIX = "[OSM_IMAGE_PATH]:"
+    if isinstance(last_message, ToolMessage) and last_message.name == "geocode_and_screenshot" and last_message.content.startswith(OSM_IMAGE_PATH_PREFIX):
+        print("  檢測到 geocode_and_screenshot 工具返回的文件路徑。")
+        image_path = last_message.content[len(OSM_IMAGE_PATH_PREFIX):]
+        print(f"    OSM 文件路徑: {image_path}")
+        try:
+            if not os.path.exists(image_path):
+                 print(f"  !! 錯誤：收到的 OSM 圖像文件路徑不存在: {image_path}")
+                 return {"messages": [AIMessage(content=f"地圖處理完畢，但截圖文件未找到: {image_path}")], "task_complete": True}
+
+            with open(image_path, "rb") as f: image_bytes = f.read()
+            base64_data = base64.b64encode(image_bytes).decode('utf-8')
+            file_extension = os.path.splitext(image_path)[1].lower()
+            mime_type = "image/png"
+            if file_extension == ".jpeg" or file_extension == ".jpg": mime_type = "image/jpeg"
+            data_uri = f"data:{mime_type};base64,{base64_data}"
+            print(f"    推斷 MIME 類型: {mime_type}")
+
+            return {
+                "messages": [AIMessage(content=f"地圖截圖已完成。\n截圖已保存至 {image_path}。")],
+                "saved_image_path": image_path,
+                "saved_image_data_uri": data_uri,
+                "task_complete": True
+            }
+        except Exception as img_proc_err:
+            print(f"  !! 處理 OSM 截圖文件 '{image_path}' 或編碼時出錯: {img_proc_err}")
+            traceback.print_exc()
+            return {"messages": [AIMessage(content=f"地圖截圖已完成，但處理文件 '{image_path}' 時失敗: {img_proc_err}")], "task_complete": True}
 
     # --- 處理 capture_viewport 返回的錯誤消息 ---
-    elif isinstance(last_message, ToolMessage) and last_message.name == "capture_viewport" and last_message.content.startswith("[Error: Viewport Capture Failed]:"):
+    elif isinstance(last_message, ToolMessage) and last_message.name == "capture_focused_view" and last_message.content.startswith("[Error: Viewport Capture Failed]:"):
          error_msg = last_message.content
          print(f"  檢測到 capture_viewport 工具返回錯誤: {error_msg}")
-         # 直接將錯誤消息作為最終結果返回
-         return {"messages": [AIMessage(content=f"任務因截圖錯誤而終止: {error_msg}")]}
+         return {"messages": [AIMessage(content=f"任務因截圖錯誤而終止: {error_msg}")], "task_complete": True}
 
+    # --- 處理 pinterest_search_and_download 返回的文件路徑 (NEW) ---
+    PINTEREST_PATH_PREFIX = "[PINTEREST_DOWNLOAD_PATH]:"
+    if isinstance(last_message, ToolMessage) and last_message.name == "pinterest_search_and_download" and last_message.content.startswith(PINTEREST_PATH_PREFIX):
+        print("  檢測到 pinterest_search_and_download 工具返回的文件路徑。")
+        image_path = last_message.content[len(PINTEREST_PATH_PREFIX):]
+        print(f"    文件路徑 (最後一個): {image_path}")
+        try:
+            if not os.path.exists(image_path):
+                 print(f"  !! 錯誤：收到的 Pinterest 下載文件路徑不存在: {image_path}")
+                 # 仍然認為下載步驟嘗試過，但報告文件問題
+                 return {"messages": [AIMessage(content=f"Pinterest 圖片下載完成，但最後一個文件未找到: {image_path}")], "task_complete": True} # 假設 Pinterest 下載是最後一步
 
-    # --- 如果不是處理截圖返回，則執行正常邏輯 ---
+            with open(image_path, "rb") as f: image_bytes = f.read()
+            base64_data = base64.b64encode(image_bytes).decode('utf-8')
+            file_extension = os.path.splitext(image_path)[1].lower()
+            mime_type = "image/png"
+            if file_extension == ".jpeg" or file_extension == ".jpg": mime_type = "image/jpeg"
+            elif file_extension == ".gif": mime_type = "image/gif"
+            elif file_extension == ".webp": mime_type = "image/webp"
+            data_uri = f"data:{mime_type};base64,{base64_data}"
+            print(f"    推斷 MIME 類型: {mime_type}")
+
+            # 返回一個簡化的完成消息，因為詳細信息已在 ToolMessage 中
+            return {
+                "messages": [AIMessage(content=f"Pinterest 圖片搜索和下載完成。\n最後一個下載的文件保存在: {image_path}")],
+                "saved_image_path": image_path, # 重用現有字段存儲最後一個路徑
+                "saved_image_data_uri": data_uri, # 重用現有字段存儲最後一個URI
+                "task_complete": True # 假設 Pinterest 下載通常是任務的結束
+            }
+        except Exception as img_proc_err:
+            print(f"  !! 處理 Pinterest 下載文件 '{image_path}' 或編碼時出錯: {img_proc_err}")
+            traceback.print_exc()
+            return {"messages": [AIMessage(content=f"Pinterest 下載完成，但處理文件 '{image_path}' 時失敗: {img_proc_err}")], "task_complete": True}
+
+    # --- 如果不是處理特定工具返回，則執行正常規劃/執行邏輯 ---
     try:
-        # 處理輸入圖片路徑
+        # ... (獲取初始消息、圖片路徑的邏輯保持不變) ...
         initial_image_path = state.get('initial_image_path')
         has_input_image = initial_image_path and os.path.exists(initial_image_path)
-        if has_input_image:
-            print(f"  檢測到初始圖片輸入: {initial_image_path}")
-        else:
-            print("  未檢測到有效初始圖片輸入。")
+        if has_input_image: print(f"  檢測到初始圖片輸入: {initial_image_path}")
+        else: print("  未檢測到有效初始圖片輸入。")
 
-        # 1. 獲取初始消息 (包含文本)
         if not current_messages or not isinstance(current_messages[0], HumanMessage):
-             print("!! 錯誤：狀態 'messages' 為空或第一個消息不是 HumanMessage。請檢查圖調用方式。")
+             print("!! 錯誤：狀態 'messages' 為空或第一個消息不是 HumanMessage。")
              return {"messages": [AIMessage(content="內部錯誤：缺少有效的初始用戶請求消息。")]}
         initial_user_message_obj = current_messages[0]
-        # 從 HumanMessage 中提取文本內容，即使它是列表格式
         initial_user_text = ""
-        if isinstance(initial_user_message_obj.content, str):
-            initial_user_text = initial_user_message_obj.content
+        if isinstance(initial_user_message_obj.content, str): initial_user_text = initial_user_message_obj.content
         elif isinstance(initial_user_message_obj.content, list):
             for item in initial_user_message_obj.content:
                 if isinstance(item, dict) and item.get("type") == "text":
-                    initial_user_text = item.get("text", "")
-                    break
+                    initial_user_text = item.get("text", ""); break
         if not initial_user_text:
             print("!! 錯誤：無法從初始 HumanMessage 提取文本內容。")
             return {"messages": [AIMessage(content="內部錯誤：無法解析初始用戶請求文本。")]}
+        print(f"  使用初始文本 '{initial_user_text[:100]}...' 作為基礎。")
 
-        print(f"  使用初始文本 '{initial_user_text[:100]}...' 作為規劃基礎。")
 
-        # 2. 獲取 MCP 工具 (不再載入 img_recognition)
+        # 獲取 MCP 工具
         mcp_tools = await get_mcp_tools(mcp_name)
         print(f"  獲取了 {len(mcp_tools)} 個 {mcp_name} MCP 工具。")
         if not mcp_tools: print(f"  警告：未找到 {mcp_name} 工具！")
 
-        # 3. 檢查是否需要規劃
+        # 檢查是否需要規劃
         PLAN_PREFIX = "[目標階段計劃]:\n"
         plan_exists = any(
-            isinstance(msg, AIMessage) and msg.content.strip().startswith(PLAN_PREFIX)
+            isinstance(msg, AIMessage) and isinstance(msg.content, str) and msg.content.strip().startswith(PLAN_PREFIX)
             for msg in current_messages
         )
 
@@ -657,50 +848,47 @@ async def agent_node_logic(state: MCPAgentState, config: RunnableConfig, mcp_nam
 
         if not plan_exists:
             print("  需要生成執行計劃...")
-            # --- 簡化規劃提示構造 ---
             tool_descriptions = "\n".join([f"- {tool.name}: {tool.description}" for tool in mcp_tools])
-            # 直接使用 f-string 構建完整提示，包含基本指令、例子和工具
-            planning_system_content = f"""你是一位優秀的 CAD/BIM 任務規劃助理。
-            基於使用者提供的文字請求、提供的圖像 ({initial_image_path}) 以及下方列出的可用工具，生成一個清晰的、**分階段目標**的計劃，並在最後一步加入截圖指令。
+            # --- 調整 planning prompt slightly for Pinterest ---
+            planning_system_content = f"""你是一位優秀的任務規劃助理，專門為 CAD/BIM、圖像搜索或地理空間任務制定計劃。
+            基於使用者提供的文字請求、可選的圖像以及下方列出的可用工具，生成一個清晰的、**分階段目標**的計劃。
+
+            對於 Rhino/Revit，計劃的最後一步應是截圖 (`capture_focused_view`)。
+            對於 Pinterest，計劃通常是搜索 (`pinterest_search_and_download`)。
+            對於 OSM，計劃通常是地理編碼加截圖 (`geocode_and_screenshot`)。
 
             這個計劃應側重於**每個階段要達成的目標狀態**，而不是具體的工具使用細節。將任務分解成符合邏輯順序的多個階段目標。
-            切記[最後目標] 使用 capture_viewport 截取最終畫面。直接輸出這個階段性目標計劃，不要額外的開場白或解釋。
+            直接輸出這個階段性目標計劃，不要額外的開場白或解釋。
 
-            可用工具如下：
+            可用工具如下 ({mcp_name}):
             {tool_descriptions}"""
             planning_system_message = SystemMessage(content=planning_system_content)
             print("    構造了規劃 SystemMessage")
 
-            # --- 構造規劃 HumanMessage (包含圖片) ---
+            # --- 構造規劃 HumanMessage (保持不變) ---
             planning_human_content = [{"type": "text", "text": initial_user_text}]
             if has_input_image:
                 try:
-                    # 直接讀取圖片並編碼，準備傳遞給 Gemini
-                    with open(initial_image_path, "rb") as img_file:
-                        img_bytes = img_file.read()
+                    with open(initial_image_path, "rb") as img_file: img_bytes = img_file.read()
                     img_base64 = base64.b64encode(img_bytes).decode('utf-8')
-                    # Gemini 通常接受這種格式的圖片輸入
+                    mime_type="image/png" # Assume png, adjust if needed
                     planning_human_content.append({
                         "type": "image_url",
-                        "image_url": {"url": f"data:image/png;base64,{img_base64}"} # 假設是PNG, 可根據需要調整mime type
+                        "image_url": {"url": f"data:{mime_type};base64,{img_base64}"}
                     })
                     print("    已將初始圖片添加到規劃 HumanMessage 中。")
                 except Exception as img_read_err:
-                    print(f"    !! 無法讀取或編碼初始圖片: {img_read_err}，規劃將不包含圖片。")
-                    # 如果圖片讀取失敗，回退到純文本
-                    planning_human_content = initial_user_text # 或者保持列表格式只含文本
+                    print(f"    !! 無法讀取或編碼初始圖片: {img_read_err}")
+                    planning_human_content = initial_user_text
 
-            # 如果 planning_human_content 不是列表 (例如圖片讀取失敗回退了)，確保它是列表
             if not isinstance(planning_human_content, list):
                  planning_human_content = [{"type": "text", "text": str(planning_human_content)}]
-
             planning_human_message_user_input = HumanMessage(content=planning_human_content)
 
             print(f"     正在調用 LLM ({agent_llm.model}) 進行規劃...")
             plan_message = None
             try:
                 planning_llm_no_callbacks = agent_llm.with_config({"callbacks": None})
-                # 傳遞包含圖片的 HumanMessage
                 planning_response = await planning_llm_no_callbacks.ainvoke(
                     [planning_system_message, planning_human_message_user_input]
                 )
@@ -717,58 +905,43 @@ async def agent_node_logic(state: MCPAgentState, config: RunnableConfig, mcp_nam
                  error_message = f"調用規劃 LLM 時出錯: {planning_err}"
                  plan_message = AIMessage(content=error_message)
             finally:
-                # --- 在規劃 LLM 調用後加入延遲 ---
                 print(f"     規劃 LLM 調用結束，等待 {RPM_DELAY} 秒...")
                 await asyncio.sleep(RPM_DELAY)
                 print("     等待結束。")
 
-
-            if plan_message:
-                messages_to_return.append(plan_message)
+            if plan_message: messages_to_return.append(plan_message)
         else:
              print("  檢測到已有計劃，跳過規劃步驟。")
 
-        # 4. 調用 call_llm_with_tools 執行下一步 (不再傳遞 input_image_path，因為已包含在消息中)
-        # 確保 messages_for_execution 的第一條消息（HumanMessage）在規劃階段已被正確構建（含圖片）
+        # 調用 call_llm_with_tools 執行下一步
         messages_for_execution = current_messages + messages_to_return
-        # 更新初始 HumanMessage 以包含圖片 (如果規劃步驟未創建新的HumanMessage)
         if has_input_image and isinstance(messages_for_execution[0], HumanMessage) and not isinstance(messages_for_execution[0].content, list):
+             # ... (修正 HumanMessage 包含圖片的邏輯保持不變) ...
              print("   修正執行階段的初始 HumanMessage 以包含圖片...")
              try:
-                 with open(initial_image_path, "rb") as img_file:
-                     img_bytes = img_file.read()
+                 with open(initial_image_path, "rb") as img_file: img_bytes = img_file.read()
                  img_base64 = base64.b64encode(img_bytes).decode('utf-8')
+                 mime_type="image/png" # Assume png
                  initial_human_content = [
                      {"type": "text", "text": initial_user_text},
-                     {"type": "image_url", "image_url": {"url": f"data:image/png;base64,{img_base64}"}}
+                     {"type": "image_url", "image_url": {"url": f"data:{mime_type};base64,{img_base64}"}}
                  ]
                  messages_for_execution[0] = HumanMessage(content=initial_human_content)
              except Exception as img_read_err:
                  print(f"   !! 無法讀取或編碼初始圖片用於執行階段: {img_read_err}")
 
 
-        # 不再添加輔助 ToolMessage
-        # 不再傳遞 input_image_path 參數給 call_llm_with_tools
         execution_response = None
         try:
-            # --- 調用執行 LLM ---
-            execution_response = await call_llm_with_tools(
-                messages_for_execution,
-                mcp_tools # 只傳遞 MCP 工具
-            )
+            execution_response = await call_llm_with_tools(messages_for_execution, mcp_tools)
         finally:
-             # --- 在執行 LLM 調用後加入延遲 ---
-             # 即使 call_llm_with_tools 內部出錯，這裡也應該延遲，避免連續快速重試
              print(f"     執行 LLM 調用結束，等待 {RPM_DELAY} 秒...")
              await asyncio.sleep(RPM_DELAY)
              print("     等待結束。")
 
+        if execution_response: messages_to_return.append(execution_response)
 
-        # 5. 將執行結果添加到要返回的消息列表中
-        if execution_response: # 確保 execution_response 不是 None
-            messages_to_return.append(execution_response)
-
-        # 6. 返回新生成的消息
+        # 返回新生成的消息 (不標記 task_complete，由 should_continue 決定)
         return {"messages": messages_to_return}
 
     except Exception as e:
@@ -776,14 +949,22 @@ async def agent_node_logic(state: MCPAgentState, config: RunnableConfig, mcp_nam
         traceback.print_exc()
         return {"messages": [AIMessage(content=f"執行 {mcp_name} Agent 時發生外部錯誤: {e}")]}
 
-# --- 具體的 Agent Nodes (調用修改後的 agent_node_logic) ---
+# --- 具體的 Agent Nodes (添加 OSM) ---
 async def call_revit_agent(state: MCPAgentState, config: RunnableConfig) -> Dict:
     return await agent_node_logic(state, config, "revit")
 
 async def call_rhino_agent(state: MCPAgentState, config: RunnableConfig) -> Dict:
     return await agent_node_logic(state, config, "rhino")
 
-# --- Tool Executor Node ---
+# --- 新增 Pinterest Agent Node ---
+async def call_pinterest_agent(state: MCPAgentState, config: RunnableConfig) -> Dict:
+    return await agent_node_logic(state, config, "pinterest")
+
+# --- 新增 OSM Agent Node ---
+async def call_osm_agent(state: MCPAgentState, config: RunnableConfig) -> Dict:
+    return await agent_node_logic(state, config, "osm")
+
+# --- Tool Executor Node (保持不變) ---
 async def agent_tool_executor(state: MCPAgentState, config: RunnableConfig) -> Dict:
     """執行 Agent 請求的工具調用 (使用 print)。"""
     print("--- 執行 Agent 工具節點 ---")
@@ -816,97 +997,105 @@ async def agent_tool_executor(state: MCPAgentState, config: RunnableConfig) -> D
         return {"messages": error_tool_messages}
 
 # =============================================================================
-# Conditional Edge Logic (調整 should_continue)
+# Conditional Edge Logic (修改 should_continue 處理 task_complete)
 # =============================================================================
 def should_continue(state: MCPAgentState) -> str:
     """確定是否繼續處理請求、調用工具或結束。"""
     print("--- 判斷是否繼續 ---")
     messages = state['messages']
     last_message = messages[-1] if messages else None
-    target_mcp = state.get("target_mcp", "unknown") # 獲取目標 Agent
+    target_mcp = state.get("target_mcp", "unknown")
+
+    # --- 優先檢查 task_complete 標誌 ---
+    if state.get("task_complete"):
+        print("  檢測到 task_complete 標誌 -> end")
+        return END
 
     if not last_message:
         print("  消息列表為空 -> end")
         return END
 
-    # --- 優先檢查最大步驟數 ---
-    # 計算 AIMessage 和 ToolMessage 的總數作為步驟數
-    # message_count = sum(1 for msg in messages if isinstance(msg, (AIMessage, ToolMessage)))
-    # MAX_STEPS = 30 # 或根據需要調整
-    # if message_count >= MAX_STEPS:
-    #     print(f"  達到最大步驟數 {message_count} -> end")
-    #     return END
-
     # --- 根據最後一條消息的類型和內容判斷 ---
     if isinstance(last_message, AIMessage):
         print("  最後消息是 AIMessage")
-        content = ""
+        content_str = ""
         if isinstance(last_message.content, str):
-            content = last_message.content.lower() # 確保是字符串再lower
+            content_str = last_message.content.lower()
 
-        # --- 【修改點】檢查是否是截圖成功或失敗的最終消息 ---
-        if "任務已完成" in content or "最終畫面已截取" in content or "任務因截圖錯誤而終止" in content:
-             print("  檢測到最終完成或截圖錯誤消息 -> end")
-             return END
-
-        # 2. 檢查是否有工具調用請求
-        elif hasattr(last_message, 'tool_calls') and last_message.tool_calls: # 保持增強檢查
+        # 檢查是否有工具調用請求
+        if hasattr(last_message, 'tool_calls') and last_message.tool_calls:
             print(f"  AI請求工具 ({len(last_message.tool_calls)}個) -> agent_tool_executor")
             return "agent_tool_executor"
-
-        # 3. 檢查是否是特定的、應導致終止的 LLM 錯誤消息
-        elif "執行 LLM 決策時發生錯誤" in content or "內部錯誤：" in content:
+        # 檢查是否是表示完成的消息 (即使沒有 task_complete 標誌也結束)
+        elif "任務已完成" in content_str or "最終畫面已截取" in content_str or "任務因截圖錯誤而終止" in content_str:
+             print("  檢測到最終完成或錯誤消息 -> end")
+             return END
+        # 檢查是否是特定的、應導致終止的 LLM 錯誤消息
+        elif "執行 LLM 決策時發生錯誤" in content_str or "內部錯誤：" in content_str:
              print("  AI 返回決策錯誤 -> end")
              return END
-
-        # 4. 預設行為：如果 AI 既未完成也未請求工具調用，則結束 (避免死循環)
+        # 預設行為：如果 AI 既未完成也未請求工具調用，則結束 (避免死循環)
         else:
-             print(f"  AI未請求工具也未宣告完成 (content: '{content[:100]}...') -> end")
+             print(f"  AI未請求工具也未宣告完成 (content: '{content_str[:100]}...') -> end")
              return END
 
     elif isinstance(last_message, ToolMessage):
         # 工具執行完成後，總是應該回到 Agent 來處理結果
-        # --- 【修改點】讓所有 ToolMessage 都返回 Agent 處理 ---
         print(f"  最後消息是 ToolMessage (來自工具 '{last_message.name}') -> 返回 {target_mcp}_agent 處理結果")
-        return f"{target_mcp}_agent" if target_mcp in ["revit", "rhino"] else END
+        # --- 修改：Route back to specific agent ---
+        if target_mcp in ["revit", "rhino", "pinterest", "osm"]:
+            return f"{target_mcp}_agent"
+        else:
+            print(f"  警告: 無效的 target_mcp ('{target_mcp}')，無法返回 Agent -> end")
+            return END
+        # --- END MODIFIED ---
 
     elif isinstance(last_message, HumanMessage):
-         # 正常情況下，在 router 之後，最後一條消息不應是 HumanMessage
-         # 如果發生，通常意味著流程異常或剛開始
+         # ... (HumanMessage 處理邏輯保持不變) ...
          if len(messages) == 1:
-              # 這是初始狀態，理論上不應調用 should_continue
               print("  只有初始 HumanMessage -> 邏輯應由 Router 處理 (返回 END 避免死循環)")
               return END
          else:
               print("  在流程中意外出現 HumanMessage -> end (異常)")
               return END
     else:
-        # 未知消息類型
         print(f"  未知的最後消息類型 ({type(last_message).__name__}) -> end")
         return END
 
 # =============================================================================
-# 建立和編譯 LangGraph (移除 final_screenshot_node)
+# 建立和編譯 LangGraph (添加 OSM 節點和邊)
 # =============================================================================
 workflow = StateGraph(MCPAgentState)
 workflow.add_node("router", route_mcp_target)
 workflow.add_node("revit_agent", call_revit_agent)
 workflow.add_node("rhino_agent", call_rhino_agent)
+# --- 新增 Pinterest Node ---
+workflow.add_node("pinterest_agent", call_pinterest_agent)
+# --- 新增 OSM Node ---
+workflow.add_node("osm_agent", call_osm_agent)
 workflow.add_node("agent_tool_executor", agent_tool_executor)
 
 workflow.set_entry_point("router")
 
+# --- 修改 Router Edges ---
 workflow.add_conditional_edges(
-    "router", lambda x: x.get("target_mcp"), {"revit": "revit_agent", "rhino": "rhino_agent"}
+    "router",
+    lambda x: x.get("target_mcp"),
+    {
+        "revit": "revit_agent",
+        "rhino": "rhino_agent",
+        "pinterest": "pinterest_agent",
+        "osm": "osm_agent"
+    }
 )
 
-# Agent 節點後的判斷 (現在由 should_continue 處理循環和結束)
+# --- 新增 Edges for OSM Agent ---
 workflow.add_conditional_edges(
     "revit_agent",
     should_continue,
     {
         "agent_tool_executor": "agent_tool_executor",
-        END: END # 包含完成和錯誤情況
+        END: END
     }
 )
 workflow.add_conditional_edges(
@@ -914,57 +1103,46 @@ workflow.add_conditional_edges(
     should_continue,
     {
         "agent_tool_executor": "agent_tool_executor",
-        END: END # 包含完成和錯誤情況
+        END: END
+    }
+)
+# Add edges for the new pinterest agent
+workflow.add_conditional_edges(
+    "pinterest_agent",
+    should_continue,
+    {
+        "agent_tool_executor": "agent_tool_executor",
+        END: END # Pinterest agent might also end directly or request tools
     }
 )
 
-# --- 【修改點】工具執行後，根據 should_continue 的判斷決定去向 ---
-# 工具執行後，返回對應的 Agent 進行處理
-# should_continue 會根據 ToolMessage 的內容判斷是否需要返回 Agent
+# Add edges for the new pinterest agent
+workflow.add_conditional_edges(
+    "osm_agent",
+    should_continue,
+    {
+        "agent_tool_executor": "agent_tool_executor",
+        END: END # Pinterest agent might also end directly or request tools
+    }
+)
+# --- END MODIFIED ---
+
+# --- 修改 Tool Executor Edges ---
 workflow.add_conditional_edges(
    "agent_tool_executor",
-   should_continue, # should_continue 會在 ToolMessage 後返回對應的 Agent 名稱
+   should_continue, # should_continue now returns the correct agent name or END
    {
        "revit_agent": "revit_agent",
        "rhino_agent": "rhino_agent",
-       END: END # 以防萬一 should_continue 返回 END (理論上不應發生)
+       "pinterest_agent": "pinterest_agent",
+       "osm_agent": "osm_agent",
+       END: END
    }
 )
 
-
 graph = workflow.compile()
-graph.name = "Router_AgentPlanning_MCP_Agent_V16_FilePathWorkaround" # 更新版本號
+# --- 修改 Graph Name ---
+graph.name = "Router_AgentPlanning_MCP_Agent_V18_OSM"
 print(f"LangGraph 編譯完成: {graph.name}")
 
-# =============================================================================
-# 更新調用提示信息 (移除圖像加載示例)
-# =============================================================================
-print("\n測試執行代碼塊 和 get_image_data 函數 已移除。")
-print("請在其他地方導入並使用 'graph' 對象來運行流程。")
-print("\n重要提示：如何調用 Graph:")
-print("1. 準備初始狀態字典 `initial_state`。")
-print("2. `initial_state['initial_request']` 應為用戶請求的純文本字串 (用於路由)。")
-print("3. `initial_state['initial_image_path']` 可選，用於記錄圖像來源，但代碼不再處理圖像加載。")
-print("4. `initial_state['messages']` 必須是一個列表，且第一個元素是 `HumanMessage`。")
-print("   - 這個 `HumanMessage` 的 `content` 可以是純文本，或包含文本的列表:")
-print("     - 簡單文本: `HumanMessage(content='用戶請求文本')`")
-print("     - 或列表格式: `HumanMessage(content=[{'type': 'text', 'text': '用戶請求文本'}])`")
-print("   - 示例:")
-print("""
-from langchain_core.messages import HumanMessage
-
-user_text = "創建一個紅色立方體"
-# image_path = "path/to/your/image.png" # 不再需要加載圖像
-
-initial_state = {
-    "messages": [HumanMessage(content=user_text)], # 或使用列表格式 content
-    "initial_request": user_text,
-    "initial_image_path": None, # 或提供路徑字串
-    # target_mcp, task_complete, saved_image_path, saved_image_data_uri 不需要初始設置
-}
-# 然後調用: result = await graph.ainvoke(initial_state, config=...)
-""")
-
-# --- 主程序結束後的提示 ---
-print("\nMulti MCP Agent (File Path Workaround Version) 定義完成。")
 
