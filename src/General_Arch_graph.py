@@ -196,11 +196,34 @@ class ProcessManagement:
         """Generates a summary and saves a task state to the vectorstore."""
         task_id = task.get('task_id', 'N/A')
         status = task.get('status', 'N/A')
+        agent_name = task.get('selected_agent', 'N/A') # Get agent name for logging
+
         if task_id == 'N/A':
             print("PM LTM Warning: Cannot save task without ID.")
             return
 
-        print(f"PM LTM: Preparing to save task {task_id} with status '{status}'...")
+        print(f"PM LTM: Preparing to save task {task_id} (Agent: {agent_name}, Status: '{status}')...")
+
+        # --- <<< ADDED LOGGING for outputs >>> ---
+        task_outputs_to_log = task.get('outputs')
+        if task_outputs_to_log:
+            try:
+                # Log a preview, be careful with large outputs
+                outputs_preview = json.dumps(task_outputs_to_log, ensure_ascii=False, default=str)[:500]
+                print(f"  - Task {task_id} Outputs being saved to LTM (Preview): {outputs_preview}")
+                # Specifically check Pinterest output structure if agent matches
+                if agent_name == "PinterestMCPCoordinator":
+                     pinterest_paths = task_outputs_to_log.get("saved_image_paths")
+                     if isinstance(pinterest_paths, list):
+                         print(f"    - Pinterest paths found in outputs: Count={len(pinterest_paths)}, First few: {pinterest_paths[:3]}")
+                     else:
+                         print(f"    - Pinterest paths ('saved_image_paths') key not found or not a list in outputs.")
+            except Exception as log_e:
+                print(f"  - Warning: Could not serialize/preview outputs for LTM logging: {log_e}")
+        else:
+            print(f"  - Task {task_id} has no 'outputs' field to save to LTM.")
+        # --- <<< END ADDED LOGGING >>> ---
+
         summary = self._create_task_summary(task)
         # print(f"PM LTM Summary for {task_id}:\n{summary}\n--------------------") # Optional: Debug print summary
 
@@ -209,7 +232,7 @@ class ProcessManagement:
         metadata = {
             "task_id": task_id,
             "status": status,
-            "agent": task.get("selected_agent", "N/A"),
+            "agent": agent_name,
             "requires_evaluation": task.get("requires_evaluation", False),
             "timestamp": datetime.now().isoformat() # Add timestamp
         }
@@ -254,7 +277,23 @@ class ProcessManagement:
             summarized_tasks = [{"task_id": t.get("task_id", "N/A"), "objective": t.get("task_objective", "N/A")} for t in tasks]
             tasks_json_for_interrupt = json.dumps(summarized_tasks, ensure_ascii=False)
             current_task_for_interrupt = tasks[current_idx] if 0 <= current_idx < len(tasks) else None
-            current_task_json_for_interrupt = json.dumps(current_task_for_interrupt, ensure_ascii=False, default=lambda o: '<not serializable>') if current_task_for_interrupt else "{}"
+            
+            # --- <<< 修改：過濾當前任務以生成 JSON >>> ---
+            current_task_filtered = {}
+            if current_task_for_interrupt:
+                current_task_filtered = current_task_for_interrupt.copy()
+                # 從 task['outputs'] 中移除不需要的鍵
+                if "outputs" in current_task_filtered and isinstance(current_task_filtered["outputs"], dict):
+                    current_task_outputs_filtered = current_task_filtered["outputs"].copy()
+                    current_task_outputs_filtered.pop("mcp_internal_messages", None)
+                    current_task_outputs_filtered.pop("grounding_sources", None)
+                    current_task_outputs_filtered.pop("search_suggestions", None) # 加入移除
+                    current_task_filtered["outputs"] = current_task_outputs_filtered # 用過濾後的版本替換
+                # 可以考慮也過濾 task_inputs 如果需要
+                # if "task_inputs" in current_task_filtered and isinstance(current_task_filtered["task_inputs"], dict): ...
+
+            current_task_json_for_interrupt = json.dumps(current_task_filtered, ensure_ascii=False, default=lambda o: '<not serializable>') if current_task_filtered else "{}"
+            # --- <<< 結束修改 >>> ---
 
             interrupt_prompt_input = {
                 "user_input": state.get("user_input", ""), "interrupt_input": interrupt_input,
@@ -522,7 +561,7 @@ class ProcessManagement:
                     print(f"  Failure Type: {failure_type}")
                     print(f"  Is Max Retries (Passed to LLM): {is_max_retries}") # Log what LLM sees
                     print(f"  Current Retry Count (Passed to LLM): {current_retry_count}") # Log count LLM sees
-                    print(f"  Feedback Log (Input): {fail_prompt_input['feedback_log'][:500]}...")
+                    # print(f"  Feedback Log (Input): {fail_prompt_input['feedback_log'][:500]}...")
                     print(f"  Error Log (Input): {fail_prompt_input['execution_error_log']}")
                     print("-----------------------------------------")
 
@@ -661,7 +700,11 @@ class ProcessManagement:
                     print(f"PM (Fail): Skipping task {task_id} at index {current_idx} based on action 'SKIP'.")
                     # Ensure status is max_retries_reached if it was forced skip due to retries
                     if tasks[current_idx].get("retry_count", 0) >= max_retries:
-                        tasks[current_idx]["status"] = "max_retries_reached"
+                         tasks[current_idx]["status"] = "max_retries_reached"
+                         # --- FIX: Save skipped task to LTM ---
+                         print(f"PM Loop: Saving skipped/max_retries task {task_id} to LTM before skipping.")
+                         await self._save_task_to_ltm(tasks[current_idx])
+                         # --- END FIX ---
 
                     current_idx += 1
                     output_state["current_task_index"] = current_idx # Update index before continuing
@@ -673,17 +716,21 @@ class ProcessManagement:
             # --- End of failed/max_retries_reached block ---
 
             elif status == "completed":
-                # Completed logic remains the same
+                # --- FIX: Ensure index update happens correctly ---
                 print(f"PM Loop: Handling 'completed' for task {task_id}. Saving to LTM.")
                 await self._save_task_to_ltm(task_to_check)
-                current_idx += 1
+                current_idx += 1 # Increment index AFTER processing the completed task
+                # --- Update state *after* incrementing ---
                 output_state["current_task_index"] = current_idx
-                print(f"PM Loop: Incremented index to {current_idx} after completing task {task_id}. Continuing loop.")
-                continue # Continue WHILE loop
+                output_state["current_task"] = tasks[current_idx].copy() if 0 <= current_idx < len(tasks) else None
+                print(f"PM Loop: Incremented index to {current_idx} after completing task {task_id}. Continuing loop check.")
+                # --- Let the loop condition check the new index ---
+                continue # Go back to the start of the while loop check
 
             elif status in ["pending", "in_progress", None]:
                 # Pending/In Progress logic remains the same
                 print(f"PM Loop: Task {task_id} is '{status}'. Ready for routing. Breaking loop.")
+                # --- Ensure state reflects the task to be routed ---
                 output_state["current_task_index"] = current_idx
                 output_state["current_task"] = task_to_check.copy()
                 break # Break WHILE loop
@@ -691,8 +738,13 @@ class ProcessManagement:
             else:
                 # Unexpected status logic remains the same
                 print(f"PM Loop Warning: Unhandled task status '{status}' for Task {task_id}. Skipping.")
+                 # --- FIX: Save unexpected status task to LTM before skipping ---
+                print(f"PM Loop: Saving task {task_id} with unexpected status '{status}' to LTM before skipping.")
+                await self._save_task_to_ltm(task_to_check)
+                 # --- END FIX ---
                 current_idx += 1
                 output_state["current_task_index"] = current_idx
+                output_state["current_task"] = tasks[current_idx].copy() if 0 <= current_idx < len(tasks) else None
                 print(f"PM Loop (Warning): Updated current_idx to {current_idx}. Continuing loop.")
                 continue
 
@@ -701,11 +753,19 @@ class ProcessManagement:
         print(f"PM: --- Debug log: Exited status check loop ---")
         final_idx_after_loop = output_state.get("current_task_index", current_idx) # Get potentially updated index
         print(f"PM: Final index after loop processing: {final_idx_after_loop}")
-        if final_idx_after_loop >= len(tasks):
+        tasks_final_count = len(output_state.get("tasks", [])) # Get final task count
+        if final_idx_after_loop >= tasks_final_count:
             print("PM: Reached end of task list after loop.")
             # State for current_task/index already set inside loop or at end
             output_state["current_task"] = None # Ensure current task is None if index is out of bounds
-        # else: Task found, index/task already set inside loop's break condition
+            output_state["current_task_index"] = final_idx_after_loop # Keep the final index
+        else:
+             # Task found, index/task already set inside loop's break condition
+             # Ensure state reflects this correctly
+             output_state["current_task_index"] = final_idx_after_loop
+             if "current_task" not in output_state or output_state["current_task"] is None or output_state["current_task"].get("task_id") != tasks[final_idx_after_loop].get("task_id"):
+                  output_state["current_task"] = tasks[final_idx_after_loop].copy()
+             print(f"PM: Exiting with index {final_idx_after_loop} pointing to task {output_state['current_task'].get('task_id') if output_state.get('current_task') else 'N/A'}.")
 
         # Final state preparation remains the same
         if "tasks" not in output_state: output_state["tasks"] = state.get("tasks", [])
@@ -715,78 +775,51 @@ class ProcessManagement:
 class EvaAgent:
     """
     Parent node responsible for initiating evaluation by invoking the evaluation_subgraph.
-    It now marks tasks intended for final/holistic evaluation.
+    It now acts as a simple trigger based on routing.
     """
     def __init__(self):
-        pass # No internal state needed
+        pass
 
     async def run(self, state: WorkflowState, config: RunnableConfig) -> Dict[str, Any]:
         """
-        Checks if evaluation is needed, marks final eval tasks, invokes subgraph,
-        and updates Task status based on subgraph results.
+        Checks if evaluation is needed (based on routing) and invokes subgraph.
+        Evaluation type logic is handled within the subgraph based on selected_agent.
         """
-        print("--- Running EvaAgent Node (TaskState Version) ---")
+        print("--- Running EvaAgent Node (Simple Trigger) ---") # Updated description
         current_idx = state["current_task_index"]
         tasks = [t.copy() for t in state["tasks"]]
         if current_idx >= len(tasks):
              print("EvaAgent Error: Invalid task index.")
-             return {} # Should not happen if routing is correct
+             return {}
         current_task = tasks[current_idx]
 
-        # --- MODIFIED: Check if evaluation is needed ---
-        # If the task requires evaluation AND is pending, EvaAgent should handle it,
-        # regardless of whether it was assigned directly to EvaAgent or is an intermediate eval.
-        needs_evaluation_now = (
-            current_task.get("requires_evaluation", False) and
-            current_task.get("status") == "pending"
-        )
-        # The is_final_evaluation_task check remains separate and correct
-        # It also implies status is 'pending' and requires_evaluation is True.
-        is_final_evaluation_task = (
-            current_task.get("task_objective") == "final_evaluation" and
-            needs_evaluation_now # Simplified: If it's final objective AND pending+requires_eval
-        )
-
-        # Combine the conditions: If it's pending and requires evaluation (either regular or final)
-        should_run_evaluation = needs_evaluation_now # This now covers both regular and final pending evaluations
-
-        if not should_run_evaluation:
-            # Log reason more clearly
+        # Simplified check: If routed here, assume evaluation is needed and pending
+        if not (current_task.get("requires_evaluation", False) and current_task.get("status") == "pending"):
             status = current_task.get('status')
             req_eval = current_task.get('requires_evaluation')
-            print(f"EvaAgent: Skipping task {current_task['task_id']} - Evaluation not triggered (Requires Eval: {req_eval}, Status: {status}).")
-            return {"tasks": state.get("tasks", [])} # Return original tasks list
+            print(f"EvaAgent Warning: Routed here but task {current_task['task_id']} might not be ready? (Requires Eval: {req_eval}, Status: {status}). Proceeding anyway.")
+            # Continue, assuming routing logic is correct
 
-        # --- If should_run_evaluation is True, proceed with the rest of the logic ---
-        print(f"EvaAgent: Preparing evaluation for Task {current_task['task_id']}")
-        if "evaluation" not in current_task: # Ensure evaluation dict exists
-            current_task["evaluation"] = {}
+        print(f"EvaAgent: Triggering evaluation for Task {current_task['task_id']} (Agent: {current_task.get('selected_agent')})")
 
-        # --- Set status to in_progress to signify evaluation start ---
-        # This should happen for both regular and final evaluation tasks entering here
-        # Use is_final_evaluation_task flag determined above for logging clarity
-        print(f"EvaAgent: Task requires evaluation (Final: {is_final_evaluation_task}). Updating status to in_progress.")
-        current_task["status"] = "in_progress" # Mark evaluation as started
+        # --- REMOVED: Logic to check/set/infer boolean flags ---
 
-        # --- Mark if this is a final evaluation task ---
-        # is_final_evaluation_task is already determined above
-        if is_final_evaluation_task:
-             print("EvaAgent: Identified as FINAL evaluation task.")
-             current_task["evaluation"]["is_final_evaluation"] = True
-        else:
-             print("EvaAgent: Identified as REGULAR intermediate evaluation task.")
-             current_task["evaluation"]["is_final_evaluation"] = False # Ensure it's False for regular
+        # --- Set status to in_progress ---
+        print(f"EvaAgent: Setting task status to in_progress.")
+        current_task["status"] = "in_progress"
 
         # Update the tasks list in the state *before* calling the subgraph
-        # Create a new list with the updated task
         tasks = tasks[:current_idx] + [current_task] + tasks[current_idx+1:]
-        state["tasks"] = tasks # Update the state that will be passed to the subgraph
+        state["tasks"] = tasks
 
-
-        # --- Invoke Subgraph (logic remains same) ---
+        # --- Invoke Subgraph ---
         try:
-            print(f"EvaAgent: Invoking evaluation subgraph (operates on WorkflowState)...")
-            # Pass the modified state (with updated task status) to the subgraph
+            print(f"EvaAgent: Invoking evaluation subgraph...")
+            # --- MODIFICATION: Use Send to pass the *entire* state to the subgraph ---
+            # The subgraph now operates on the main WorkflowState
+            # return Send(to="evaluation_teams", inputs=state) # Send doesn't return dict directly
+            # --- CORRECTION: EvaAgent node itself should return the output dict ---
+            # We directly invoke the subgraph here.
             subgraph_output_state: WorkflowState = await evaluation_teams.ainvoke(state, config=config)
             print(f"EvaAgent: Evaluation subgraph finished.")
 
@@ -804,19 +837,7 @@ class EvaAgent:
                  else:
                      return {"tasks": tasks} # Return original list if index was truly invalid initially
 
-
-            final_task = final_tasks[current_idx] # Get the potentially modified task
-            subgraph_internal_error = final_task.get("evaluation", {}).get("subgraph_error")
-
-            # Ensure status reflects internal errors (logic remains same)
-            if subgraph_internal_error and final_task["status"] != "failed":
-                print(f"EvaAgent: Evaluation subgraph reported an internal error: {subgraph_internal_error}. Ensuring status is 'failed'.")
-                final_task["status"] = "failed"
-                error_log = final_task.get("error_log", "")
-                if f"Evaluation Subgraph Error: {subgraph_internal_error}" not in error_log:
-                    final_task["error_log"] = f"{error_log}; Evaluation Subgraph Error: {subgraph_internal_error}".strip("; ")
-
-            # Final status logging (logic remains same)
+            final_task = final_tasks[current_idx] # Get the updated task
             print(f"Task {final_task['task_id']} finished evaluation phase with status: {final_task['status']}")
             if final_task["status"] == "failed":
                 print(f"  - Feedback/Error Log: {final_task.get('feedback_log', 'N/A')} / {final_task.get('error_log', 'N/A')}")
@@ -840,12 +861,11 @@ class EvaAgent:
             else:
                  print(f"EvaAgent Warning: Could not log final task status due to index ({current_idx}) or tasks list issues after subgraph.")
             # --- <<< END ADD LOGGING >>> ---
-
+            final_tasks = subgraph_output_state.get("tasks", tasks)
             # Return the full updated tasks list from the subgraph output state
             return {"tasks": final_tasks}
 
         except Exception as e:
-            # Handle errors during the invocation of the subgraph itself (logic remains same)
             print(f"EvaAgent: Error invoking evaluation subgraph: {e}")
             import traceback
             traceback.print_exc()
@@ -1007,49 +1027,109 @@ class QA_Agent:
             qa_chain = self.prompt_template | llm
             response_message: AIMessage = await qa_chain.ainvoke(chain_input)
             response_content = response_message.content.strip()
-            print(f"{node_name} Response: {response_content}")
-            ai_message = response_message
+            print(f"{node_name} 原始回應: {response_content[:150]}...")
+            
+            # --- 增強意圖檢測 ---
+            intent_detected = False
+            
+            # 檢查特殊指令格式標記
+            if "#RESUME_TASK#" in response_content:
+                # 用戶想繼續任務
+                clean_content = "好的，正在返回任務執行流程。"
+                next_phase = "task_execution"
+                intent_detected = True
+                print(f"{node_name}: LLM 檢測到【繼續任務】指令標記")
+            elif "#TERMINATE#" in response_content:
+                # 用戶想結束對話
+                clean_content = "好的，對話結束。"
+                next_phase = "finished"
+                intent_detected = True
+                print(f"{node_name}: LLM 檢測到【結束對話】指令標記")
+            elif "#NEW_TASK:" in response_content:
+                # 處理新任務邏輯...
+                # ... (現有代碼) ...
+                intent_detected = True
+                
+            # --- 如果沒有檢測到指令標記，嘗試分析內容文本 ---
+            if not intent_detected:
+                # 繼續任務的模糊表達
+                resume_keywords = ["繼續任務", "返回任務", "回到任務", "繼續工作", "繼續流程", "繼續執行"]
+                is_resume_intent = any(kw in response_content.lower() for kw in resume_keywords)
+                
+                # 結束對話的模糊表達
+                terminate_keywords = ["結束對話", "結束交談", "停止對話", "再見", "謝謝再見"]
+                is_terminate_intent = any(kw in response_content.lower() for kw in terminate_keywords)
+                
+                if is_resume_intent:
+                    clean_content = "好的，正在返回任務執行流程。"
+                    next_phase = "task_execution"
+                    print(f"{node_name}: LLM 文本內容暗示【繼續任務】")
+                elif is_terminate_intent:
+                    clean_content = "好的，對話結束。"  
+                    next_phase = "finished"
+                    print(f"{node_name}: LLM 文本內容暗示【結束對話】")
+                else:
+                    # 普通對話
+                    clean_content = response_content
+                    print(f"{node_name}: 沒有檢測到特殊意圖，繼續QA對話")
+                    next_phase = "qa"
+            
+            # 更新消息內容
+            ai_message.content = clean_content
+            
+            # --- 詳細日誌 ---
+            print(f"{node_name}: 設定 current_phase = '{next_phase}'")
+            print(f"{node_name}: 處理後的AI回應: '{clean_content[:100]}...'")
+            
+            # ... (其餘保持不變) ...
+
+            # --- 處理 LLM 回應，增強 RESUME_TASK 判斷 ---
+            response_content = ai_message.content
+            next_phase = "qa"  # 預設階段
+            
+            # 增強的繼續任務偵測 - 支援多種表達方式
+            resume_keywords = ["RESUME_TASK", "繼續任務", "返回任務", "回到任務", "回到工作流程", "繼續執行"]
+            is_resume_request = response_content == "RESUME_TASK" or any(keyword in response_content.lower() for keyword in resume_keywords)
+            
+            if response_content == "TERMINATE":
+                ai_message.content = "好的，對話結束。"
+                next_phase = "finished"
+                print(f"{node_name}: 終止對話偵測到。")
+            elif response_content.startswith("NEW_TASK:"):
+                new_task_desc = response_content[len("NEW_TASK:"):].strip()
+                ai_message.content = f"收到新任務：'{new_task_desc}'。正在返回任務規劃..."
+                next_phase = "task_execution"
+                return_state_update["user_input"] = new_task_desc
+                print(f"{node_name}: 新任務請求。")
+            elif is_resume_request:  # <<< 修改：使用更廣泛的判斷 >>>
+                ai_message.content = "好的，正在返回任務執行流程。"
+                next_phase = "task_execution"  # 關鍵設定：切換到任務執行階段
+                print(f"{node_name}: 偵測到任務繼續請求！將階段設為 '{next_phase}'")
+            else:
+                print(f"{node_name}: 提供了回答，保持在 QA 階段。")
+                next_phase = "qa"
+            
+            # --- 增加額外偵錯資訊 ---
+            print(f"{node_name}: 設定 current_phase = '{next_phase}'")
+            print(f"{node_name}: AI 訊息內容: '{ai_message.content[:100]}...'")
+            
+            # --- 更新 STM ---
+            if isinstance(last_message, HumanMessage):
+                self.stm.save_context({"human_input": last_message.content}, {"output": ai_message.content})
+            
+            # --- 準備返回的狀態更新 ---
+            return_state_update["current_phase"] = next_phase
+            return_state_update["qa_context"] = [ai_message]
+            
+            print(f"{node_name}: 返回狀態更新: {return_state_update}")
+            return return_state_update
+
         except Exception as llm_e:
              print(f"{node_name} LLM Error: {llm_e}")
              ai_message = AIMessage(content=f"Error: {llm_e}")
              return_state_update["current_phase"] = "qa"
              return_state_update["qa_context"] = [ai_message]
              return return_state_update
-
-        # --- <<< 修改：處理 LLM 回應，增加 RESUME_TASK 判斷 >>> ---
-        response_content = ai_message.content
-        next_phase = "qa" # Default phase
-        if response_content == "TERMINATE":
-            ai_message.content = "好的，對話結束。" # 可以給用戶一個友好的回覆
-            next_phase = "finished" # 更新 phase 為 finished
-            print(f"{node_name}: Termination detected.")
-        elif response_content.startswith("NEW_TASK:"):
-            new_task_desc = response_content[len("NEW_TASK:") :].strip()
-            ai_message.content = f"收到新任務：'{new_task_desc}'。正在返回任務規劃..." # 友好的回覆
-            next_phase = "task_execution" # 更新 phase 為 task_execution
-            return_state_update["user_input"] = new_task_desc # 將新任務目標傳回 state
-            print(f"{node_name}: New task requested.")
-        elif response_content == "RESUME_TASK": # <<< 新增判斷 >>>
-            ai_message.content = "好的，正在返回任務執行流程。" # 友好的回覆
-            next_phase = "task_execution" # 更新 phase 為 task_execution
-            print(f"{node_name}: Task resumption requested.")
-            # 不需要清除 qa_context，因為下次進入 PM 會重新開始任務流程
-        else:
-            # 普通回答，保持在 QA 階段
-            print(f"{node_name}: Provided answer. Staying in QA.")
-            next_phase = "qa"
-        # --- <<< 結束修改 >>> ---
-
-
-        # --- 更新 STM ---
-        if isinstance(last_message, HumanMessage):
-            self.stm.save_context({"human_input": last_message.content}, {"output": ai_message.content})
-
-        # --- 準備返回的狀態更新 ---
-        return_state_update["current_phase"] = next_phase
-        return_state_update["qa_context"] = [ai_message] # 返回包含 AI 回覆的列表
-
-        return return_state_update
 
 
 # --- Keep loading agent descriptions as they are still needed ---
@@ -1073,83 +1153,71 @@ def save_final_summary(state: WorkflowState) -> WorkflowState:
     tasks = state.get("tasks", [])
     user_input = state.get("user_input", "N/A") # Use current user_input
     timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-    # Use UUID for guaranteed uniqueness even if run multiple times per second
-    summary_filename = f"workflow_summary_{timestamp}_{uuid.uuid4().hex[:8]}.md" # Shortened UUID
-    # Ensure output directory exists relative to the script or use an absolute path
-    output_dir = Path(_full_static_config.workflow.output_directory) # Use loaded static config
-    # Save summary in the parent of the output/Cache directory
+    summary_filename = f"workflow_summary_{timestamp}_{uuid.uuid4().hex[:8]}.md"
+    output_dir = Path(_full_static_config.workflow.output_directory)
     output_parent_dir = output_dir.parent
-    os.makedirs(output_parent_dir, exist_ok=True) # Create parent dir if needed
+    os.makedirs(output_parent_dir, exist_ok=True)
     summary_filepath = os.path.join(output_parent_dir, summary_filename)
 
     summary_content = f"# Workflow Summary ({timestamp})\n\n"
-    summary_content += f"## User Goal\n\n```text\n{user_input}\n```\n\n" # Changed title
+    summary_content += f"## User Goal\n\n```text\n{user_input}\n```\n\n"
     summary_content += f"## Executed Tasks ({len(tasks)})\n\n"
 
     for i, task in enumerate(tasks):
         summary_content += f"### Task {i+1}: {task.get('description', 'N/A')} (ID: {task.get('task_id', 'N/A')})\n\n"
-        summary_content += f"*   **Objective:** `{task.get('task_objective', 'N/A')}`\n" # Renamed from Type
-        summary_content += f"*   **Agent:** `{task.get('selected_agent', 'N/A')}`\n" # Added Agent
+        summary_content += f"*   **Objective:** `{task.get('task_objective', 'N/A')}`\n"
+        summary_content += f"*   **Agent:** `{task.get('selected_agent', 'N/A')}`\n"
         summary_content += f"*   **Status:** {task.get('status', 'N/A')}\n"
 
-        # --- MODIFIED: Add more detail for failed/retried tasks ---
         if task.get('status') in ['failed', 'max_retries_reached']:
             summary_content += f"*   **Retry Attempts:** {task.get('retry_count', 0)}\n"
             if task.get('error_log'):
                  summary_content += f"*   **Last Error Log:**\n    ```text\n    {task['error_log']}\n    ```\n"
-            if task.get('feedback_log'): # Feedback log might contain analysis or eval feedback contributing to failure
+            if task.get('feedback_log'):
                  summary_content += f"*   **Last Feedback Log (Analysis/Eval):**\n    ```text\n    {task['feedback_log']}\n    ```\n"
-        # --- End MODIFIED ---
 
-        inputs_str = json.dumps(task.get('task_inputs', {}), ensure_ascii=False, indent=2) # Use task_inputs
-        summary_content += f"*   **Final Inputs Used:**\n    ```json\n    {inputs_str[:1000]}{'...' if len(inputs_str) > 1000 else ''}\n    ```\n" # Renamed
+        inputs_str = json.dumps(task.get('task_inputs', {}), ensure_ascii=False, indent=2)
+        summary_content += f"*   **Final Inputs Used:**\n    ```json\n    {inputs_str[:1000]}{'...' if len(inputs_str) > 1000 else ''}\n    ```\n"
 
-        outputs = task.get('outputs', {}) # Use correct key
-        outputs_str = json.dumps(outputs, ensure_ascii=False, indent=2)
-        if outputs:
-            # Distinguish between content output and error output if structure allows
-            if outputs.get('content'):
-                 summary_content += f"*   **Output Content:**\n    ```text\n    {str(outputs['content'])[:2000]}{'...' if len(str(outputs['content'])) > 2000 else ''}\n    ```\n"
-            elif outputs.get('error'):
-                 error_detail = outputs.get('analysis', outputs['error'])
-                 summary_content += f"*   **Error Output:**\n    ```text\n    Error: {outputs['error']}\n    Analysis: {error_detail}\n    ```\n"
-            else: # General outputs dictionary
-                 summary_content += f"*   **Structured Outputs:**\n    ```json\n    {outputs_str[:2000]}{'...' if len(outputs_str) > 2000 else ''}\n    ```\n"
+        outputs = task.get('outputs', {})
+        # --- <<< FIX for TypeError and grounding_sources START >>> ---
+        outputs_for_summary = outputs.copy()
+        # Try to remove the non-serializable history for summary generation
+        mcp_history_preview = "[MCP History Present]" if "mcp_internal_messages" in outputs_for_summary else "[No MCP History]"
+        outputs_for_summary.pop("mcp_internal_messages", None)
+        outputs_for_summary.pop("search_suggestions", None)
+        # outputs_for_summary.pop("grounding_sources", None)
 
-        # Use correct key 'output_files'
+        outputs_str = "" # Initialize
+        try:
+            # Dump the cleaned version for the summary string
+            outputs_str = json.dumps(outputs_for_summary, ensure_ascii=False, indent=2, default=str) # Use default=str as fallback
+        except TypeError as e:
+            print(f"    Warning: Could not JSON dump cleaned outputs for task {task.get('task_id')} summary: {e}. Using placeholder.")
+            outputs_str = json.dumps({"error": "Could not serialize outputs", "mcp_history_status": mcp_history_preview }, ensure_ascii=False, indent=2)
+
+        if outputs: # Check if original outputs dict was non-empty
+            # Display the potentially cleaned/fallback string
+            summary_content += f"*   **Structured Outputs:** {mcp_history_preview}\n    ```json\n    {outputs_str[:2000]}{'...' if len(outputs_str) > 2000 else ''}\n    ```\n"
+
         files = task.get('output_files', [])
         if files:
             summary_content += "*   **Generated Files:**\n"
             for file_info in files:
-                file_desc = file_info.get('description', 'N/A')
-                # Prefer filename, fallback to basename of path
-                file_name = file_info.get('filename', os.path.basename(file_info.get('path', 'N/A')))
-                # Check if base64 was included (it shouldn't be based on filter, but check anyway)
-                has_base64 = " (Base64 Included)" if "base64_data" in file_info else ""
-                summary_content += f"    *   `{file_name}` ({file_info.get('type', 'N/A')}): {file_desc}{has_base64}\n" # Path removed for brevity
+                 file_desc = file_info.get('description', 'N/A')
+                 file_name = file_info.get('filename', os.path.basename(file_info.get('path', 'N/A')))
+                 has_base64 = " (Base64 Included)" if "base64_data" in file_info else ""
+                 summary_content += f"    *   `{file_name}` ({file_info.get('type', 'N/A')}): {file_desc}{has_base64}\n"
 
         evaluation = task.get('evaluation', {})
-        if evaluation and ('assessment' in evaluation or 'specific_criteria' in evaluation): # Check if eval dict has content
+        if evaluation and ('assessment' in evaluation or 'specific_criteria' in evaluation):
             summary_content += "*   **Evaluation:**\n"
             if 'assessment' in evaluation:
                  summary_content += f"    *   Assessment: **{str(evaluation.get('assessment', 'N/A')).upper()}**\n"
-            # Feedback log now captures eval feedback, so let's check there primarily
-            # if evaluation.get('feedback'):
-            #      summary_content += f"    *   Feedback: {evaluation.get('feedback', 'N/A')}\n"
-            # if evaluation.get('improvement_suggestions'): summary_content += f"    *   Suggestions: {evaluation.get('improvement_suggestions')}\n"
-            if evaluation.get('specific_criteria'): # Use correct key name
-                 # Indent criteria properly
+            if evaluation.get('specific_criteria'):
                  criteria_lines = evaluation['specific_criteria'].split('\n')
                  indented_criteria = "\n        ".join(criteria_lines)
                  summary_content += f"    *   Criteria Used:\n        ```text\n        {indented_criteria}\n        ```\n"
-
-        # Remove Task Messages as they are less relevant for summary
-        # messages = task.get('messages', [])
-        # if messages:
-        #     summary_content += "*   **Task Messages:**\n"
-        #     for msg in messages:
-        #         prefix = "Human Input" if isinstance(msg, HumanMessage) else "AI Response/Log"
-        #         summary_content += f"    *   {prefix}: {msg.content[:150]}{'...' if len(msg.content) > 150 else ''}\n"
 
         summary_content += "\n---\n\n"
     try:
@@ -1157,12 +1225,9 @@ def save_final_summary(state: WorkflowState) -> WorkflowState:
         print(f"Summary saved to: {summary_filepath}")
     except Exception as e: print(f"Error saving summary: {e}")
 
-    # --- <<< 新增：設置 Phase 為 QA >>> ---
     print("Setting current_phase to 'qa' after saving summary.")
     state["current_phase"] = "qa"
-    # --- <<< 結束新增 >>> ---
-
-    return state # Return the state with updated phase
+    return state
 
 def initialize_workflow(user_input: str) -> WorkflowState:
     """Initializes the workflow state for a new run."""
@@ -1190,28 +1255,24 @@ async def initialize_mcp_client():
 def route_from_process_management(state: WorkflowState) -> Literal[
     "assign_teams", "eva_teams", "save_final_summary", "qa_loop", "finished", "process_management"
 ]:
-    """ Determines the next node. Routes to QA loop if needed."""
-    print("--- Routing decision @ route_from_process_management ---")
+    """ Determines the next node based on task status and selected agent."""
+    print("--- Routing decision @ route_from_process_management (v2) ---") # Version indicator
     current_phase = state.get("current_phase")
     interrupt_result = state.get("interrupt_result")
     interrupt_action = interrupt_result.get("action") if isinstance(interrupt_result, dict) else None
 
     print(f"Router received state: Phase='{current_phase}', Interrupt Action='{interrupt_action}'")
 
-    # --- 1. Check if entering QA mode ---
+    # --- 1. Check QA / Finished ---
     if current_phase == "qa" or interrupt_action == "CONVERSATION":
-         # 清除 interrupt_result 避免影響後續步驟 (如果它是 CONVERSATION)
-         state["interrupt_result"] = None # 直接修改狀態字典（因為路由函數不應返回它）
+         state["interrupt_result"] = None
          print(f"Routing -> qa_loop (Reason: Phase='{current_phase}' or Interrupt Action='CONVERSATION')")
          return "qa_loop"
-
-    # --- 2. Check Finished Phase ---
     if current_phase == "finished":
         print("Routing -> finished (Reason: Phase is 'finished')")
         return "finished"
 
-    # --- 3. Normal Task Execution Flow ---
-    # ... (這部分邏輯保持不變，檢查任務列表、狀態、是否需要評估等) ...
+    # --- 2. Normal Task Execution Flow ---
     tasks = state.get("tasks", [])
     current_index = state.get("current_task_index", 0)
 
@@ -1223,36 +1284,49 @@ def route_from_process_management(state: WorkflowState) -> Literal[
              print("Routing -> finished (Reason: Tasks done and phase 'finished')")
              return "finished"
 
+
     if 0 <= current_index < len(tasks):
         current_task = tasks[current_index]
         task_id = current_task.get('task_id', 'N/A')
         task_status = current_task.get("status")
+        selected_agent = current_task.get("selected_agent")
+        requires_eval = current_task.get("requires_evaluation", False)
+
+        print(f"  Checking Task {task_id} (Idx: {current_index}), Status: '{task_status}', Agent: '{selected_agent}', RequiresEval: {requires_eval}")
 
         if task_status in ["failed", "max_retries_reached"]:
             print(f"Routing -> process_management (Reason: Task {task_id} status '{task_status}', returning for failure analysis)")
             return "process_management"
 
-        requires_eval = current_task.get("requires_evaluation", False)
-        if requires_eval:
-            if task_status in ["pending", "in_progress", None]:
-                print(f"Routing -> eva_teams (Reason: Task {task_id} status '{task_status}' and requires evaluation)")
-                return "eva_teams"
+        # --- MODIFIED: Check for specific evaluation agents ---
+        is_evaluation_agent = selected_agent in ["EvaAgent", "SpecialEvaAgent", "FinalEvaAgent"]
+
+        if is_evaluation_agent:
+            if requires_eval:
+                if task_status in ["pending", "in_progress", None]: # Should be pending
+                    print(f"Routing -> eva_teams (Reason: Task {task_id} is agent '{selected_agent}', requires evaluation, and status '{task_status}')")
+                    # --- CORRECTION: The target node is still called "eva_teams" which triggers EvaAgent.run ---
+                    return "eva_teams" # Route to the single evaluation entry point
+                else:
+                    print(f"Routing Warning: Evaluation Task {task_id} ({selected_agent}) has unexpected status '{task_status}'. Looping PM.")
+                    return "process_management"
             else:
-                print(f"Routing Warning: Task {task_id} needs eval but has unexpected status '{task_status}'. Looping PM.")
-                return "process_management"
-        else: # Doesn't require evaluation
+                 print(f"Routing Error: Evaluation Task {task_id} ({selected_agent}) has requires_evaluation=False. Looping PM.")
+                 # This indicates an error in PM's plan generation
+                 return "process_management"
+        else: # Not an evaluation agent
             if task_status in ["pending", "in_progress", None]:
-                print(f"Routing -> assign_teams (Reason: Task {task_id} status '{task_status}' and ready for execution)")
+                print(f"Routing -> assign_teams (Reason: Task {task_id} agent '{selected_agent}' status '{task_status}' and ready for execution)")
                 return "assign_teams"
-            else:
-                print(f"Routing Warning: Task {task_id} ready but has unexpected status '{task_status}'. Looping PM.")
+            else: # Should already be completed or failed, handled above
+                print(f"Routing Warning: Non-Eval Task {task_id} has unexpected status '{task_status}'. Looping PM.")
                 return "process_management"
     else:
         print(f"Routing Warning: index ({current_index}) out of bounds (size {len(tasks)}). Fallback to save_final_summary.")
         return "save_final_summary"
 
 
-# ... (route_after_assign_teams, route_after_evaluation 保持不變) ...
+# ... (route_after_assign_teams保持不變) ...
 def route_after_assign_teams(state: WorkflowState) -> Literal["process_management", "finished"]:
     """
     Routes after the assign_teams subgraph. ALWAYS routes back to Process Management
@@ -1280,57 +1354,71 @@ def route_after_assign_teams(state: WorkflowState) -> Literal["process_managemen
     print(f"Route after assign_teams: Routing decision -> process_management")
     return "process_management"
 
-def route_after_evaluation(state: WorkflowState) -> Literal["process_management", "assign_teams", "finished"]:
-    """Routes after EvaAgent (evaluation subgraph): Continue (PM) or retry (assign_teams)."""
-    current_phase = state.get("current_phase")
-    if current_phase != "task_execution":
-        print(f"Route after Eva Error: Unexpected phase '{current_phase}'. Routing to finished.")
-        return "finished"
+# def route_after_evaluation(state: WorkflowState) -> Literal["process_management", "assign_teams", "finished"]:
+#     """Routes after EvaAgent (evaluation subgraph): Continue (PM) or retry (assign_teams)."""
+#     current_phase = state.get("current_phase")
+#     if current_phase != "task_execution":
+#         print(f"Route after Eva Error: Unexpected phase '{current_phase}'. Routing to finished.")
+#         return "finished"
 
-    tasks = state.get("tasks", [])
-    current_idx = state.get("current_task_index", -1)
-    if current_idx < 0 or current_idx >= len(tasks):
-        print("Routing Error: Invalid index after evaluation. Routing to finished.")
-        return "finished"
+#     tasks = state.get("tasks", [])
+#     current_idx = state.get("current_task_index", -1)
+#     if current_idx < 0 or current_idx >= len(tasks):
+#         print("Routing Error: Invalid index after evaluation. Routing to finished.")
+#         return "finished"
 
-    task = tasks[current_idx]
-    status = task.get("status")
-    retry_count = task.get("retry_count", 0)
-    max_retries = _full_static_config.agents.get("process_management", {}).parameters.get("max_retries", 3)
+#     task = tasks[current_idx]
+#     status = task.get("status")
+#     retry_count = task.get("retry_count", 0)
+#     max_retries = _full_static_config.agents.get("process_management", {}).parameters.get("max_retries", 3)
 
-    print(f"Route after Eva: Checking Task {current_idx}, Status: {status}, RetryCount: {retry_count}")
+#     print(f"Route after Eva: Checking Task {current_idx}, Status: {status}, RetryCount: {retry_count}")
 
-    if status == "completed":
-        print("Route after Eva: Evaluation passed. Routing to PM to advance.")
-        return "process_management"
-    elif status == "failed":
-        print(f"Route after Eva: Evaluation failed. Routing to PM for assessment.")
-        return "process_management"
-    else:
-        print(f"Route after Eva Error: Unexpected status '{status}'. Routing to PM as failsafe.")
-        return "process_management"
+#     if status == "completed":
+#         print("Route after Eva: Evaluation passed. Routing to PM to advance.")
+#         return "process_management"
+#     elif status == "failed":
+#         print(f"Route after Eva: Evaluation failed. Routing to PM for assessment.")
+#         return "process_management"
+#     else:
+#         print(f"Route after Eva Error: Unexpected status '{status}'. Routing to PM as failsafe.")
+#         return "process_management"
 
 
 # --- <<< 修改 route_after_chat_bot >>> ---
 def route_after_chat_bot(state: WorkflowState) -> Literal["process_management", "qa_loop", "finished"]:
-    """Routes after QA agent. Loops back to qa_loop for QA, goes to PM for new tasks, or finishes."""
-    # 讀取 QA Agent 返回的 state 更新中的 phase
-    # 因為 QA Agent 只返回了部分狀態，我們需要從主 state 中讀取 current_phase
+    """基於QA代理設置的階段路由到適當的節點"""
     current_phase = state.get("current_phase")
-    print(f"--- Routing decision @ route_after_chat_bot ---")
-    print(f"  Current phase after chat_bot execution: {current_phase}")
-
-    if current_phase == "task_execution":
-        print("Routing -> process_management (Reason: QA requested new task sequence)")
+    print(f"--- 路由決策 @ route_after_chat_bot ---")
+    print(f"  當前階段: '{current_phase}'")
+    
+    # 獲取QA上下文以進行額外檢查
+    qa_context = state.get("qa_context", [])
+    last_ai_message = qa_context[-1] if qa_context and isinstance(qa_context[-1], AIMessage) else None
+    last_message_content = last_ai_message.content if last_ai_message else "無消息"
+    print(f"  最後一條 AI 消息: '{last_message_content[:100]}...'")
+    
+    # 關鍵 - 檢查階段和消息內容
+    resume_indicators = ["正在返回任務執行流程", "繼續任務", "返回任務", "回到任務"]
+    force_resume = any(indicator in last_message_content for indicator in resume_indicators)
+    
+    if current_phase == "task_execution" or force_resume:
+        print("路由 -> process_management (原因: QA 請求繼續/新任務)")
+        # 強制設定階段以確保正確路由
+        if force_resume:
+            print(f"  強制啟動: 根據消息內容設定 current_phase = 'task_execution'")
+            state["current_phase"] = "task_execution"
+            # 清除 interrupt_input 以避免循環
+            state["interrupt_input"] = None
         return "process_management"
     elif current_phase == "finished":
-        print("Routing -> finished (Reason: QA detected termination request)")
+        print("路由 -> finished (原因: QA 檢測到終止請求)")
         return "finished"
     elif current_phase == "qa":
-        print("Routing -> qa_loop (Reason: Continue QA conversation)")
-        return "qa_loop" # <<< 修改：路由回新的循環節點
+        print("路由 -> qa_loop (原因: 繼續 QA 對話)")
+        return "qa_loop"
     else:
-        print(f"Routing Warning: Unexpected phase '{current_phase}' after chat_bot. Routing to finished.")
+        print(f"路由警告: 意外的階段 '{current_phase}'. 路由到 finished.")
         return "finished"
 
 
@@ -1378,76 +1466,84 @@ def qa_loop_node(state: WorkflowState) -> Dict[str, Any]:
 # =============================================================================
 workflow = StateGraph(WorkflowState, config_schema=ConfigSchema)
 
-# 添加節點
+# Add Nodes (No changes here)
 workflow.add_node("process_management", process_management.run)
 workflow.add_node("assign_teams", assign_teams)
-workflow.add_node("eva_teams", eva_agent.run)
+workflow.add_node("eva_teams", eva_agent.run) # Still points to the EvaAgent.run trigger
 workflow.add_node("chat_bot", qa_agent.run)
 workflow.add_node("save_final_summary", save_final_summary)
-workflow.add_node("qa_loop", qa_loop_node) # <<< 修改節點名稱和函數名 >>>
+workflow.add_node("qa_loop", qa_loop_node)
 
-# 設置入口點
+# Set Entry Point
 workflow.set_entry_point("process_management")
 
-# 添加邊緣和條件邊緣
+# Add Edges
 workflow.add_conditional_edges(
     "process_management",
     route_from_process_management, # Uses updated logic
     {
         "assign_teams": "assign_teams",
-        "eva_teams": "eva_teams",
+        "eva_teams": "eva_teams", # Still route to the eva_teams node trigger
         "save_final_summary": "save_final_summary",
-        "qa_loop": "qa_loop", # <<< 修改：指向新的 QA 循環節點名稱 >>>
-        "process_management": "process_management",
+        "qa_loop": "qa_loop",
+        "process_management": "process_management", # Loop back for failure/retries
         "finished": END,
     }
 )
 
-# assign_teams always goes back to process_management (Unchanged)
 workflow.add_conditional_edges(
     "assign_teams",
-    route_after_assign_teams,
+    route_after_assign_teams, # Still goes back to PM
     {
         "process_management": "process_management",
-        "finished": END
+        "finished": END # Should ideally not happen if PM handles empty tasks
     }
 )
 
-# Edge after Evaluation - Always goes back to PM (Unchanged)
-workflow.add_conditional_edges(
-    "eva_teams",
-    route_after_evaluation,
-    {
-        "process_management": "process_management",
-        "finished": END
-    }
-)
+# --- REMOVED Conditional edge for eva_teams ---
+# The main router now handles the state after evaluation completes.
+# workflow.add_conditional_edges(
+#     "eva_teams",
+#     route_after_evaluation, # REMOVED
+#     {       
+#        "process_management": "process_management",
+#        "finished": END
+# )
+# --- Instead, eva_teams implicitly returns to the main router ---
+# The output of eva_teams (which is the state updated by the subgraph)
+# flows back to the main graph logic implicitly after the node finishes.
+# The next routing decision happens at the START of the next cycle, triggered
+# by the process_management node again reading the updated state.
+# THEREFORE, we need an edge FROM eva_teams BACK to process_management.
+workflow.add_edge("eva_teams", "process_management")
 
-# --- <<< 添加從 QA 循環管理器到 Chat Bot 的邊緣 >>> ---
-workflow.add_edge("qa_loop", "chat_bot") # 從新的管理器節點到聊天機器人
 
-# --- <<< 修改 Chat Bot 之後的條件邊緣 >>> ---
+# QA Loop Edges (Remain same)
+workflow.add_edge("qa_loop", "chat_bot")
 workflow.add_conditional_edges(
     "chat_bot",
-    route_after_chat_bot, # Use the updated routing function
+    route_after_chat_bot,
     {
-        "process_management": "process_management", # Go back to PM if QA ends/new task
-        "qa_loop": "qa_loop",           # <<< 修改：指向新的 QA 循環節點名稱 >>> Go back to loop for more input
-        "finished": END                  # Fallback/error case
+        "process_management": "process_management",
+        "qa_loop": "qa_loop",
+        "finished": END
     }
 )
 
-# --- <<< 新增：從 save_final_summary 返回 PM >>> ---
+# Final Summary Edge (Remains same)
 workflow.add_edge("save_final_summary", "process_management")
-# --- <<< 結束新增 >>> ---
 
 
 # =============================================================================
 # 11. 圖編譯
 # =============================================================================
+# Need to adjust interrupt points if EvaAgent.run is just a trigger
+# Interrupting before eva_teams might be less useful now.
+# Interrupting *inside* the subgraph might be better if needed.
+# For now, keep existing interrupts.
 graph = workflow.compile(interrupt_before=["qa_loop"], interrupt_after=["chat_bot"])
-graph.name = "General_Arch_graph_v19_DedicatedQA_Refactored"
-print("Main Graph compiled successfully (v19 - Refactored Imports).")
+graph.name = "General_Arch_graph_v20_AgentBasedEval" # Updated name
+print("Main Graph compiled successfully (v20 - Agent-Based Eval).")
 
 # =============================================================================
 # 12. TODOLIST
@@ -1455,9 +1551,10 @@ print("Main Graph compiled successfully (v19 - Refactored Imports).")
 # 1. QA test   V
 # 2. from insert enter QA node test    V
 # 3. Fauilure analysis test   V
-# 4. Building life cycle tools add in  (maybe 3D model)
-# 5. final configuration systematically...
-# 6. 3D model input / output test(MCP)
+# 4. Building life cycle tools add in  (maybe 3D model)  V
+# 5. final configuration systematically...    V
+# 6. 3D model input / output test(MCP)  V
 # 7. Change node name to agent name    V
-# 8. final evaluation 好像不太行
+# 8. final evaluation 好像不太行 
 # 9. 檢查save summary 與長期記憶有關   V
+

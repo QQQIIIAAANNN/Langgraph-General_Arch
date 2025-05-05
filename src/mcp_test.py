@@ -50,8 +50,8 @@ try:
         print("錯誤：找不到 GEMINI_API_KEY 環境變數。")
         exit(1)
     else:
-        agent_llm = ChatGoogleGenerativeAI(
-            model="gemini-2.5-flash-preview-04-17", #gemini-2.0-flash
+        agent_llm = ChatGoogleGenerativeAI(  #gemini-2.5-pro-exp-03-25  "gemini-2.5-pro-preview-03-25"
+            model="gemini-2.5-flash-preview-04-17", #gemini-2.0-flash "gemini-2.5-flash-preview-04-17" 
             temperature=0.1,
             google_api_key=api_key
         )
@@ -261,7 +261,18 @@ AGENT_EXECUTION_PROMPT = SystemMessage(content="""你是一個嚴格按計劃執
 4.  **如果需要調用工具來執行此動作，請必須生成 `tool_calls` 在首位的 AIMessage 以請求該工具調用**。**不要僅僅用文字描述你要調用哪個工具，而是實際生成工具調用指令。** 一次只生成一個工具調用請求。
 5.  嚴格禁止使用 f-string 格式化字串。請使用 `.format()` 或 `%` 進行字串插值。
 6.  **仔細參考工具描述或 Mcp 文檔確認函數用法與參數正確性，必須實際生成結構化的工具呼叫指令。**
-    *   **地址處理**: 當你需要呼叫 `geocode_and_screenshot` 時，如果使用者提供的地址比較複雜或包含區等，請**嘗試將其簡化**，例如 "號碼, 街道名稱, 城市, 國家" 再傳遞給 `address` 參數。如果持續地理編碼失敗，可以嘗試進一步簡化。
+    *   **Rhino 圖層管理 (重要):** 當生成 Rhino 代碼 (`execute_rhino_code` 或 `RhinoMCPCoordinator` 的 `user_request`) 時：
+        *   如果當前階段目標**明確要求**在特定圖層上操作，**必須**在相關操作（如創建物件）**之前**包含 `rs.CurrentLayer('目標圖層名稱')` 指令。
+        *   如果目標涉及控制圖層可見性（例如，準備截圖），**必須**包含 `rs.LayerVisible('圖層名', True/False)` 指令。
+        *   **可用函數參考:**
+            *   `rs.CurrentLayer('LayerName')`: 設置當前活動圖層。
+            *   `rs.LayerVisible('LayerName', True/False)`: 設置圖層可見性。
+            *   `rs.IsLayer('LayerName')`: 檢查圖層是否存在。
+            *   `rs.AddLayer('LayerName', color=(R,G,B))`: 添加新圖層（可選顏色）。
+    *   **地址/座標處理 (OSM - geocode_and_screenshot):**
+        *   **檢查使用者輸入**：查看初始請求或當前目標是否包含明確的**經緯度座標**（例如 "2X.XXX 1XX.XXX" 或類似格式）。
+        *   **如果找到座標**：直接將**座標字串 "緯度,經度"** (例如 "2X.XXX 1XX.XXX") 作為 `address` 參數的值傳遞給 `geocode_and_screenshot` 工具。**不要**嘗試將座標轉換成地址。
+        *   **如果只找到地址**：請**嘗試將其簡化**，例如 "號碼, 街道名稱, 城市, 國家" 再傳遞給 `address` 參數。如果持續地理編碼失敗，可以嘗試進一步簡化。
 7.  **最終步驟：**
     *   對於 Rhino/Revit 任務，當所有用戶請求的目標達成後，計劃的最後一步**應該**是調用 `capture_focused_view` 工具來截取最終畫面。
     *   對於 Pinterest 任務，計劃的最後一步應該是調用 `pinterest_search_and_download` (如果尚未完成) 或生成總結訊息。
@@ -340,7 +351,7 @@ async def execute_tools(agent_action: AIMessage, selected_tools: List[BaseTool])
                     final_content = f"[IMAGE_FILE_PATH]:{observation}"
                     print(f"      << 工具 '{tool_name}' 返回文件路徑字符串: {observation}")
 
-            # --- 處理 pinterest_search_and_download 返回 (MODIFIED to handle string list) ---
+            # --- 處理 pinterest_search_and_download 返回 (MODIFIED to return JSON list of paths) ---
             elif tool_name == "pinterest_search_and_download" and isinstance(observation, list):
                  print(f"      << 工具 '{tool_name}' 返回列表。正在解析下載路徑...")
                  try:
@@ -353,41 +364,39 @@ async def execute_tools(agent_action: AIMessage, selected_tools: List[BaseTool])
                  full_text_output = []
                  expected_prefix = "保存位置: " # 使用簡體中文前綴
 
-                 # --- <<< MODIFIED: Iterate through strings directly >>> ---
                  for text_item in observation:
-                     # Ensure item is a string before processing
                      if isinstance(text_item, str):
-                         full_text_output.append(text_item) # Add to full output regardless
+                         full_text_output.append(text_item)
                          if text_item.startswith(expected_prefix):
                              path = text_item.split(expected_prefix, 1)[1].strip()
-                             if path: # Basic check if path is not empty after split
-                                 print(f"         提取到潛在路徑: {path}")
+                             if path and os.path.exists(path): # <<< ADDED: Check if path exists >>>
+                                 print(f"         提取到有效路徑: {path}")
                                  download_paths.append(path)
+                             elif path:
+                                 print(f"         警告: 從 '{text_item}' 提取的路徑不存在: {path}")
                              else:
                                  print(f"         警告: 從 '{text_item}' 提取的路徑為空。")
                      else:
-                         # Log if item is not a string, though based on debug output it should be
                          print(f"         警告: 觀察列表中的項目不是預期的字串: {type(text_item)} - {repr(text_item)}")
-                         full_text_output.append(str(text_item)) # Add string representation
-                 # --- <<< END MODIFIED >>> ---
+                         full_text_output.append(str(text_item))
 
-                 print(f"         找到 {len(download_paths)} 個下載路徑: {download_paths}")
+                 print(f"         找到 {len(download_paths)} 個有效下載路徑。")
                  if download_paths:
-                     last_path = download_paths[-1]
-                     if os.path.exists(last_path):
-                         final_content = f"[PINTEREST_DOWNLOAD_PATH]:{last_path}"
-                         print(f"         標記 ToolMessage content 以傳遞最後存在的路徑: {last_path}")
-                     else:
-                         print(f"         警告: 最後提取的路徑 '{last_path}' 不存在。返回原始文本。")
-                         final_content = "\n".join(full_text_output) if full_text_output else "Pinterest tool ran, paths found but last path invalid."
+                     # <<< MODIFIED: Return JSON list of paths >>>
+                     try:
+                         final_content = json.dumps({"downloaded_paths": download_paths})
+                         print(f"         返回 JSON 列表: {final_content}")
+                     except Exception as json_e:
+                         print(f"         !! JSON 序列化下載路徑列表時出錯: {json_e}")
+                         final_content = "[Error serializing download paths]"
+                     # <<< END MODIFIED >>>
                  else:
                      failure_mentioned = any("失败" in t or "failed" in t.lower() for t in full_text_output)
                      if failure_mentioned:
-                         final_content = "\n".join(full_text_output) if full_text_output else "Pinterest tool ran with download errors, no paths reported."
-                         print(f"         檢測到下載錯誤，未找到有效下載路徑，返回原始文本輸出。")
+                         final_content = "\n".join(full_text_output) if full_text_output else "Pinterest tool ran with download errors, no valid paths reported."
                      else:
-                         final_content = "\n".join(full_text_output) if full_text_output else "Pinterest tool ran but no download paths found in output."
-                         print(f"         未找到有效下載路徑，返回原始文本輸出。")
+                         final_content = "\n".join(full_text_output) if full_text_output else "Pinterest tool ran but no valid download paths found."
+                     print(f"         未找到有效下載路徑，返回文本輸出: {final_content[:100]}...")
 
             # --- 處理 bytes (保持不變) ---
             elif isinstance(observation, bytes):
@@ -529,7 +538,7 @@ async def call_llm_with_tools(
                     properties.update({
                         "projection_type": {
                             "type": "STRING",
-                            "description": "投影類型: 'parallel', 'perspective', 或 'two_point'",
+                            "description": "投影類型: 'parallel', 'perspective', 'two_point'",
                             "nullable": True
                         },
                         "lens_angle": {
@@ -537,6 +546,20 @@ async def call_llm_with_tools(
                             "description": "透視或兩點投影的鏡頭角度",
                             "nullable": True
                         },
+                        # --- 新增相機參數定義 ---
+                        "camera_position": {
+                            "type": "ARRAY",
+                            "description": "相機位置的 [x, y, z] 坐標",
+                            "nullable": True,
+                             "items": {"type": "NUMBER"}
+                        },
+                        "target_position": {
+                             "type": "ARRAY",
+                             "description": "目標點的 [x, y, z] 坐標",
+                             "nullable": True,
+                             "items": {"type": "NUMBER"}
+                         },
+                         # --- 結束新增 ---
                         "layer": {
                             "type": "STRING",
                             "description": "用於篩選顯示註釋的圖層名稱",
@@ -774,39 +797,59 @@ async def agent_node_logic(state: MCPAgentState, config: RunnableConfig, mcp_nam
          print(f"  檢測到 capture_viewport 工具返回錯誤: {error_msg}")
          return {"messages": [AIMessage(content=f"任務因截圖錯誤而終止: {error_msg}")], "task_complete": True}
 
-    # --- 處理 pinterest_search_and_download 返回的文件路徑 (NEW) ---
-    PINTEREST_PATH_PREFIX = "[PINTEREST_DOWNLOAD_PATH]:"
-    if isinstance(last_message, ToolMessage) and last_message.name == "pinterest_search_and_download" and last_message.content.startswith(PINTEREST_PATH_PREFIX):
-        print("  檢測到 pinterest_search_and_download 工具返回的文件路徑。")
-        image_path = last_message.content[len(PINTEREST_PATH_PREFIX):]
-        print(f"    文件路徑 (最後一個): {image_path}")
+    # --- 處理 pinterest_search_and_download 返回的文件路徑列表 (MODIFIED) ---
+    if isinstance(last_message, ToolMessage) and last_message.name == "pinterest_search_and_download":
+        print("  檢測到 pinterest_search_and_download 工具返回。")
+        content = last_message.content
+        saved_paths_list = None
         try:
-            if not os.path.exists(image_path):
-                 print(f"  !! 錯誤：收到的 Pinterest 下載文件路徑不存在: {image_path}")
-                 # 仍然認為下載步驟嘗試過，但報告文件問題
-                 return {"messages": [AIMessage(content=f"Pinterest 圖片下載完成，但最後一個文件未找到: {image_path}")], "task_complete": True} # 假設 Pinterest 下載是最後一步
+            # Try to parse the content as JSON which should contain the list
+            data = json.loads(content)
+            if isinstance(data, dict) and "downloaded_paths" in data and isinstance(data["downloaded_paths"], list):
+                saved_paths_list = data["downloaded_paths"]
+                print(f"    成功解析到 {len(saved_paths_list)} 個下載路徑。")
+            else:
+                 print(f"    ToolMessage content is JSON but missing 'downloaded_paths' list: {content[:200]}...")
+        except json.JSONDecodeError:
+            # If it's not JSON, it might be an error message or plain text
+            print(f"    ToolMessage content is not JSON (likely text output or error): {content[:200]}...")
+        except Exception as e:
+            print(f"    解析 Pinterest ToolMessage content 時出錯: {e}")
 
-            with open(image_path, "rb") as f: image_bytes = f.read()
-            base64_data = base64.b64encode(image_bytes).decode('utf-8')
-            file_extension = os.path.splitext(image_path)[1].lower()
-            mime_type = "image/png"
-            if file_extension == ".jpeg" or file_extension == ".jpg": mime_type = "image/jpeg"
-            elif file_extension == ".gif": mime_type = "image/gif"
-            elif file_extension == ".webp": mime_type = "image/webp"
-            data_uri = f"data:{mime_type};base64,{base64_data}"
-            print(f"    推斷 MIME 類型: {mime_type}")
+        if saved_paths_list:
+             # --- MODIFIED: Store the list and mark task complete ---
+             print(f"    將下載的路徑列表存儲到狀態中。")
+             # Store the list of paths. Assume Pinterest is the final step.
+             # We still store the last path in the single fields for potential compatibility
+             # or quick access, but the primary source is the list.
+             last_path = saved_paths_list[-1] if saved_paths_list else None
+             data_uri = None
+             if last_path:
+                 try:
+                     with open(last_path, "rb") as f: image_bytes = f.read()
+                     base64_data = base64.b64encode(image_bytes).decode('utf-8')
+                     # ... (mime type detection) ...
+                     mime_type = "image/png" # Default or detect
+                     file_extension = os.path.splitext(last_path)[1].lower()
+                     if file_extension == ".jpeg" or file_extension == ".jpg": mime_type = "image/jpeg"
+                     elif file_extension == ".gif": mime_type = "image/gif"
+                     elif file_extension == ".webp": mime_type = "image/webp"
+                     data_uri = f"data:{mime_type};base64,{base64_data}"
+                 except Exception as img_proc_err:
+                     print(f"    !! 處理最後一個 Pinterest 文件 '{last_path}' 或編碼時出錯: {img_proc_err}")
 
-            # 返回一個簡化的完成消息，因為詳細信息已在 ToolMessage 中
-            return {
-                "messages": [AIMessage(content=f"Pinterest 圖片搜索和下載完成。\n最後一個下載的文件保存在: {image_path}")],
-                "saved_image_path": image_path, # 重用現有字段存儲最後一個路徑
-                "saved_image_data_uri": data_uri, # 重用現有字段存儲最後一個URI
-                "task_complete": True # 假設 Pinterest 下載通常是任務的結束
-            }
-        except Exception as img_proc_err:
-            print(f"  !! 處理 Pinterest 下載文件 '{image_path}' 或編碼時出錯: {img_proc_err}")
-            traceback.print_exc()
-            return {"messages": [AIMessage(content=f"Pinterest 下載完成，但處理文件 '{image_path}' 時失敗: {img_proc_err}")], "task_complete": True}
+             return {
+                 "messages": [AIMessage(content=f"Pinterest 圖片搜索和下載完成，共找到 {len(saved_paths_list)} 個有效文件。")],
+                 "saved_image_path": last_path, # Keep last for reference
+                 "saved_image_data_uri": data_uri, # Keep last for reference
+                 "saved_image_paths": saved_paths_list, # Store the full list <<< NEW FIELD >>>
+                 "task_complete": True # Assume Pinterest is final step
+             }
+        else:
+             # If parsing failed or no paths found, just pass the message content along
+             print("    Pinterest 工具未返回有效路徑列表，任務可能未成功或未找到圖片。")
+             # Let should_continue decide the next step based on the text message
+             return {"messages": [AIMessage(content=f"Pinterest 任務處理完成，但未找到或處理下載路徑。工具輸出: {content[:200]}...")]}
 
     # --- 如果不是處理特定工具返回，則執行正常規劃/執行邏輯 ---
     try:
@@ -853,10 +896,16 @@ async def agent_node_logic(state: MCPAgentState, config: RunnableConfig, mcp_nam
             planning_system_content = f"""你是一位優秀的任務規劃助理，專門為 CAD/BIM、圖像搜索或地理空間任務制定計劃。
             基於使用者提供的文字請求、可選的圖像以及下方列出的可用工具，生成一個清晰的、**分階段目標**的計劃。
 
-            對於 Rhino/Revit，計劃的最後一步應是截圖 (`capture_focused_view`)。
-            對於 Pinterest，計劃通常是搜索 (`pinterest_search_and_download`)。
-            對於 OSM，計劃通常是地理編碼加截圖 (`geocode_and_screenshot`)。
+            **重要要求：**
+            1.  **量化與具體化:** 對於幾何操作 (Rhino/Revit)，每個階段目標**必須**包含盡可能多的**具體數值、尺寸、座標、角度、數量、距離、方向、或清晰的空間關係描述**。
+            2.  **邏輯順序:** 確保階段目標按邏輯順序排列，後續步驟依賴於先前步驟的結果。
+            3.  **最終步驟:**
+                *   對於 Rhino，計劃的最後一步**必須**是調用 `capture_focused_view` 工具來截取最終畫面。請確保相機位置在水平面之上。
+                *   對於 Pinterest，計劃通常是搜索 (`pinterest_search_and_download`)。
+                *   對於 OSM，計劃通常是地理編碼加截圖 (`geocode_and_screenshot`)。
+            4.  **目標狀態:** 計劃應側重於**每個階段要達成的目標狀態**，說明該階段完成後場景應有的變化。
 
+            **rhino提醒: 目前單位是M(公尺)。對於量體配置方案建議使用parallel或perspective從上方俯視；對於渲染用建模建議使用two point perspective從人眼視角截圖**
             這個計劃應側重於**每個階段要達成的目標狀態**，而不是具體的工具使用細節。將任務分解成符合邏輯順序的多個階段目標。
             直接輸出這個階段性目標計劃，不要額外的開場白或解釋。
 
@@ -1037,7 +1086,7 @@ def should_continue(state: MCPAgentState) -> str:
         # 預設行為：如果 AI 既未完成也未請求工具調用，則結束 (避免死循環)
         else:
              print(f"  AI未請求工具也未宣告完成 (content: '{content_str[:100]}...') -> end")
-             return END
+             return "agent_tool_executor"
 
     elif isinstance(last_message, ToolMessage):
         # 工具執行完成後，總是應該回到 Agent 來處理結果
