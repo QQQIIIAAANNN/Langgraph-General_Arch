@@ -149,7 +149,7 @@ def simulate_future_image(outer_prompt: str, render_image: str) -> str:
     os.makedirs(OUTPUT_SHELL_CACHE_DIR, exist_ok=True)
     file_uuid = uuid.uuid4()
     # 使用 UUID 命名
-    output_filename = f"shell_future_{file_uuid}.png"
+    output_filename = f"future_render_{file_uuid}.png"
     output_path = os.path.join(OUTPUT_SHELL_CACHE_DIR, output_filename)
 
     if images:

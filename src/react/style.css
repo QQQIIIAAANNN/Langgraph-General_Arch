@@ -1,0 +1,137 @@
+/* 基本頁面設定 */
+body { 
+    font-family: sans-serif; 
+    margin: 0; 
+    line-height: 1.6; 
+    background-color: #f0f2f5; 
+    color: #333; 
+    display: flex; 
+    flex-direction: column; 
+    min-height: 100vh; 
+}
+
+/* 頁首樣式 */
+header { 
+    background-color: #2c3e50; 
+    color: #ecf0f1; 
+    padding: 1em 2em; 
+    text-align: left; 
+    border-bottom: 3px solid #3498db; 
+}
+header h1 { 
+    margin: 0; 
+    font-size: 1.8em; 
+}
+header p { 
+    margin: 0.2em 0; 
+    font-size: 0.9em; 
+    color: #bdc3c7; 
+}
+
+/* 主要內容區域 */
+main { 
+    padding: 0; 
+    max-width: 100%; 
+    margin: 0; 
+    display: flex; 
+    flex-grow: 1; 
+    overflow: hidden; 
+}
+
+/* 3D模型顯示區域 */
+#model-viewer-container { 
+    flex: 3; 
+    height: calc(100vh - 100px); 
+    background-color: #1e1e1e; 
+    position: relative; 
+    overflow: hidden; 
+}
+
+/* 任務詳情區域 */
+#task-details-ui { 
+    flex: 1; 
+    padding: 20px; 
+    background-color: #ffffff; 
+    overflow-y: auto; 
+    height: calc(100vh - 100px); 
+    box-shadow: -2px 0 5px rgba(0,0,0,0.1); 
+}
+#task-details-ui h2 { 
+    color: #2980b9; 
+    border-bottom: 2px solid #eaeaea; 
+    padding-bottom: 0.5em; 
+    margin-top: 0; 
+}
+
+/* 任務卡片樣式 */
+.task-card { 
+    background-color: #f9f9f9; 
+    border: 1px solid #e0e0e0; 
+    border-radius: 4px; 
+    margin-bottom: 20px; 
+    padding: 15px; 
+    box-shadow: 0 2px 4px rgba(0,0,0,0.05); 
+}
+.task-card h3 { 
+    margin-top: 0; 
+    color: #34495e; 
+    font-size: 1.1em; 
+    cursor: pointer; 
+    display: flex; 
+    justify-content: space-between; 
+    align-items: center; 
+}
+.task-card h3::after { 
+    content: '\25BC'; 
+    font-size: 0.8em; 
+    margin-left: 10px; 
+    transition: transform 0.2s ease-in-out; 
+}
+.task-card.collapsed h3::after { 
+    transform: rotate(-90deg); 
+}
+.task-card-content { 
+    padding-top: 10px; 
+    border-top: 1px dashed #eee; 
+    margin-top: 10px; 
+}
+
+/* 圖片畫廊 */
+.image-gallery { 
+    display: flex; 
+    flex-wrap: wrap; 
+    gap: 10px; 
+    margin-top: 10px; 
+}
+.image-gallery figure { 
+    margin: 0; 
+}
+.image-gallery img { 
+    border: 1px solid #ddd; 
+    border-radius: 3px; 
+}
+
+/* 程式碼區塊 */
+pre { 
+    background-color: #2d2d2d; 
+    color: #f0f0f0; 
+    padding: 15px; 
+    border-radius: 4px; 
+    white-space: pre-wrap; 
+    word-wrap: break-word; 
+    font-family: 'Courier New', Courier, monospace; 
+    font-size: 0.9em; 
+    max-height: 200px; 
+    overflow-y: auto; 
+}
+
+/* 頁尾樣式 */
+footer { 
+    background-color: #34495e; 
+    color: #bdc3c7; 
+    padding: 0.8em; 
+    text-align: center; 
+    font-size: 0.85em; 
+    margin-top: auto; 
+}
+/* 可添加更多互動性和設計感的樣式 */

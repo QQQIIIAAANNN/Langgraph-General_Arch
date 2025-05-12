@@ -5,6 +5,7 @@ import os
 import uuid
 import json
 import base64
+import shutil # NEW IMPORT for file copying
 from typing import Dict, List, Any, Annotated, Literal, Union, Optional, Tuple
 from datetime import datetime
 from pathlib import Path
@@ -12,6 +13,10 @@ from dotenv import load_dotenv
 from typing_extensions import TypedDict
 from contextlib import asynccontextmanager
 import traceback # Added for error printing
+from jinja2 import Environment, FileSystemLoader # NEW IMPORT
+from docx import Document as DocxDocument # NEW IMPORT for Word document creation
+from docx.shared import Inches, Pt # NEW IMPORT for sizing
+from docx.enum.text import WD_ALIGN_PARAGRAPH # NEW IMPORT for alignment
 
 # LangChain/LangGraph Imports
 from langchain_core.messages import AIMessage, HumanMessage, BaseMessage
@@ -34,9 +39,10 @@ from src.tools.video_recognition import video_recognition
 from src.tools.gemini_image_generation_tool import generate_gemini_image
 from src.tools.gemini_search_tool import perform_grounded_search
 # --- ComfyUI Tools ---
-from src.tools.case_render_image import case_render_image
+from src.tools.model_render_image import model_render_image # Ensure this is the one being imported
 from src.tools.generate_3D import generate_3D
-from src.tools.simulate_future_image import simulate_future_image
+# --- MODIFIED: Remove simulate_future_image import ---
+# from src.tools.simulate_future_image import simulate_future_image
 
 # --- MODIFIED ---
 # Import ConfigSchema, but remove direct dependency on FullConfig, AgentConfig etc. for runtime
@@ -247,33 +253,28 @@ class ProcessManagement:
     # --- MODIFIED run method ---
     async def run(self, state: WorkflowState, config: RunnableConfig) -> WorkflowState:
         print("\n=== Process Management Running ===")
-        # --- <<< 修改：移除 QA 階段快速通道檢查，讓路由處理 >>> ---
-        # current_phase = state.get("current_phase")
-        # if current_phase == "qa":
-        #     print("PM: In QA phase. Skipping task processing. Routing based on phase.")
-        #     return state # 直接返回
-
         output_state = state.copy()
-        output_state["interrupt_result"] = None
+        output_state["interrupt_result"] = None # Ensure cleared initially
 
-        print(f"--- Debug log @ PM.run (Start) ---") # 日誌保持
         # ... (打印 initial state 的日誌 - 不變) ...
         initial_tasks = state.get("tasks", [])
         initial_idx = state.get("current_task_index", 0)
-        print(f"  Received initial current_task_index: {initial_idx}")
-        print(f"  Received initial task count: {len(initial_tasks)}")
+        print(f"  PM Start: Received initial current_task_index: {initial_idx}")
+        print(f"  PM Start: Received initial task count: {len(initial_tasks)}")
         if 0 <= initial_idx < len(initial_tasks):
-             print(f"  Initial task at index {initial_idx} status: '{initial_tasks[initial_idx].get('status')}'")
+             print(f"  PM Start: Initial task at index {initial_idx} ID: '{initial_tasks[initial_idx].get('task_id')}', Status: '{initial_tasks[initial_idx].get('status')}'")
+        else:
+             print(f"  PM Start: Initial index {initial_idx} is out of bounds.")
 
 
         tasks = state.get("tasks", [])
         current_idx = state.get("current_task_index", 0)
-        interrupt_input = state.get("interrupt_input")
+        interrupt_input = state.get("interrupt_input") # Use original state's input
 
         # --- 1. Interrupt Processing ---
         if interrupt_input:
             print(f"PM: Interrupt detected: '{interrupt_input[:100]}...'. Invoking LLM for analysis.")
-            # ... (LLM interrupt analysis logic - 保持不變) ...
+            # ... (LLM interrupt analysis logic - remains the same) ...
             summarized_tasks = [{"task_id": t.get("task_id", "N/A"), "objective": t.get("task_objective", "N/A")} for t in tasks]
             tasks_json_for_interrupt = json.dumps(summarized_tasks, ensure_ascii=False)
             current_task_for_interrupt = tasks[current_idx] if 0 <= current_idx < len(tasks) else None
@@ -287,8 +288,23 @@ class ProcessManagement:
                     current_task_outputs_filtered = current_task_filtered["outputs"].copy()
                     current_task_outputs_filtered.pop("mcp_internal_messages", None)
                     current_task_outputs_filtered.pop("grounding_sources", None)
-                    current_task_outputs_filtered.pop("search_suggestions", None) # 加入移除
-                    current_task_filtered["outputs"] = current_task_outputs_filtered # 用過濾後的版本替換
+                    current_task_outputs_filtered.pop("search_suggestions", None) 
+                    current_task_filtered["outputs"] = current_task_outputs_filtered 
+                
+                # --- NEW: Filter base64_data from output_files for interrupt prompt ---
+                if "output_files" in current_task_filtered and isinstance(current_task_filtered["output_files"], list):
+                    filtered_output_files = []
+                    for file_dict in current_task_filtered["output_files"]:
+                        if isinstance(file_dict, dict):
+                            file_copy = file_dict.copy()
+                            file_copy.pop("base64_data", None)
+                            file_copy.pop("fileName", None)
+                            filtered_output_files.append(file_copy)
+                        else:
+                            filtered_output_files.append(file_dict) # Keep non-dict items as is
+                    current_task_filtered["output_files"] = filtered_output_files
+                # --- END NEW ---
+
                 # 可以考慮也過濾 task_inputs 如果需要
                 # if "task_inputs" in current_task_filtered and isinstance(current_task_filtered["task_inputs"], dict): ...
 
@@ -311,24 +327,22 @@ class ProcessManagement:
                 elif interrupt_content.startswith("```"): interrupt_content = interrupt_content[3:-3].strip()
                 interrupt_result = json.loads(interrupt_content)
                 action = interrupt_result.get("action", "PROCEED")
+                print(f"PM: Parsed LLM interrupt analysis action: {action}, Result: {interrupt_result}") # Log parsed result
 
-                # --- <<< 修改：只存儲結果，路由函數決定是否進入 QA >>> ---
-                output_state["interrupt_result"] = interrupt_result # Store full result
-                print(f"PM: LLM analysis action: {action}")
+                # --- <<< 修改：處理 Command Actions 並控制返回邏輯 >>> ---
+                processed_interrupt = False # Flag to track if interrupt caused an immediate return
 
                 if action == "CONVERSATION":
                     print("PM: LLM analysis resulted in CONVERSATION. Setting phase to 'qa'.")
                     output_state["current_phase"] = "qa"
-                    # --- 不清除 interrupt_input，留給 QA Agent ---
-                    # --- 但清除 interrupt_result，因為 phase 已設定，路由會處理 ---
-                    # --- 或者讓路由函數讀取 interrupt_result['action']? 保持 interrupt_result 供路由使用 ---
-                    # output_state["interrupt_result"] = None # 清除可能更好? 路由直接看 phase
-                    # <<< 決定：讓路由函數檢查 interrupt_result['action'] 和 current_phase >>>
-                    return output_state # 返回，讓路由函數處理
+                    output_state["interrupt_result"] = interrupt_result # Keep result for QA entry check
+                    # Keep interrupt_input for QA Agent? No, QA Agent reads from context. Clear it.
+                    output_state["interrupt_input"] = None
+                    print(f"PM (CONVERSATION): Returning state for QA. Index remains {current_idx}.")
+                    processed_interrupt = True
+                    return output_state # CONVERSATION requires immediate return to route to QA
 
-                # --- 處理 Command Actions (REPLACE, INSERT, PROCEED) ---
-                if action == "REPLACE_TASKS":
-                    # ... (原本的 REPLACE_TASKS 邏輯) ...
+                elif action == "REPLACE_TASKS":
                     print("PM: Processing REPLACE_TASKS command.")
                     new_tasks_data = interrupt_result.get("new_tasks_list")
                     if isinstance(new_tasks_data, list):
@@ -359,15 +373,22 @@ class ProcessManagement:
                             output_state["tasks"] = completed_prefix + created_tasks
                             output_state["current_task_index"] = len(completed_prefix)
                             output_state["current_task"] = created_tasks[0].copy() if created_tasks else None
+                            print(f"PM (REPLACE): State updated. New index: {output_state['current_task_index']}. New task count: {len(output_state['tasks'])}.")
                         else:
                             print("PM Warning (REPLACE): No valid tasks created. Proceeding.")
-                            action = "PROCEED"
+                            # No need to explicitly set action = "PROCEED", will fall through
                     else:
                         print("PM Warning (REPLACE): 'new_tasks_list' missing or invalid. Proceeding.")
-                        action = "PROCEED"
+                        # No need to explicitly set action = "PROCEED", will fall through
+
+                    # --- Common logic for REPLACE/INSERT ---
+                    output_state["interrupt_input"] = None # Clear after processing
+                    output_state["interrupt_result"] = None
+                    processed_interrupt = True
+                    print(f"PM (REPLACE): Returning updated state to router after replacing tasks.")
+                    return output_state # REPLACE requires immediate return
 
                 elif action == "INSERT_TASKS":
-                    # ... (原本的 INSERT_TASKS 邏輯) ...
                     print("PM: Processing INSERT_TASKS command.")
                     insert_tasks_data = interrupt_result.get("insert_tasks_list")
                     if isinstance(insert_tasks_data, list):
@@ -376,7 +397,7 @@ class ProcessManagement:
                             if isinstance(task_data, dict):
                                 task_id = str(uuid.uuid4())
                                 task = TaskState(
-                                    task_id=task_id, status="pending",
+                                    task_id=task_id, status="pending", # Ensure status is pending
                                     task_objective=task_data.get("task_objective", f"Inserted Objective {i+1}"),
                                     description=task_data.get("description", f"Inserted Task {i+1}"),
                                     selected_agent=task_data.get("selected_agent", "LLMTaskAgent"),
@@ -388,50 +409,77 @@ class ProcessManagement:
                                     print(f"PM Warning (INSERT): Task {i} lacks 'selected_agent'. Skipping.")
                                     continue
                                 inserted_tasks.append(task)
+                                print(f"  - Created inserted task {i+1} (ID: {task_id})")
                             else: print(f"PM Warning (INSERT): Invalid item in insert_tasks_list at index {i}.")
 
                         if inserted_tasks:
-                            current_tasks_in_state = output_state.get("tasks", tasks)
-                            insert_after_idx = state.get("current_task_index", 0) # Index of the task *before* insertion
-                            valid_insert_point = insert_after_idx + 1 # Insert after this index
+                            original_tasks_before_insert = state.get("tasks", [])
+                            insert_after_idx = state.get("current_task_index", 0)
+                            valid_insert_point = insert_after_idx + 1
+                            print(f"PM (INSERT): Original index before insert: {insert_after_idx}")
                             print(f"PM (INSERT): Inserting {len(inserted_tasks)} tasks at index {valid_insert_point}.")
-                            new_sequence = current_tasks_in_state[:valid_insert_point] + inserted_tasks + current_tasks_in_state[valid_insert_point:]
+
+                            current_tasks_in_output_state = output_state.get("tasks", original_tasks_before_insert)
+                            new_sequence = current_tasks_in_output_state[:valid_insert_point] + inserted_tasks + current_tasks_in_output_state[valid_insert_point:]
+
                             output_state["tasks"] = new_sequence
-                            # --- <<< 修改：插入後，index 應指向第一個插入的任務 >>> ---
                             output_state["current_task_index"] = valid_insert_point
                             output_state["current_task"] = inserted_tasks[0].copy()
-                            # --- <<< 結束修改 >>> ---
+                            print(f"PM (INSERT): State updated. New index: {output_state['current_task_index']}. New task count: {len(new_sequence)}.")
+                            print(f"PM (INSERT): Current task set to ID: {output_state['current_task']['task_id']}")
                         else:
-                            print("PM Warning (INSERT): No valid tasks created. Proceeding.")
-                            action = "PROCEED"
+                            print("PM Warning (INSERT): No valid tasks created from LLM response. Proceeding.")
+                            # No need to explicitly set action = "PROCEED", will fall through
                     else:
-                        print("PM Warning (INSERT): 'insert_tasks_list' missing or invalid. Proceeding.")
-                        action = "PROCEED"
+                        print("PM Warning (INSERT): 'insert_tasks_list' missing or invalid in LLM response. Proceeding.")
+                        # No need to explicitly set action = "PROCEED", will fall through
 
+                    # --- Common logic for REPLACE/INSERT ---
+                    output_state["interrupt_input"] = None # Clear after processing
+                    output_state["interrupt_result"] = None
+                    processed_interrupt = True
+                    print(f"PM (INSERT): Returning updated state to router after inserting tasks.")
+                    return output_state # INSERT requires immediate return
 
-                if action == "PROCEED":
-                    print("PM: PROCEED command received or fallback.")
-                    pass
+                # --- Handle PROCEED (or fallback): Only clear flags, DO NOT return ---
+                elif action == "PROCEED":
+                    print("PM: PROCEED command received or fallback. Clearing interrupt flags and continuing.")
+                    output_state["interrupt_input"] = None
+                    output_state["interrupt_result"] = None
+                    # --- DO NOT RETURN HERE ---
+                    processed_interrupt = False # Indicate we should continue to task processing loop
 
-                # --- 清除非 CONVERSATION 命令的中斷輸入和結果 ---
-                print(f"PM: Processed command '{action}'. Clearing interrupt_input and result.")
-                output_state["interrupt_input"] = None
-                output_state["interrupt_result"] = None # 清除結果
+                # --- Cleanup after handling non-returning actions (like PROCEED) ---
+                # This part is now only reached if action was PROCEED
+                if not processed_interrupt:
+                    print(f"PM: Processed non-returning interrupt command '{action}'. Proceeding to task check loop.")
+                    # Flags already cleared above for PROCEED case.
+
+                # --- Catch potential errors during interrupt processing ---
+                # Removed the explicit `except Exception as e:` block that was wrapping the action handling,
+                # as individual actions returning should handle their own errors or the main function try-except will catch it.
+                # Ensure the try-except around the LLM call itself remains.
 
             except Exception as e:
                 print(f"PM Error processing interrupt command: {e}")
                 traceback.print_exc()
-                output_state["interrupt_input"] = None
-                output_state["interrupt_result"] = None # 清除錯誤時的結果
+                output_state["interrupt_input"] = None # Clear on error too
+                output_state["interrupt_result"] = None
+                # Consider returning state here too, or let it flow to task processing?
+                # Let's allow it to flow to task processing for now, which might handle failure.
+                print(f"PM: Error during interrupt processing. Allowing flow to task status check.")
+
 
         # --- 2. Task Processing Logic ---
-        # (確保這部分邏輯只在非 QA 階段執行)
-        tasks = output_state.get("tasks", []) # Use potentially updated tasks
-        current_idx = output_state.get("current_task_index", 0)
+        # This part is now reached if:
+        # a) There was no interrupt_input initially.
+        # b) The interrupt_input resulted in a 'PROCEED' action.
+        tasks = output_state.get("tasks", []) # Use potentially updated tasks (though PROCEED doesn't modify them)
+        current_idx = output_state.get("current_task_index", 0) # Use potentially updated index (though PROCEED doesn't modify it)
 
-        # --- Initial Workflow Creation (if tasks is empty) ---
-        if not tasks:
-            # ... (原本的 workflow creation 邏輯 - 保持不變) ...
+        # --- Initial Workflow Creation (if tasks is empty and no interrupt happened) ---
+        if not tasks and not state.get("interrupt_input"): # Only create if no interrupt was processed
+            # ... (Existing workflow creation logic) ...
             print("PM: Task list is empty. Generating initial workflow...")
             try:
                 if not self.prompts.get("create_workflow"): raise ValueError("create_workflow prompt missing")
@@ -488,16 +536,15 @@ class ProcessManagement:
                 return output_state
 
         # --- Loop to Check Status, Save to LTM, and Handle Failure ---
-        print(f"\nPM: --- Debug log: Entering status check loop ---")
-        tasks = output_state.get("tasks", []) # Use potentially updated tasks from interrupt/creation
-        current_idx = output_state.get("current_task_index", 0)
+        print(f"\nPM: --- Entering status check loop ---") # Log entry clearly
+        tasks = output_state.get("tasks", []) # Get final task list for the loop
+        current_idx = output_state.get("current_task_index", 0) # Get final index for the loop
         print(f"PM: Starting loop with current_idx = {current_idx}, task count = {len(tasks)}")
 
         while 0 <= current_idx < len(tasks):
             task_to_check = tasks[current_idx]
             status = task_to_check.get("status")
             task_id = task_to_check.get("task_id", "N/A")
-            # --- Log current task being checked ---
             print(f"PM Loop: Checking Task {task_id} (Idx: {current_idx}), Status: '{status}'")
 
             if status in ["failed", "max_retries_reached"]:
@@ -716,37 +763,37 @@ class ProcessManagement:
             # --- End of failed/max_retries_reached block ---
 
             elif status == "completed":
-                # --- FIX: Ensure index update happens correctly ---
-                print(f"PM Loop: Handling 'completed' for task {task_id}. Saving to LTM.")
-                await self._save_task_to_ltm(task_to_check)
-                current_idx += 1 # Increment index AFTER processing the completed task
-                # --- Update state *after* incrementing ---
-                output_state["current_task_index"] = current_idx
-                output_state["current_task"] = tasks[current_idx].copy() if 0 <= current_idx < len(tasks) else None
-                print(f"PM Loop: Incremented index to {current_idx} after completing task {task_id}. Continuing loop check.")
-                # --- Let the loop condition check the new index ---
-                continue # Go back to the start of the while loop check
+                # ... (原本的 completed handling 邏輯) ...
+                # --- 確保增加 current_idx 並 continue ---
+                 print(f"PM Loop: Handling 'completed' for task {task_id}. Saving to LTM.")
+                 await self._save_task_to_ltm(task_to_check)
+                 current_idx += 1 # Increment index AFTER processing the completed task
+                 # --- Update state *after* incrementing ---
+                 output_state["current_task_index"] = current_idx # Update index in state
+                 # Update current_task based on new index before continuing loop check
+                 output_state["current_task"] = tasks[current_idx].copy() if 0 <= current_idx < len(tasks) else None
+                 print(f"PM Loop: Incremented index to {current_idx} after completing task {task_id}. Continuing loop check.")
+                 continue # Go back to the start of the while loop check
+
 
             elif status in ["pending", "in_progress", None]:
-                # Pending/In Progress logic remains the same
+                # 發現需要執行的任務，設置狀態並跳出循環
                 print(f"PM Loop: Task {task_id} is '{status}'. Ready for routing. Breaking loop.")
-                # --- Ensure state reflects the task to be routed ---
                 output_state["current_task_index"] = current_idx
                 output_state["current_task"] = task_to_check.copy()
-                break # Break WHILE loop
+                break # 跳出 WHILE 循環
 
-            else:
-                # Unexpected status logic remains the same
+            else: # Unexpected status
+                # ... (原本的 unexpected status handling 邏輯) ...
+                # --- 確保增加 current_idx 並 continue ---
                 print(f"PM Loop Warning: Unhandled task status '{status}' for Task {task_id}. Skipping.")
-                 # --- FIX: Save unexpected status task to LTM before skipping ---
-                print(f"PM Loop: Saving task {task_id} with unexpected status '{status}' to LTM before skipping.")
                 await self._save_task_to_ltm(task_to_check)
-                 # --- END FIX ---
                 current_idx += 1
                 output_state["current_task_index"] = current_idx
                 output_state["current_task"] = tasks[current_idx].copy() if 0 <= current_idx < len(tasks) else None
                 print(f"PM Loop (Warning): Updated current_idx to {current_idx}. Continuing loop.")
                 continue
+
 
         # --- After the loop ---
         # Logging remains the same
@@ -767,10 +814,8 @@ class ProcessManagement:
                   output_state["current_task"] = tasks[final_idx_after_loop].copy()
              print(f"PM: Exiting with index {final_idx_after_loop} pointing to task {output_state['current_task'].get('task_id') if output_state.get('current_task') else 'N/A'}.")
 
-        # Final state preparation remains the same
-        if "tasks" not in output_state: output_state["tasks"] = state.get("tasks", [])
         print(f"=== Process Management Finished. Routing Index: {output_state.get('current_task_index', 'N/A')}, Phase: {output_state.get('current_phase')} ===")
-        return output_state
+        return output_state # 返回最終狀態
 
 class EvaAgent:
     """
@@ -930,22 +975,11 @@ class QA_Agent:
         print(f"QA_Agent initialized using prompt template from configuration: 'qa_prompt'")
 
 
-    async def run(self, state: WorkflowState, config: RunnableConfig) -> Dict[str, Any]: # 返回類型改為 Dict
-        """Generates AI response based on context, determines next phase. Returns minimal state update."""
+    async def run(self, state: WorkflowState, config: RunnableConfig) -> Dict[str, Any]:
         node_name = "QA Agent Node (chat_bot)"
-        print(f"--- Running Node: {node_name} (AI Response Turn) ---") # Updated log message
+        print(f"--- 運行節點: {node_name} ---")
 
-        # --- <<< 新增：檢查最後一條消息是否為提示 >>> ---
-        qa_context_list: List[BaseMessage] = state.get("qa_context", [])
-        last_message = qa_context_list[-1] if qa_context_list else None
-        prompt_text_from_loop = "請問您想問什麼？請在Interrupt Input欄位中提供您的想法。"
-
-        if isinstance(last_message, AIMessage) and last_message.content == prompt_text_from_loop:
-            print(f"{node_name}: Last message was the prompt from qa_loop. Skipping LLM invocation and waiting for user input.")
-            return {}
-        # --- 結束檢查 ---
-
-
+        # 獲取配置和上下文
         runtime_config = config["configurable"]
         qa_llm_config = runtime_config.get("qa_llm", {})
         retriever_k = runtime_config.get("retriever_k", 5)
@@ -954,182 +988,122 @@ class QA_Agent:
         ltm = VectorStoreRetrieverMemory(retriever=retriever, memory_key=ltm_memory_key, input_key=ltm_input_key)
         llm_output_language = runtime_config.get("global_llm_output_language", LLM_OUTPUT_LANGUAGE_DEFAULT)
 
-        current_phase = state.get("current_phase")
+        qa_context_list: List[BaseMessage] = state.get("qa_context", [])
+        # qa_context is expected to have 0 or 1 message (the current turn's message)
+        current_turn_message = qa_context_list[0] if qa_context_list else None
 
-        # --- 安全檢查 ---
-        if not qa_context_list or not isinstance(qa_context_list[-1], (HumanMessage, AIMessage)):
-             print(f"{node_name}: Skipping, invalid qa_context state (last message is not User/AI).")
-             return {}
+        # --- <<< 修改循環判斷邏輯 >>> ---
+        if not current_turn_message:
+            # Case 1: qa_context is empty. This means no new user input was provided via qa_loop_node.
+            # This is the entry point for QA, or user didn't provide input after AI's last turn.
+            # Send an initial/generic prompt.
+            prompt_text = "您好，請問有什麼可以協助您的嗎？或是有其他問題嗎？ (您可以輸入 '結束對話' 或 '繼續任務')"
+            print(f"{node_name}: Context is empty or no HumanMessage. Sending initial prompt.")
+            return {
+                "current_phase": "qa",
+                "qa_context": [AIMessage(content=prompt_text)]
+            }
+        elif not isinstance(current_turn_message, HumanMessage):
+            # Case 2: Last message in qa_context (current turn) is an AIMessage.
+            # This implies AI spoke, graph paused, user provided NO input, and graph resumed.
+            # AI should not speak again. It should wait for actual user input.
+            print(f"{node_name}: Last message in context was AIMessage. AI waits for user input. No new response generated.")
+            return {
+                "current_phase": "qa",        # Stay in QA phase
+                "qa_context": qa_context_list # Return the existing context (which has AIMessage)
+            }
+        # --- <<< 結束修改循環判斷邏輯 >>> ---
 
-        # --- 獲取查詢 ---
-        # We need the user's actual query for LTM and prompt input.
-        # The last message *should* be a HumanMessage here because the prompt case was handled above.
-        query_for_ltm = ""
-        last_user_query_content = ""
-        if isinstance(last_message, HumanMessage):
-            query_for_ltm = last_message.content
-            last_user_query_content = last_message.content
-        else:
-            print(f"{node_name}: Warning - Expected last message to be HumanMessage, but got {type(last_message)}. Trying previous message for query.")
-            if len(qa_context_list) > 1 and isinstance(qa_context_list[-2], HumanMessage):
-                 query_for_ltm = qa_context_list[-2].content
-                 last_user_query_content = qa_context_list[-2].content
-            else:
-                 print(f"{node_name}: Could not determine a user query for LTM/prompt.")
+        # If we reach here, current_turn_message is a HumanMessage.
+        last_user_query_content = current_turn_message.content
+        print(f"{node_name}: Processing user query: '{last_user_query_content[:100]}...'")
+        query_for_ltm = last_user_query_content # Use the same for LTM retrieval
 
-
-        # --- 初始化返回字典 ---
+        # 初始化返回狀態
         return_state_update = {
-             "current_phase": "qa" # 預設保持 QA 狀態
+            "current_phase": "qa"  # 預設保持QA狀態
         }
 
-        # --- Prepare context for the prompt ---
-        retrieved_ltm_context = "LTM: N/A"
-        if query_for_ltm: # Only retrieve if we have a query
-            try:
-                ltm_loaded_vars = await ltm.aload_memory_variables({ltm_input_key: query_for_ltm})
-                context_from_ltm = ltm_loaded_vars.get(ltm.memory_key)
-                if context_from_ltm: 
-                    retrieved_ltm_context = context_from_ltm
-            except Exception as e: 
-                print(f"{node_name}: LTM Error: {e}")
-        else:
-            retrieved_ltm_context = "無用戶查詢可供 LTM 檢索。"
-
-        task_summary = "\n".join([f"- Task {i+1}: {t['description']} ({t['status']})" for i, t in enumerate(state.get("tasks", []))]) or "No tasks executed."
-        current_stm_vars = self.stm.load_memory_variables({})
-        formatted_chat_history = current_stm_vars.get(self.stm.memory_key, "No STM history.")
-
-        # --- 準備 LLM 輸入 ---
-        chain_input = {}
-        possible_inputs = {
-            "last_user_query": last_user_query_content,
-            "retrieved_ltm_context": retrieved_ltm_context,
-            "window_size": self.memory_window_size,
-            "chat_history": formatted_chat_history,
-            "llm_output_language": llm_output_language,
-            "task_summary": task_summary,
-        }
-        missing_prompt_vars = []
-        for var in self.qa_prompt_input_variables:
-            if var in possible_inputs:
-                chain_input[var] = possible_inputs[var]
-            else:
-                missing_prompt_vars.append(var)
-                chain_input[var] = "N/A"
-        if missing_prompt_vars:
-            print(f"QA_Agent Warning: Prompt template requires variables not available: {missing_prompt_vars}. Using 'N/A'.")
-
-
-        # --- LLM Invocation ---
-        ai_message = None
+        # 準備提示輸入
         try:
+            # ... (從LTM獲取上下文、準備其他輸入的邏輯保持不變) ...
+            retrieved_ltm_context = "LTM: N/A"
+            if query_for_ltm:
+                try:
+                    ltm_loaded_vars = await ltm.aload_memory_variables({ltm_input_key: query_for_ltm})
+                    context_from_ltm = ltm_loaded_vars.get(ltm.memory_key)
+                    if context_from_ltm:
+                        retrieved_ltm_context = context_from_ltm
+                except Exception as e:
+                    print(f"{node_name}: LTM錯誤: {e}")
+
+            task_summary = "\n".join([f"- Task {i+1}: {t['description']} ({t['status']})" for i, t in enumerate(state.get("tasks", []))]) or "沒有執行任何任務。"
+            current_stm_vars = self.stm.load_memory_variables({})
+            formatted_chat_history = current_stm_vars.get(self.stm.memory_key, "沒有STM歷史。")
+
+            chain_input = {
+                "last_user_query": last_user_query_content,
+                "retrieved_ltm_context": retrieved_ltm_context,
+                "window_size": self.memory_window_size,
+                "chat_history": formatted_chat_history,
+                "llm_output_language": llm_output_language,
+                "task_summary": task_summary,
+            }
+
+            # LLM調用
             qa_chain = self.prompt_template | llm
-            response_message: AIMessage = await qa_chain.ainvoke(chain_input)
+            response_message = await qa_chain.ainvoke(chain_input)
             response_content = response_message.content.strip()
             print(f"{node_name} 原始回應: {response_content[:150]}...")
-            
-            # --- 增強意圖檢測 ---
-            intent_detected = False
-            
-            # 檢查特殊指令格式標記
-            if "#RESUME_TASK#" in response_content:
-                # 用戶想繼續任務
-                clean_content = "好的，正在返回任務執行流程。"
-                next_phase = "task_execution"
-                intent_detected = True
-                print(f"{node_name}: LLM 檢測到【繼續任務】指令標記")
-            elif "#TERMINATE#" in response_content:
-                # 用戶想結束對話
-                clean_content = "好的，對話結束。"
-                next_phase = "finished"
-                intent_detected = True
-                print(f"{node_name}: LLM 檢測到【結束對話】指令標記")
-            elif "#NEW_TASK:" in response_content:
-                # 處理新任務邏輯...
-                # ... (現有代碼) ...
-                intent_detected = True
-                
-            # --- 如果沒有檢測到指令標記，嘗試分析內容文本 ---
-            if not intent_detected:
-                # 繼續任務的模糊表達
-                resume_keywords = ["繼續任務", "返回任務", "回到任務", "繼續工作", "繼續流程", "繼續執行"]
-                is_resume_intent = any(kw in response_content.lower() for kw in resume_keywords)
-                
-                # 結束對話的模糊表達
-                terminate_keywords = ["結束對話", "結束交談", "停止對話", "再見", "謝謝再見"]
-                is_terminate_intent = any(kw in response_content.lower() for kw in terminate_keywords)
-                
-                if is_resume_intent:
-                    clean_content = "好的，正在返回任務執行流程。"
-                    next_phase = "task_execution"
-                    print(f"{node_name}: LLM 文本內容暗示【繼續任務】")
-                elif is_terminate_intent:
-                    clean_content = "好的，對話結束。"  
-                    next_phase = "finished"
-                    print(f"{node_name}: LLM 文本內容暗示【結束對話】")
-                else:
-                    # 普通對話
-                    clean_content = response_content
-                    print(f"{node_name}: 沒有檢測到特殊意圖，繼續QA對話")
-                    next_phase = "qa"
-            
-            # 更新消息內容
-            ai_message.content = clean_content
-            
-            # --- 詳細日誌 ---
-            print(f"{node_name}: 設定 current_phase = '{next_phase}'")
-            print(f"{node_name}: 處理後的AI回應: '{clean_content[:100]}...'")
-            
-            # ... (其餘保持不變) ...
 
-            # --- 處理 LLM 回應，增強 RESUME_TASK 判斷 ---
-            response_content = ai_message.content
+            # ... (意圖檢測邏輯保持不變) ...
             next_phase = "qa"  # 預設階段
-            
-            # 增強的繼續任務偵測 - 支援多種表達方式
-            resume_keywords = ["RESUME_TASK", "繼續任務", "返回任務", "回到任務", "回到工作流程", "繼續執行"]
-            is_resume_request = response_content == "RESUME_TASK" or any(keyword in response_content.lower() for keyword in resume_keywords)
-            
-            if response_content == "TERMINATE":
-                ai_message.content = "好的，對話結束。"
+            terminate_indicators = ["TERMINATE", "結束對話", "再見", "謝謝再見", "不需要了"]
+            is_terminate = any(ind in response_content for ind in terminate_indicators)
+            resume_indicators = ["RESUME_TASK", "繼續任務", "返回任務", "回到任務", "繼續工作流程"]
+            is_resume = any(ind in response_content for ind in resume_indicators)
+            new_task_match = None
+            if response_content.startswith("NEW_TASK:"):
+                new_task_match = response_content[len("NEW_TASK:"):].strip()
+
+            if is_terminate:
+                response_content = "好的，對話結束。"
                 next_phase = "finished"
-                print(f"{node_name}: 終止對話偵測到。")
-            elif response_content.startswith("NEW_TASK:"):
-                new_task_desc = response_content[len("NEW_TASK:"):].strip()
-                ai_message.content = f"收到新任務：'{new_task_desc}'。正在返回任務規劃..."
+                print(f"{node_name}: 檢測到終止對話意圖")
+            elif is_resume:
+                response_content = "好的，正在返回任務執行流程。"
                 next_phase = "task_execution"
-                return_state_update["user_input"] = new_task_desc
-                print(f"{node_name}: 新任務請求。")
-            elif is_resume_request:  # <<< 修改：使用更廣泛的判斷 >>>
-                ai_message.content = "好的，正在返回任務執行流程。"
-                next_phase = "task_execution"  # 關鍵設定：切換到任務執行階段
-                print(f"{node_name}: 偵測到任務繼續請求！將階段設為 '{next_phase}'")
+                print(f"{node_name}: 檢測到繼續任務意圖")
+            elif new_task_match:
+                response_content = f"收到新任務：'{new_task_match}'。正在返回任務規劃..."
+                next_phase = "task_execution"
+                return_state_update["user_input"] = new_task_match # Pass new task goal back
+                print(f"{node_name}: 檢測到新任務請求")
             else:
-                print(f"{node_name}: 提供了回答，保持在 QA 階段。")
-                next_phase = "qa"
-            
-            # --- 增加額外偵錯資訊 ---
-            print(f"{node_name}: 設定 current_phase = '{next_phase}'")
-            print(f"{node_name}: AI 訊息內容: '{ai_message.content[:100]}...'")
-            
-            # --- 更新 STM ---
-            if isinstance(last_message, HumanMessage):
-                self.stm.save_context({"human_input": last_message.content}, {"output": ai_message.content})
-            
-            # --- 準備返回的狀態更新 ---
+                print(f"{node_name}: 普通回答，維持QA階段")
+
+            # 更新STM
+            # --- <<< 修改：確保使用正確的 key >>> ---
+            self.stm.save_context({"human_input": last_user_query_content}, {"output": response_content})
+            # --- <<< 結束修改 >>> ---
+
+            # 準備返回狀態
             return_state_update["current_phase"] = next_phase
-            return_state_update["qa_context"] = [ai_message]
-            
-            print(f"{node_name}: 返回狀態更新: {return_state_update}")
+            # --- <<< 修改：返回 AI 回應，而不是提示 >>> ---
+            return_state_update["qa_context"] = [AIMessage(content=response_content)]
+            # --- <<< 結束修改 >>> ---
+
+            print(f"{node_name}: 返回狀態: phase='{next_phase}', 消息='{response_content[:50]}...'")
             return return_state_update
 
-        except Exception as llm_e:
-             print(f"{node_name} LLM Error: {llm_e}")
-             ai_message = AIMessage(content=f"Error: {llm_e}")
-             return_state_update["current_phase"] = "qa"
-             return_state_update["qa_context"] = [ai_message]
-             return return_state_update
+        except Exception as e:
+            print(f"{node_name} 錯誤: {e}")
+            traceback.print_exc() # Print traceback for debugging
+            error_message = f"處理您的問題時發生錯誤: {e}"
+            # Return error message in qa_context, keep in QA phase
+            return_state_update["current_phase"] = "qa"
+            return_state_update["qa_context"] = [AIMessage(content=error_message)]
+            return return_state_update
 
 
 # --- Keep loading agent descriptions as they are still needed ---
@@ -1148,85 +1122,215 @@ qa_agent = QA_Agent(long_term_memory_vectorstore=vectorstore)
 # 8. 輔助/節點函數定義
 # =============================================================================
 def save_final_summary(state: WorkflowState) -> WorkflowState:
-    """Saves a summary of the completed workflow tasks to a Markdown file."""
+    """
+    Saves the final summary of the workflow, including all task details,
+    outputs, and generated files into a Word document and a JSON file.
+    The Word document includes a title, overall goal, task summaries, and images.
+    """
     print("--- Saving Final Workflow Summary ---")
-    tasks = state.get("tasks", [])
-    user_input = state.get("user_input", "N/A") # Use current user_input
+    if not state:
+        print("Error: State is None, cannot save summary.")
+        return state # Should not happen if graph is structured correctly
+
+    # Ensure output directory exists at the root level
+    # OUTPUT_DIR = "output" # Removed, use config
+    # --- MODIFIED: Get output_directory from config ---
+    runtime_config = state.get('config', {}).get('configurable', {})
+    output_dir_from_config = runtime_config.get('output_directory', 'output') # Default to 'output' if not in config
+    # Ensure this is a top-level 'output' directory, not nested like 'output/Cache'
+    # For simplicity, let's assume output_dir_from_config IS the intended top-level like "./output"
+    # If it could be "./output/Cache", we'd need to go up one level: os.path.dirname(output_dir_from_config)
+    # For now, let's assume it's set correctly to the desired root output folder.
+    final_summary_output_dir = os.path.abspath(output_dir_from_config)
+    os.makedirs(final_summary_output_dir, exist_ok=True)
+    # --- END MODIFIED ---
+
     timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-    summary_filename = f"workflow_summary_{timestamp}_{uuid.uuid4().hex[:8]}.md"
-    output_dir = Path(_full_static_config.workflow.output_directory)
-    output_parent_dir = output_dir.parent
-    os.makedirs(output_parent_dir, exist_ok=True)
-    summary_filepath = os.path.join(output_parent_dir, summary_filename)
+    
+    # --- MODIFIED: Filenames to be saved in final_summary_output_dir ---
+    base_filename = f"Final_Workflow_Summary_{timestamp}"
+    word_filename = f"{base_filename}.docx"
+    json_filename = f"{base_filename}.json"
+    word_filepath = os.path.join(final_summary_output_dir, word_filename)
+    json_filepath = os.path.join(final_summary_output_dir, json_filename)
+    # --- END MODIFIED ---
 
-    summary_content = f"# Workflow Summary ({timestamp})\n\n"
-    summary_content += f"## User Goal\n\n```text\n{user_input}\n```\n\n"
-    summary_content += f"## Executed Tasks ({len(tasks)})\n\n"
+    doc = DocxDocument()
+    doc.add_heading('Workflow Final Summary', level=0)
+    doc.add_paragraph(f"User Goal: {state.get('user_input', 'N/A')}")
+    doc.add_paragraph(f"Report Generated: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
+    doc.add_paragraph() # Add a blank line for spacing
 
-    for i, task in enumerate(tasks):
-        summary_content += f"### Task {i+1}: {task.get('description', 'N/A')} (ID: {task.get('task_id', 'N/A')})\n\n"
-        summary_content += f"*   **Objective:** `{task.get('task_objective', 'N/A')}`\n"
-        summary_content += f"*   **Agent:** `{task.get('selected_agent', 'N/A')}`\n"
-        summary_content += f"*   **Status:** {task.get('status', 'N/A')}\n"
+    # --- Workflow Details Section ---
+    doc.add_heading("Workflow Details", level=1)
 
-        if task.get('status') in ['failed', 'max_retries_reached']:
-            summary_content += f"*   **Retry Attempts:** {task.get('retry_count', 0)}\n"
-            if task.get('error_log'):
-                 summary_content += f"*   **Last Error Log:**\n    ```text\n    {task['error_log']}\n    ```\n"
-            if task.get('feedback_log'):
-                 summary_content += f"*   **Last Feedback Log (Analysis/Eval):**\n    ```text\n    {task['feedback_log']}\n    ```\n"
+    if not state.get("tasks", []):
+        doc.add_paragraph("No tasks were executed in this workflow.")
+    else:
+        for i, task in enumerate(state.get("tasks", [])):
+            doc.add_heading(f"Task {i+1}: {task.get('description', 'N/A')}", level=2)
+            
+            p_objective = doc.add_paragraph()
+            p_objective.add_run("Objective: ").bold = True
+            p_objective.add_run(task.get('task_objective', 'N/A'))
 
-        inputs_str = json.dumps(task.get('task_inputs', {}), ensure_ascii=False, indent=2)
-        summary_content += f"*   **Final Inputs Used:**\n    ```json\n    {inputs_str[:1000]}{'...' if len(inputs_str) > 1000 else ''}\n    ```\n"
+            p_agent = doc.add_paragraph()
+            p_agent.add_run("Agent: ").bold = True
+            p_agent.add_run(task.get('selected_agent', 'N/A'))
 
-        outputs = task.get('outputs', {})
-        # --- <<< FIX for TypeError and grounding_sources START >>> ---
-        outputs_for_summary = outputs.copy()
-        # Try to remove the non-serializable history for summary generation
-        mcp_history_preview = "[MCP History Present]" if "mcp_internal_messages" in outputs_for_summary else "[No MCP History]"
-        outputs_for_summary.pop("mcp_internal_messages", None)
-        outputs_for_summary.pop("search_suggestions", None)
-        # outputs_for_summary.pop("grounding_sources", None)
+            p_status = doc.add_paragraph()
+            p_status.add_run("Status: ").bold = True
+            p_status.add_run(task.get('status', 'N/A'))
+            
+            doc.add_paragraph() # Spacing before outputs
 
-        outputs_str = "" # Initialize
-        try:
-            # Dump the cleaned version for the summary string
-            outputs_str = json.dumps(outputs_for_summary, ensure_ascii=False, indent=2, default=str) # Use default=str as fallback
-        except TypeError as e:
-            print(f"    Warning: Could not JSON dump cleaned outputs for task {task.get('task_id')} summary: {e}. Using placeholder.")
-            outputs_str = json.dumps({"error": "Could not serialize outputs", "mcp_history_status": mcp_history_preview }, ensure_ascii=False, indent=2)
+            # --- Text Outputs ---
+            text_outputs_found = False
+            if task.get("outputs"):
+                for key, value in task["outputs"].items():
+                    if isinstance(value, str) and key not in ["mcp_internal_messages", "grounding_sources", "search_suggestions"]:
+                        if len(value) > 10: # Consider it significant text
+                            if not text_outputs_found:
+                                doc.add_heading("Key Text Outputs:", level=3)
+                                text_outputs_found = True
+                            
+                            doc.add_paragraph(f"{key.replace('_', ' ').title()}:", style='Intense Quote') # Or another style
+                            # For pre-formatted text or code-like output, consider a different approach
+                            # For now, just add as paragraph. User can reformat.
+                            doc.add_paragraph(value)
+                            doc.add_paragraph() # Spacing
 
-        if outputs: # Check if original outputs dict was non-empty
-            # Display the potentially cleaned/fallback string
-            summary_content += f"*   **Structured Outputs:** {mcp_history_preview}\n    ```json\n    {outputs_str[:2000]}{'...' if len(outputs_str) > 2000 else ''}\n    ```\n"
+            # --- Files (Images, Videos, Models, Others) ---
+            if task.get("output_files"):
+                doc.add_heading("Associated Files:", level=3)
+                for file_info in task.get("output_files", []):
+                    original_path_str = file_info.get("path")
+                    file_description = file_info.get("description", Path(original_path_str).name if original_path_str else "N/A")
+                    file_type = file_info.get("type", "Unknown").lower()
+                    
+                    p_file = doc.add_paragraph()
+                    p_file.add_run(f"File: {file_description} ").bold = True
+                    p_file.add_run(f"(Type: {file_type.capitalize()})")
 
-        files = task.get('output_files', [])
-        if files:
-            summary_content += "*   **Generated Files:**\n"
-            for file_info in files:
-                 file_desc = file_info.get('description', 'N/A')
-                 file_name = file_info.get('filename', os.path.basename(file_info.get('path', 'N/A')))
-                 has_base64 = " (Base64 Included)" if "base64_data" in file_info else ""
-                 summary_content += f"    *   `{file_name}` ({file_info.get('type', 'N/A')}): {file_desc}{has_base64}\n"
+                    if original_path_str and Path(original_path_str).exists():
+                        # Copy file to report directory for easier access if needed
+                        # This makes the Word doc more self-contained with its assets if user wants to keep them together
+                        try:
+                            asset_target_dir = final_summary_output_dir / "task_assets" / task.get('task_id', f"task_{i+1}")
+                            os.makedirs(asset_target_dir, exist_ok=True)
+                            
+                            original_file = Path(original_path_str)
+                            destination_file = asset_target_dir / original_file.name
+                            shutil.copy2(original_file, destination_file)
+                            
+                            # Add a hyperlink to the copied file (relative path might not work well in Word from different machines)
+                            # So, we'll just state where it's copied.
+                            # Users can also drag-and-drop images/videos into Word.
+                            p_file.add_run(f"\n  - Copied to: .\\task_assets\\{task.get('task_id', f'task_{i+1}')}\\{original_file.name}")
+                            # Add placeholder for direct embedding if image
+                            if "image" in file_type:
+                                try:
+                                    doc.add_paragraph("  [Placeholder for image below - Please insert manually if needed]")
+                                    doc.add_picture(str(destination_file), width=Inches(4.0)) # Example width
+                                except Exception as img_e:
+                                     doc.add_paragraph(f"  [Could not automatically embed image: {img_e}]")
+                                     print(f"Warning: Could not embed image {destination_file}: {img_e}")
 
-        evaluation = task.get('evaluation', {})
-        if evaluation and ('assessment' in evaluation or 'specific_criteria' in evaluation):
-            summary_content += "*   **Evaluation:**\n"
-            if 'assessment' in evaluation:
-                 summary_content += f"    *   Assessment: **{str(evaluation.get('assessment', 'N/A')).upper()}**\n"
-            if evaluation.get('specific_criteria'):
-                 criteria_lines = evaluation['specific_criteria'].split('\n')
-                 indented_criteria = "\n        ".join(criteria_lines)
-                 summary_content += f"    *   Criteria Used:\n        ```text\n        {indented_criteria}\n        ```\n"
+                        except Exception as copy_e:
+                            print(f"Error copying asset {original_path_str} for Word report: {copy_e}")
+                            p_file.add_run(f"\n  - Original path: {original_path_str} (Error copying)")
+                        
+                        if "video" in file_type:
+                            doc.add_paragraph("  [Video file - Please link or embed manually if Word version supports it]")
+                        elif "model" in file_type:
+                             doc.add_paragraph("  [3D Model file - Path provided for external viewing]")
+                    elif original_path_str:
+                         p_file.add_run(f"\n  - Original path (file not found): {original_path_str}")
+                    else:
+                        p_file.add_run("\n  - Path not specified.")
+                    doc.add_paragraph() # Spacing
+            
+            if i < len(state.get("tasks", [])) - 1:
+                doc.add_page_break() # Add a page break between tasks if not the last one
 
-        summary_content += "\n---\n\n"
+    # --- Footer or final notes ---
+    doc.add_paragraph()
+    doc.add_heading("End of Report", level=1)
+    # You could add a final summary or disclaimer here
+
+    # --- Save the Word document ---
     try:
-        with open(summary_filepath, "w", encoding="utf-8") as f: f.write(summary_content)
-        print(f"Summary saved to: {summary_filepath}")
-    except Exception as e: print(f"Error saving summary: {e}")
+        doc.save(word_filepath)
+        print(f"Final summary Word document saved to: {word_filepath}")
+    except Exception as e:
+        print(f"Error saving Word document: {e}")
+        # Fallback: try saving with a generic name if permission issues with timestamped name
+        try:
+            fallback_word_path = os.path.join(final_summary_output_dir, "Fallback_Summary.docx")
+            doc.save(fallback_word_path)
+            print(f"Saved Word document with fallback name: {fallback_word_path}")
+        except Exception as fe:
+            print(f"Failed to save Word document with fallback name: {fe}")
 
-    print("Setting current_phase to 'qa' after saving summary.")
-    state["current_phase"] = "qa"
+
+    # Save the full state as JSON for debugging or programmatic access
+    try:
+        # Create a serializable version of the state
+        serializable_state = {}
+        for key, value in state.items():
+            if key == "config": # Config can be complex, maybe exclude or simplify
+                serializable_state[key] = "Configuration object (not fully serialized)"
+                # Or attempt to serialize parts of it if needed
+                # serializable_state[key] = {
+                #     "configurable": value.get('configurable', {}),
+                #     # "recursion_limit": value.get('recursion_limit') # etc.
+                # }
+            elif isinstance(value, Path):
+                serializable_state[key] = str(value)
+            elif key == "tasks" and isinstance(value, list):
+                 serializable_state[key] = []
+                 for task_item in value:
+                     if isinstance(task_item, dict): # Assuming TaskState is a TypedDict, so it's a dict
+                         s_task = {}
+                         for t_key, t_val in task_item.items():
+                             if t_key == "mcp_internal_messages" and isinstance(t_val, list):
+                                 # Already handled to be serializable in _update_task_state_after_tool
+                                 s_task[t_key] = t_val
+                             elif isinstance(t_val, (dict, list, str, int, float, bool, type(None))):
+                                 s_task[t_key] = t_val
+                             else:
+                                 s_task[t_key] = f"<Non-serializable type: {type(t_val).__name__}>"
+                         serializable_state[key].append(s_task)
+                     else: # Should not happen if tasks are TaskState
+                         serializable_state[key].append(f"<Non-dict task item: {type(task_item).__name__}>")
+            elif isinstance(value, (dict, list, str, int, float, bool, type(None))):
+                serializable_state[key] = value
+            else:
+                serializable_state[key] = f"<Non-serializable type: {type(value).__name__}>"
+
+        with open(json_filepath, 'w', encoding='utf-8') as f:
+            json.dump(serializable_state, f, indent=4, ensure_ascii=False, default=str) # Added default=str for safety
+        print(f"Final summary JSON state saved to: {json_filepath}")
+    except Exception as e:
+        print(f"Error saving JSON state: {e}")
+        # Fallback for JSON
+        try:
+            fallback_json_path = os.path.join(final_summary_output_dir, "Fallback_State.json")
+            with open(fallback_json_path, 'w', encoding='utf-8') as f:
+                 json.dump({"error": "Failed to serialize full state, this is a minimal fallback.", "original_error": str(e)}, f, indent=4, ensure_ascii=False)
+            print(f"Saved JSON state with fallback name: {fallback_json_path}")
+        except Exception as fe:
+            print(f"Failed to save JSON state with fallback name: {fe}")
+
+
+    # Update state with the path to the saved summary (optional)
+    updated_tasks = list(state.get("tasks", []))
+    if updated_tasks: # Check if there are any tasks to potentially update
+        # Add to the last task's output or create a new field in the state
+        # For simplicity, let's assume we can add it to the state directly
+        state["final_summary_word_path"] = word_filepath
+        state["final_summary_json_path"] = json_filepath
+
     return state
 
 def initialize_workflow(user_input: str) -> WorkflowState:
@@ -1244,10 +1348,7 @@ def initialize_workflow(user_input: str) -> WorkflowState:
     print(f"Initialized workflow state: Phase='{initialized_state['current_phase']}', user_input='{user_input[:50]}...'")
     return initialized_state
 
-# Async function placeholder (if needed later for async tools/MCP)
-async def initialize_mcp_client():
-    # ... (MCP client initialization logic) ...
-    pass
+
 
 # =============================================================================
 # 9. 圖邊緣條件函數定義 (Update routing)
@@ -1392,71 +1493,45 @@ def route_after_chat_bot(state: WorkflowState) -> Literal["process_management", 
     print(f"--- 路由決策 @ route_after_chat_bot ---")
     print(f"  當前階段: '{current_phase}'")
     
-    # 獲取QA上下文以進行額外檢查
-    qa_context = state.get("qa_context", [])
-    last_ai_message = qa_context[-1] if qa_context and isinstance(qa_context[-1], AIMessage) else None
-    last_message_content = last_ai_message.content if last_ai_message else "無消息"
-    print(f"  最後一條 AI 消息: '{last_message_content[:100]}...'")
-    
-    # 關鍵 - 檢查階段和消息內容
-    resume_indicators = ["正在返回任務執行流程", "繼續任務", "返回任務", "回到任務"]
-    force_resume = any(indicator in last_message_content for indicator in resume_indicators)
-    
-    if current_phase == "task_execution" or force_resume:
-        print("路由 -> process_management (原因: QA 請求繼續/新任務)")
-        # 強制設定階段以確保正確路由
-        if force_resume:
-            print(f"  強制啟動: 根據消息內容設定 current_phase = 'task_execution'")
-            state["current_phase"] = "task_execution"
-            # 清除 interrupt_input 以避免循環
-            state["interrupt_input"] = None
+    # 直接根據QA代理設置的階段進行路由，不再進行重複檢測
+    if current_phase == "task_execution":
+        print("路由 -> process_management (原因: QA代理設置階段為'task_execution')")
         return "process_management"
     elif current_phase == "finished":
-        print("路由 -> finished (原因: QA 檢測到終止請求)")
+        print("路由 -> finished (原因: QA代理設置階段為'finished')")
         return "finished"
     elif current_phase == "qa":
-        print("路由 -> qa_loop (原因: 繼續 QA 對話)")
+        print("路由 -> qa_loop (原因: QA代理設置階段為'qa')")
         return "qa_loop"
     else:
-        print(f"路由警告: 意外的階段 '{current_phase}'. 路由到 finished.")
-        return "finished"
+        print(f"路由警告: 未預期的階段 '{current_phase}'。預設路由到qa_loop。")
+        return "qa_loop"
 
 
 def qa_loop_node(state: WorkflowState) -> Dict[str, Any]:
     """
     Manages the user input part of the QA loop.
-    Processes interrupt_input or prompts user if empty upon resuming.
-    Returns only the user message update for qa_context.
+    Processes interrupt_input ONLY if present.
+    Returns update for qa_context (with HumanMessage) and clears interrupt_input.
+    If no interrupt_input, returns minimal state update.
     """
     node_name = "QA Loop Manager"
     print(f"--- Running Node: {node_name} ---")
 
     interrupt_input = state.get("interrupt_input")
-    qa_context_list = state.get("qa_context", []) # Get current context
-
-    message_to_add = None
-    new_interrupt_input = None # Default to clearing
+    update_dict = {} # Initialize update dictionary
 
     if interrupt_input:
         print(f"{node_name}: Processing query from interrupt_input: '{interrupt_input[:100]}...'")
         message_to_add = HumanMessage(content=interrupt_input)
-        # Clear interrupt_input for the next step
-        new_interrupt_input = None
+        update_dict["qa_context"] = [message_to_add] # Add user message
+        update_dict["interrupt_input"] = None # Clear interrupt input
     else:
-        # Interrupt occurred, but no new input provided by external loop upon resume
-        print(f"{node_name}: No interrupt_input found upon resuming. Prompting user.")
-        # Use an AIMessage to signify a system prompt to the user
-        prompt_text = "請問您想問什麼？請在Interrupt Input欄位中提供您的想法。"
-        message_to_add = AIMessage(content=prompt_text)
-        # Keep interrupt_input as None, wait for actual user input next time
-        new_interrupt_input = None # Ensure it stays None
-
-    # Prepare the minimal state update dictionary
-    update_dict = {
-        "interrupt_input": new_interrupt_input
-    }
-    if message_to_add:
-        update_dict["qa_context"] = [message_to_add] # Wrap in list for add_messages
+        # No new interrupt input, just return empty update or clear interrupt if needed
+        print(f"{node_name}: No new interrupt_input found. Returning minimal update.")
+        # Ensure interrupt_input is None in the returned state
+        update_dict["interrupt_input"] = None
+        # Do NOT add any message to qa_context here
 
     return update_dict
 
@@ -1542,8 +1617,9 @@ workflow.add_edge("save_final_summary", "process_management")
 # Interrupting *inside* the subgraph might be better if needed.
 # For now, keep existing interrupts.
 graph = workflow.compile(interrupt_before=["qa_loop"], interrupt_after=["chat_bot"])
+# graph = workflow.compile() #沒有中斷點的編譯
 graph.name = "General_Arch_graph_v20_AgentBasedEval" # Updated name
-print("Main Graph compiled successfully (v20 - Agent-Based Eval).")
+print("Main Graph compiled successfully (v20 - Agent-Based Eval with QA interrupts enabled).")
 
 # =============================================================================
 # 12. TODOLIST

@@ -38,7 +38,7 @@
       "sampler": "euler_a",
       "scheduler": "beta",
       "steps": "20",
-      "guidance": "2.5",
+      "guidance": "3",
       "max_shift": "",
       "base_shift": "",
       "denoise": "1.0",

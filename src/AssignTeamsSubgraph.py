@@ -25,9 +25,11 @@ from src.tools.img_recognition import img_recognition
 from src.tools.video_recognition import video_recognition
 from src.tools.gemini_image_generation_tool import generate_gemini_image
 from src.tools.gemini_search_tool import perform_grounded_search
-from src.tools.case_render_image import case_render_image
+from src.tools.model_render_image import model_render_image
 from src.tools.generate_3D import generate_3D
-from src.tools.simulate_future_image import simulate_future_image
+# --- MODIFIED: Remove simulate_future_image tool import ---
+# from src.tools.simulate_future_image import simulate_future_image
+# --- END MODIFIED ---
 
 # --- Configuration & LLM Initialization ---
 from src.configuration import ConfigManager, ModelConfig, MemoryConfig, initialize_llm, ConfigSchema
@@ -390,7 +392,11 @@ async def prepare_tool_inputs_node(state: WorkflowState, config: RunnableConfig)
         task_status = task.get("status")
         agent_used = task.get("selected_agent", "N/A")
         objective = task.get("task_objective", "N/A")
+        error_log = task.get('error_log', 'N/A'); feedback_log = task.get('feedback_log', 'N/A')
+        error_log_summary = error_log[:100] + "..." if error_log else "N/A"
+        feedback_log_summary = feedback_log[:100] + "..." if feedback_log else "N/A"
         aggregated_summary_parts.append(f"  Task {i} (ID: {task_id}, Agent: {agent_used}, Status: {task_status}): {task_desc} (Objective: {objective})")
+        aggregated_summary_parts.append(f"    Status: {task_status} - Error: {error_log_summary} Feedback: {feedback_log_summary}")
         if task_status == "completed":
             task_outputs = task.get("outputs")
             if task_outputs:
@@ -415,7 +421,9 @@ async def prepare_tool_inputs_node(state: WorkflowState, config: RunnableConfig)
                 aggregated_files_raw.extend(task_files); aggregated_summary_parts.append(f"    Files Generated: {[f.get('filename', 'N/A') for f in task_files]}")
         elif task_status == "failed" or task_status == "max_retries_reached":
              error_log = task.get('error_log', 'N/A'); feedback_log = task.get('feedback_log', 'N/A')
-             aggregated_summary_parts.append(f"    Status: {task_status} - Error: {error_log[:100]}... Feedback: {feedback_log[:100]}...")
+             error_log_summary = error_log[:100] + "..." if error_log else "N/A"
+             feedback_log_summary = feedback_log[:100] + "..." if feedback_log else "N/A"
+             aggregated_summary_parts.append(f"    Status: {task_status} - Error: {error_log_summary} Feedback: {feedback_log_summary}")
     filtered_aggregated_files = _filter_base64_from_files(aggregated_files_raw)
     # --- MODIFIED: Use the aggregated_outputs dict (which contains original task outputs) for the final JSON string ---
     try:
@@ -487,26 +495,26 @@ async def prepare_tool_inputs_node(state: WorkflowState, config: RunnableConfig)
                 err_msg = f"Input Prep Failed: LLM returned invalid format (expected dict). Content: {prep_content}"
                 _set_task_failed(current_task, err_msg, node_name)
             else:
-                # --- Validation (including OSMMCPCoordinator) ---
+                # --- Validation ---
                 agent_key_map = {
                     "ArchRAGAgent": ["prompt"], "WebSearchAgent": ["prompt"],
                     "ImageRecognitionAgent": ["image_paths", "prompt"], "VideoRecognitionAgent": ["video_paths", "prompt"],
-                    "Generate3DAgent": ["image_path"], "CaseRenderAgent": ["outer_prompt", "i", "strength"],
-                    "SimulateFutureAgent": ["outer_prompt", "render_image"], "ImageGenerationAgent": ["prompt"],
+                    "ModelRenderAgent": ["outer_prompt", "image_inputs", "is_future_scenario"], # Updated keys
+                    "Generate3DAgent": ["image_path"],
+                    "ImageGenerationAgent": ["prompt"], # image_inputs is optional for ImageGenerationAgent
                     "LLMTaskAgent": ["prompt"],
-                    "RhinoMCPCoordinator": ["user_request"], # initial_image_path is optional
-                    "PinterestMCPCoordinator": ["keyword"], # limit is optional
-                    # <<< ADDED: OSMMCPCoordinator inputs >>>
-                    "OSMMCPCoordinator": ["user_request"] # Contains the address
-                    # <<< END ADDED >>>
+                    "RhinoMCPCoordinator": ["user_request"],
+                    "PinterestMCPCoordinator": ["keyword"],
+                    "OSMMCPCoordinator": ["user_request"]
                 }
-                # --- Optional Keys Handling ---
                 optional_keys = []
                 if selected_agent_name == "RhinoMCPCoordinator":
                     optional_keys.append("initial_image_path")
                 elif selected_agent_name == "PinterestMCPCoordinator":
                     optional_keys.append("limit")
-                # Add other optional keys here if needed
+                elif selected_agent_name == "ImageGenerationAgent":
+                    optional_keys.append("i")
+                    optional_keys.append("image_inputs") # image_inputs is optional for ImageGenerationAgent
 
                 missing_keys = []
                 invalid_paths = []
@@ -516,45 +524,89 @@ async def prepare_tool_inputs_node(state: WorkflowState, config: RunnableConfig)
                 required_keys = agent_key_map.get(selected_agent_name, [])
                 for key in required_keys:
                     value = prepared_inputs.get(key)
-                    if value is None or (isinstance(value, (str, list)) and not value):
+                    
+                    if key == "is_future_scenario" and selected_agent_name == "ModelRenderAgent":
+                        if value is None: # Must be explicitly true or false by the LLM
+                            missing_keys.append(key)
+                        elif not isinstance(value, bool):
+                            invalid_values.append(f"{key}: Value '{value}' is not a boolean (true/false).")
+                    elif key == "image_inputs" and selected_agent_name == "ModelRenderAgent":
+                        if value is None or not isinstance(value, list) or not value: # Must be a non-empty list
+                            missing_keys.append(key)
+                            if value is not None and isinstance(value,list) and not value :
+                                invalid_values.append(f"{key}: List cannot be empty for ModelRenderAgent.")
+                        elif not all(isinstance(item, str) for item in value):
+                             invalid_values.append(f"{key}: All items in list must be string paths.")
+                    elif value is None or (isinstance(value, str) and not value): # Check for empty strings for other required keys
                         missing_keys.append(key)
+                    # If it's a list type other than image_inputs for ModelRenderAgent, and it's empty, it's missing
+                    elif isinstance(value, list) and not value and key not in ["image_inputs"]: # e.g. image_paths for ImageRecognitionAgent
+                        missing_keys.append(key)
+
 
                 # Check optional keys and validate if present
                 for key in optional_keys:
                     value = prepared_inputs.get(key)
-                    if value is not None:
+                    if value is not None: # Only validate if present
                         if key == "initial_image_path":
                             if not isinstance(value, str) or not os.path.exists(value):
                                 invalid_paths.append(f"{key}: '{value}' (Optional path provided but not found or invalid type)")
                         elif key == "limit":
                             try: int(value)
                             except (ValueError, TypeError): invalid_values.append(f"{key}: '{value}' (Must be integer)")
-                        # Add other optional key validations
+                        elif key == "i" and selected_agent_name == "ImageGenerationAgent":
+                            try: prepared_inputs[key] = int(value)
+                            except (ValueError, TypeError): invalid_values.append(f"{key}: '{value}' (Must be int for ImageGenerationAgent)")
+                        elif key == "image_inputs" and selected_agent_name == "ImageGenerationAgent": # Optional image_inputs for ImageGen
+                             if not isinstance(value, list) or not all(isinstance(item, str) for item in value):
+                                 invalid_values.append(f"{key}: Optional input must be a list of string paths.")
+                             else: # Validate paths if list is provided
+                                 for item_idx, item_path in enumerate(value):
+                                     if not os.path.exists(item_path):
+                                        invalid_paths.append(f"{key}[{item_idx}]: Optional path '{item_path}' not found.")
 
-                # Perform general validation on present keys
+
+                # Perform general validation on present keys (that are not None)
                 for key, value in prepared_inputs.items():
                     if value is None: continue
-                    # --- Path/Value Validation (remains mostly the same) ---
-                    if key in ["image_paths", "video_paths"] and isinstance(value, list):
-                         for path in value:
-                             if not isinstance(path, str) or not os.path.exists(path): invalid_paths.append(f"{key}: '{path}'")
-                    elif key == "image_path" and isinstance(value, str) and key not in optional_keys: # Check it's required
-                         if not os.path.exists(value): invalid_paths.append(f"{key}: '{value}'")
-                    elif key == "render_image" and isinstance(value, str):
-                        # ... (render_image path check) ...
-                        full_path_cache = os.path.join(RENDER_CACHE_DIR, value)
-                        full_path_output = os.path.join(OUTPUT_DIR, value) # Check output root
-                        if not os.path.exists(full_path_cache) and not os.path.exists(full_path_output) and not os.path.exists(value):
-                             invalid_paths.append(f"{key}: '{value}' (Not found in cache, output, or as absolute path)")
-                    elif key == "i" and selected_agent_name == "CaseRenderAgent":
-                         try: prepared_inputs[key] = int(value)
-                         except (ValueError, TypeError): invalid_values.append(f"{key}: '{value}' (Must be int)")
-                    elif key == "strength" and selected_agent_name == "CaseRenderAgent":
-                         try:
-                             strength_val = float(value); prepared_inputs[key] = str(strength_val) # Keep as string
-                             if not (0.0 <= strength_val <= 1.0): print(f"Warning: CaseRenderAgent strength {strength_val} outside typical 0.0-0.8 range. Allowing 0.0-1.0.")
-                         except (ValueError, TypeError): invalid_values.append(f"{key}: '{value}' (Must be float-like string)")
-                    elif key in ["prompt", "outer_prompt", "user_request", "keyword"] and not isinstance(value, str):
+
+                    if key in ["image_paths", "video_paths"] and isinstance(value, list): # For ImageRecognitionAgent, VideoRecognitionAgent
+                         if not value: # Empty list for a required path list is an error unless handled above
+                             if key in required_keys and key not in missing_keys: # If it wasn't caught as missing
+                                invalid_values.append(f"{key}: List is empty. Must provide at least one path.")
+                         for path_idx, path_val in enumerate(value):
+                             if not isinstance(path_val, str) or not os.path.exists(path_val):
+                                 invalid_paths.append(f"{key}[{path_idx}]: '{path_val}' (Path not found or invalid type)")
+                    elif key == "image_path" and isinstance(value, str) and key not in optional_keys: # For Generate3DAgent
+                         if not os.path.exists(value): invalid_paths.append(f"{key}: '{value}' (Path not found)")
+                    
+                    # Validation for ModelRenderAgent's image_inputs (paths inside the list)
+                    elif key == "image_inputs" and selected_agent_name == "ModelRenderAgent" and isinstance(value, list) and value: # Already checked for non-list or empty list
+                        for item_idx, item_path in enumerate(value):
+                            # Path existence check (can be more robust, checking cache/output dirs like before)
+                            # For now, a simple os.path.exists(), assuming LLM provides resolvable paths
+                            if not isinstance(item_path, str): # Should have been caught by LLM prompt, but good to double check
+                                if f"{key}[{item_idx}]" not in invalid_values : invalid_values.append(f"{key}[{item_idx}]: Item '{item_path}' is not a string path.")
+                                continue
+                            
+                            # Re-check path validation logic here, ensuring it matches the previous detailed one.
+                            # The current simple os.path.exists(item_path) might be too restrictive if paths are relative to cache.
+                            # Let's use the more comprehensive check:
+                            full_path_cache_item = os.path.join(RENDER_CACHE_DIR, os.path.basename(item_path))
+                            full_path_output_item = os.path.join(OUTPUT_DIR, os.path.basename(item_path))
+                            if not os.path.exists(item_path) and \
+                               not os.path.exists(full_path_cache_item) and \
+                               not os.path.exists(full_path_output_item):
+                                invalid_paths.append(f"{key}[{item_idx}]: '{item_path}' (Not found as absolute, in cache, or in output dir)")
+
+                    elif key == "is_future_scenario" and selected_agent_name == "ModelRenderAgent":
+                        if not isinstance(value, bool): # Already caught None, this catches non-bool
+                             if f"{key}: Value '{value}' is not a boolean (true/false)." not in invalid_values: # Avoid duplicates
+                                invalid_values.append(f"{key}: Value '{value}' is not a boolean (true/false).")
+                                
+                    elif key == "i" and selected_agent_name == "ImageGenerationAgent":
+                         pass # Already validated if present in optional_keys
+                    elif key in ["prompt", "outer_prompt", "user_request", "keyword"] and not isinstance(value, str): # outer_prompt for ModelRender
                          invalid_values.append(f"{key}: Value must be a string.")
 
                 # Consolidate errors
@@ -892,49 +944,133 @@ def run_web_search_tool_node(state: WorkflowState, config: RunnableConfig) -> Di
     tasks[current_idx] = _update_task_state_after_tool(current_task, outputs=final_outputs, output_files=output_files_list, error=error_to_report)
     return {"tasks": tasks, "current_task": tasks[current_idx].copy()}
 
-# --- run_case_render_tool_node ---
-def run_case_render_tool_node(state: WorkflowState, config: RunnableConfig) -> Dict[str, Any]:
-    print("--- Running Case Render Tool Node (Unified Subgraph) ---")
+# --- MODIFIED: run_model_render_tool_node (now handles both photorealism and future simulation) ---
+def run_model_render_tool_node(state: WorkflowState, config: RunnableConfig) -> Dict[str, Any]:
+    node_name = "Model Render Node"
+    print(f"--- Running {node_name} (Handles Photorealism & Future Simulation) ---")
     current_idx = state.get("current_task_index", -1)
     tasks = [t.copy() for t in state.get("tasks", [])]
     if current_idx < 0 or current_idx >= len(tasks): return {"tasks": state.get("tasks", [])}
     current_task = tasks[current_idx]
     inputs = current_task.get("task_inputs")
     error_to_report = None
-    output_files_list = []
+    aggregated_output_files_list = []
+    aggregated_generated_filenames = []
     final_outputs = {}
 
     try:
-        if not inputs or not isinstance(inputs, dict): raise ValueError("Invalid or missing 'task_inputs'")
-        outer_prompt = inputs.get("outer_prompt")
-        i = inputs.get("i")
-        strength = inputs.get("strength")
-        if not outer_prompt or i is None or strength is None: raise ValueError("Missing required inputs ('outer_prompt', 'i', 'strength')")
+        if not inputs or not isinstance(inputs, dict):
+            raise ValueError("Invalid or missing 'task_inputs'")
 
-        print(f"Case Render Node: Using outer_prompt='{outer_prompt[:50]}...', count(i)={i}, strength={strength}")
+        initial_outer_prompt_context = inputs.get("outer_prompt") # This is the contextual prompt from prepare_tool_inputs
+        image_inputs_paths = inputs.get("image_inputs") # List of image paths, RENAMED from render_image_input
+        is_future_scenario = inputs.get("is_future_scenario", False) # Boolean flag
 
-        # Use imported tool
-        result = case_render_image({"outer_prompt": outer_prompt, "i": i, "strength": strength})
-        if isinstance(result, dict) and "Error:" in result.get("error", ""): raise ValueError(f"Tool Error: {result['error']}")
-        if not isinstance(result, str) or not result: raise ValueError(f"Tool returned unexpected/empty result: {result}")
+        if not initial_outer_prompt_context:
+            raise ValueError("Missing required input 'outer_prompt' (contextual prompt)")
+        if not image_inputs_paths or not isinstance(image_inputs_paths, list) or not image_inputs_paths or not all(isinstance(p, str) for p in image_inputs_paths): # Added check for empty list
+            raise ValueError("Missing or invalid 'image_inputs' (must be a non-empty list of string paths)")
+        if not isinstance(is_future_scenario, bool):
+            raise ValueError("'is_future_scenario' must be a boolean")
 
-        filenames = result.split(',')
-        for filename in filenames:
-            fn_stripped = filename.strip()
-            if fn_stripped:
-                # Use placeholder _save_tool_output_file and imported RENDER_CACHE_DIR
-                file_info = _save_tool_output_file(fn_stripped, RENDER_CACHE_DIR, "image/png", f"ComfyUI render: {outer_prompt[:50]}...")
-                if file_info: output_files_list.append(file_info)
+        print(f"{node_name}: Task type: {'Future Simulation' if is_future_scenario else 'Photorealistic Render'}")
+        print(f"  Initial outer_prompt='{initial_outer_prompt_context[:70]}...', processing {len(image_inputs_paths)} image(s).")
 
-        if not output_files_list: raise ValueError("Tool ran but failed to produce/locate output files.")
-        final_outputs = {"generated_filenames": filenames}
+        for idx, image_full_path in enumerate(image_inputs_paths):
+            print(f"  Processing image {idx+1}/{len(image_inputs_paths)}: {image_full_path}")
+            
+            refined_prompt_text = initial_outer_prompt_context # Default to initial prompt
+            try:
+                if is_future_scenario:
+                    # Prompt for ImageRecognition: Ask it to generate a final English ComfyUI prompt for future simulation
+                    recognition_prompt_ir = f"Based on the following context for a future architectural scenario: '{initial_outer_prompt_context}', and by analyzing the provided image, generate a detailed and specific, final, ENGLISH ComfyUI prompt. This prompt should be directly usable by an image generation tool to visually simulate the described future scenario on the given image. Focus on elements that would change or appear in the future based on the context and image content."
+                else: # Photorealistic rendering
+                    # Prompt for ImageRecognition: Ask it to generate a final English ComfyUI prompt for photorealism
+                    recognition_prompt_ir = f"For the architectural scheme described as: '{initial_outer_prompt_context}', and by analyzing the provided image (paying close attention to its perspective, view, and existing elements), generate a detailed and specific, final, ENGLISH ComfyUI prompt. This prompt should be directly usable by an image generation tool to create a high-quality photorealistic rendering of the image, enhancing realism and matching the described scheme."
+                
+                print(f"    Invoking ImageRecognition for: {image_full_path} with IR prompt: '{recognition_prompt_ir[:100]}...'")
+                
+                refined_prompt_dict_or_str = img_recognition({
+                    "image_paths": [image_full_path],
+                    "prompt": recognition_prompt_ir
+                })
+
+                if isinstance(refined_prompt_dict_or_str, str):
+                    refined_prompt_text = refined_prompt_dict_or_str
+                elif isinstance(refined_prompt_dict_or_str, dict) and "description" in refined_prompt_dict_or_str:
+                    refined_prompt_text = refined_prompt_dict_or_str["description"]
+                else:
+                    print(f"    Warning: ImageRecognition returned unexpected format for {image_full_path}. Using initial_outer_prompt. Output: {refined_prompt_dict_or_str}")
+                    # Fallback already handled by refined_prompt_text = initial_outer_prompt_context
+                
+                if not refined_prompt_text or (isinstance(refined_prompt_text, str) and any(err_str in refined_prompt_text for err_str in ["錯誤", "Error", "找不到"])):
+                     print(f"    Warning: ImageRecognition failed or returned error for {image_full_path}: '{refined_prompt_text}'. Using initial_outer_prompt for this image.")
+                     refined_prompt_text = initial_outer_prompt_context # Ensure fallback
+
+                print(f"    Refined prompt for {image_full_path}: '{refined_prompt_text[:70]}...'")
+            except Exception as recog_err:
+                print(f"    Error during ImageRecognition for {image_full_path}: {recog_err}. Using initial_outer_prompt.")
+                # refined_prompt_text is already initial_outer_prompt_context by default
+
+            print(f"    Calling model_render_image with outer_prompt='{refined_prompt_text[:50]}...', render_image='{os.path.basename(image_full_path)}'")
+            # The model_render_image tool itself should handle the type of rendering based on the refined_prompt
+            # or potentially different ComfyUI workflows if the tool is made more complex.
+            # For now, we assume the refined_prompt is sufficient to guide the *single* model_render_image tool.
+            result = model_render_image({
+                "outer_prompt": refined_prompt_text,
+                "render_image": os.path.basename(image_full_path)
+            })
+
+            if isinstance(result, str) and result.startswith("Error:"):
+                print(f"    Tool Error for {image_full_path}: {result}")
+                current_task["feedback_log"] = (current_task.get("feedback_log","") + f"\nFailed to render {image_full_path}: {result}").strip()
+                continue 
+
+            if not isinstance(result, str) or not result:
+                print(f"    Tool returned unexpected/empty result for {image_full_path}: {result}")
+                current_task["feedback_log"] = (current_task.get("feedback_log","") + f"\nUnexpected result for {image_full_path}: {result}").strip()
+                continue 
+
+            output_filename_from_tool = result.strip()
+            if output_filename_from_tool:
+                file_info = _save_tool_output_file(
+                    output_filename_from_tool,
+                    RENDER_CACHE_DIR, 
+                    "image/png",
+                    f"{'Future simulation' if is_future_scenario else 'Model render'} for {os.path.basename(image_full_path)}: {refined_prompt_text[:30]}..."
+                )
+                if file_info:
+                    aggregated_output_files_list.append(file_info)
+                    aggregated_generated_filenames.append(output_filename_from_tool)
+                    print(f"    Successfully processed and saved: {output_filename_from_tool}")
+                else:
+                    print(f"    Could not find/process tool output file: {output_filename_from_tool} for {image_full_path}")
+                    current_task["feedback_log"] = (current_task.get("feedback_log","") + f"\nOutput file not found/processed for {image_full_path}: {output_filename_from_tool}").strip()
+            else:
+                print(f"    Tool did not return a filename for {image_full_path}.")
+                current_task["feedback_log"] = (current_task.get("feedback_log","") + f"\nNo output filename for {image_full_path}.").strip()
+
+
+        if not aggregated_output_files_list:
+            if not current_task.get("feedback_log"):
+                 current_task["feedback_log"] = "ModelRenderAgent: Tool ran but failed to produce/locate any output files for the given render_image(s)."
+            raise ValueError(current_task["feedback_log"] or "Tool ran but failed to produce/locate any output files.")
+
+        final_outputs = {"generated_filenames": aggregated_generated_filenames}
+        print(f"{node_name}: Completed. Generated {len(aggregated_generated_filenames)} file(s).")
 
     except Exception as e:
         error_to_report = e
-        final_outputs = None
-        output_files_list = None
+        final_outputs = {} 
+        traceback.print_exc()
 
-    tasks[current_idx] = _update_task_state_after_tool(current_task, outputs=final_outputs, output_files=output_files_list, error=error_to_report)
+
+    tasks[current_idx] = _update_task_state_after_tool(
+        current_task,
+        outputs=final_outputs,
+        output_files=aggregated_output_files_list, 
+        error=error_to_report
+    )
     return {"tasks": tasks, "current_task": tasks[current_idx].copy()}
 
 # --- run_generate_3d_tool_node ---
@@ -994,47 +1130,6 @@ def run_generate_3d_tool_node(state: WorkflowState, config: RunnableConfig) -> D
         final_outputs = None
         output_files_list = None
         traceback.print_exc() # Print traceback for debugging
-
-    tasks[current_idx] = _update_task_state_after_tool(current_task, outputs=final_outputs, output_files=output_files_list, error=error_to_report)
-    return {"tasks": tasks, "current_task": tasks[current_idx].copy()}
-
-# --- run_simulate_future_tool_node ---
-def run_simulate_future_tool_node(state: WorkflowState, config: RunnableConfig) -> Dict[str, Any]:
-    print("--- Running Simulate Future Tool Node (Unified Subgraph) ---")
-    current_idx = state.get("current_task_index", -1)
-    tasks = [t.copy() for t in state.get("tasks", [])]
-    if current_idx < 0 or current_idx >= len(tasks): return {"tasks": state.get("tasks", [])}
-    current_task = tasks[current_idx]
-    inputs = current_task.get("task_inputs")
-    error_to_report = None
-    output_files_list = []
-    final_outputs = {}
-
-    try:
-        if not inputs or not isinstance(inputs, dict): raise ValueError("Invalid or missing 'task_inputs'")
-        outer_prompt = inputs.get("outer_prompt")
-        render_image_filename = inputs.get("render_image")
-        if not outer_prompt: raise ValueError("Missing 'outer_prompt'")
-        if not render_image_filename: raise ValueError("Missing 'render_image' filename")
-        print(f"Simulate Future Node: Using outer_prompt='{outer_prompt[:50]}...', render_image='{render_image_filename}'")
-
-        # Use imported tool
-        result = simulate_future_image({"outer_prompt": outer_prompt, "render_image": render_image_filename})
-        if isinstance(result, dict) and result.get("error"): raise ValueError(f"Tool Error: {result['error']}")
-        if not isinstance(result, str) or not result: raise ValueError(f"Tool returned unexpected/empty result: {result}")
-
-        output_filename = result
-        # Use placeholder _save_tool_output_file and imported RENDER_CACHE_DIR
-        file_info = _save_tool_output_file(output_filename, RENDER_CACHE_DIR, "image/png", f"Future simulation: {outer_prompt[:50]}...")
-        if file_info: output_files_list.append(file_info)
-        else: raise ValueError("Tool ran but failed to produce/locate output file.")
-
-        final_outputs = {"generated_filename": output_filename}
-
-    except Exception as e:
-        error_to_report = e
-        final_outputs = None
-        output_files_list = None
 
     tasks[current_idx] = _update_task_state_after_tool(current_task, outputs=final_outputs, output_files=output_files_list, error=error_to_report)
     return {"tasks": tasks, "current_task": tasks[current_idx].copy()}
@@ -1173,7 +1268,7 @@ async def run_rhino_mcp_node(state: WorkflowState, config: RunnableConfig) -> Di
         local_mcp_state["messages"] = [HumanMessage(content=initial_human_content)]
 
         # 3. Run Internal MCP Loop (logic remains mostly the same)
-        max_mcp_steps = 100
+        max_mcp_steps = 1000
         step_count = 0
         mcp_loop_error = None
         while step_count < max_mcp_steps:
@@ -1344,7 +1439,7 @@ async def run_pinterest_mcp_node(state: WorkflowState, config: RunnableConfig) -
         }
 
         # 3. Run Internal MCP Loop (Similar structure to Rhino)
-        max_mcp_steps = 50
+        max_mcp_steps = 1000
         step_count = 0
         mcp_loop_error = None
         while step_count < max_mcp_steps:
@@ -1514,7 +1609,7 @@ async def run_osm_mcp_node(state: WorkflowState, config: RunnableConfig) -> Dict
         }
 
         # 3. Run Internal MCP Loop (Similar structure to Rhino/Pinterest)
-        max_mcp_steps = 50 # OSM usually finishes in fewer steps (agent -> executor -> agent -> END)
+        max_mcp_steps = 1000 # OSM usually finishes in fewer steps (agent -> executor -> agent -> END)
         step_count = 0
         mcp_loop_error = None
         while step_count < max_mcp_steps:
@@ -1620,9 +1715,11 @@ tool_subgraph_builder.add_node("prepare_tool_inputs", prepare_tool_inputs_node)
 tool_subgraph_builder.add_node("rag_agent", run_rag_tool_node)
 tool_subgraph_builder.add_node("image_gen_agent", run_image_gen_tool_node)
 tool_subgraph_builder.add_node("web_search_agent", run_web_search_tool_node)
-tool_subgraph_builder.add_node("case_render_agent", run_case_render_tool_node)
+tool_subgraph_builder.add_node("model_render_agent", run_model_render_tool_node)
 tool_subgraph_builder.add_node("generate_3d_agent", run_generate_3d_tool_node)
-tool_subgraph_builder.add_node("simulate_future_agent", run_simulate_future_tool_node)
+# --- MODIFIED: Remove SimulateFutureAgent node ---
+# tool_subgraph_builder.add_node("simulate_future_agent", run_simulate_future_tool_node) # Removed
+# --- END MODIFIED ---
 tool_subgraph_builder.add_node("video_recognition_agent", run_video_recognition_tool_node)
 tool_subgraph_builder.add_node("image_recognition_agent", run_image_recognition_tool_node)
 tool_subgraph_builder.add_node("llm_task_agent", run_llm_task_node)
@@ -1664,8 +1761,11 @@ def route_after_prepare_inputs(state: WorkflowState) -> str:
         print(f"  Input prep successful for '{agent_name}'. Determining target tool node...")
         node_mapping = {
             "ArchRAGAgent": "rag_agent", "ImageGenerationAgent": "image_gen_agent",
-            "WebSearchAgent": "web_search_agent", "CaseRenderAgent": "case_render_agent",
-            "Generate3DAgent": "generate_3d_agent", "SimulateFutureAgent": "simulate_future_agent",
+            "WebSearchAgent": "web_search_agent", "ModelRenderAgent": "model_render_agent",
+            "Generate3DAgent": "generate_3d_agent", 
+            # --- MODIFIED: Removed SimulateFutureAgent ---
+            # "SimulateFutureAgent": "simulate_future_agent",
+            # --- END MODIFIED ---
             "VideoRecognitionAgent": "video_recognition_agent", "ImageRecognitionAgent": "image_recognition_agent",
             "LLMTaskAgent": "llm_task_agent",
             "RhinoMCPCoordinator": "rhino_mcp_node",
@@ -1699,9 +1799,11 @@ tool_subgraph_builder.add_conditional_edges(
         "rag_agent": "rag_agent",
         "image_gen_agent": "image_gen_agent",
         "web_search_agent": "web_search_agent",
-        "case_render_agent": "case_render_agent",
+        "model_render_agent": "model_render_agent",
         "generate_3d_agent": "generate_3d_agent",
-        "simulate_future_agent": "simulate_future_agent",
+        # --- MODIFIED: Removed SimulateFutureAgent ---
+        # "simulate_future_agent": "simulate_future_agent",
+        # --- END MODIFIED ---
         "video_recognition_agent": "video_recognition_agent",
         "image_recognition_agent": "image_recognition_agent",
         "llm_task_agent": "llm_task_agent",
@@ -1718,9 +1820,11 @@ tool_subgraph_builder.add_conditional_edges(
 tool_subgraph_builder.add_edge("rag_agent", END)
 tool_subgraph_builder.add_edge("image_gen_agent", END)
 tool_subgraph_builder.add_edge("web_search_agent", END)
-tool_subgraph_builder.add_edge("case_render_agent", END)
+tool_subgraph_builder.add_edge("model_render_agent", END)
 tool_subgraph_builder.add_edge("generate_3d_agent", END)
-tool_subgraph_builder.add_edge("simulate_future_agent", END)
+# --- MODIFIED: Remove SimulateFutureAgent edge ---
+# tool_subgraph_builder.add_edge("simulate_future_agent", END) # Removed
+# --- END MODIFIED ---
 tool_subgraph_builder.add_edge("video_recognition_agent", END)
 tool_subgraph_builder.add_edge("image_recognition_agent", END)
 tool_subgraph_builder.add_edge("llm_task_agent", END)

@@ -158,7 +158,15 @@ def generate_gemini_image(prompt: str, image_inputs: Optional[List[Any]] = None,
     print(f"Gemini Image Gen Tool (Client Mode): Received prompt='{prompt[:50]}...', {len(image_inputs) if image_inputs else 0} image inputs.")
     
     # 準備 contents 列表 - 首先加入文本提示
-    text_prompt = f"根據內容生成{i}張圖片: {prompt}"
+    if image_inputs:
+        # 圖生圖／圖片編輯
+        # 使用者提供的 prompt 作為編輯指令
+        text_prompt = f"根據以下提示「{prompt}」，並參考所附的圖片，修改並生成 {i} 張圖片。"
+    else:
+        # 純文字生成圖片
+        text_prompt = f"請生成 {i} 張圖片，內容為：「{prompt}」。"
+    # --- END MODIFIED ---
+    
     contents = [text_prompt]  # 開始只有文字提示
     
     # 處理圖片輸入

@@ -23,14 +23,14 @@
   },
   "166": {
     "inputs": {
-      "seed": 189747157355218,
+      "seed": 780717576271475,
       "steps": 25,
-      "cfg": 7.5,
+      "cfg": 7,
       "sampler_name": "euler_ancestral",
       "scheduler": "normal",
       "denoise": 1,
       "model": [
-        "196",
+        "155",
         0
       ],
       "positive": [
@@ -147,7 +147,7 @@
   },
   "185": {
     "inputs": {
-      "image": "image (3).png",
+      "image": "ComfyUI_temp_sxpzh_00016_.png",
       "upload": "image"
     },
     "class_type": "LoadImage",
@@ -195,45 +195,6 @@
     "class_type": "ControlNetApplyAdvanced",
     "_meta": {
       "title": "Apply ControlNet"
-    }
-  },
-  "195": {
-    "inputs": {
-      "preset": "PLUS (high strength)",
-      "model": [
-        "155",
-        0
-      ]
-    },
-    "class_type": "IPAdapterUnifiedLoader",
-    "_meta": {
-      "title": "IPAdapter Unified Loader"
-    }
-  },
-  "196": {
-    "inputs": {
-      "weight": 0.5,
-      "weight_type": "strong style transfer",
-      "combine_embeds": "concat",
-      "start_at": 0,
-      "end_at": 0.5,
-      "embeds_scaling": "K+V",
-      "model": [
-        "195",
-        0
-      ],
-      "ipadapter": [
-        "195",
-        1
-      ],
-      "image": [
-        "185",
-        0
-      ]
-    },
-    "class_type": "IPAdapterAdvanced",
-    "_meta": {
-      "title": "IPAdapter Advanced"
     }
   },
   "198": {

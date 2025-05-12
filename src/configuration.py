@@ -151,7 +151,7 @@ class ConfigManager:
                 "process_management": AgentConfig(
                     agent_name="process_management",
                     description="Responsible for planning and managing the task workflow.",
-                    llm=ModelConfig(provider="openai", model_name="gpt-4o-mini", temperature=0.7), # Keep PM as OpenAI for now unless specified otherwise
+                    llm=ModelConfig(provider="openai", model_name="gpt-4o-mini", temperature=0.7),
                     prompts={
                         "create_workflow": PromptConfig(
                             template="""
@@ -173,7 +173,19 @@ Analyze the request and generate a **complete, logical, and DETAILED sequence of
 
 For **each** task in the sequence, you MUST specify:
 1.  `description`: High-level goal for this step (in {llm_output_language}).
-2.  `task_objective`: Specific outcome and method needed. Use `"final_evaluation"` or `"special_evaluation"` for the respective agent modes. Otherwise, describe the specific goal (e.g., "Evaluate task N based on standard criteria").
+2.  `task_objective`: Specific outcome and method needed.
+    *   Use `"final_evaluation"` or `"special_evaluation"` for the respective agent modes.
+    *   Otherwise, describe the specific goal (e.g., "Evaluate task N based on standard criteria").
+    *   **For `ModelRenderAgent` (Handles existing images):**
+        *   If the goal is photorealistic rendering of an existing model view/image (e.g., from Rhino): Set objective like "Photorealistic rendering of the provided image(s) of the architectural scheme: [scheme details]."
+        *   If the goal is future scenario simulation based on an existing image: Set objective like "Simulate future scenario for the provided image(s). Context: [user goals, site conditions, architectural scheme details for simulation]."
+    *   **For `ImageGenerationAgent` (Generates new images from text/concepts):**
+        *   If generating a new visual concept from a description: Set objective like "Generate an image representing [concept description, style, mood]."
+        *   If exploring multiple *distinct visual options* for a design element (e.g., different facade styles): **Create SEPARATE `ImageGenerationAgent` tasks for EACH distinct option.** Each task objective should clearly define ONE option. Example Task 1: "Generate image for facade option A: modern style with glass and steel." Example Task 2: "Generate image for facade option B: classical style with stone and arches."
+        *   If generating *multiple variations of the SAME concept/option*: Use a single `ImageGenerationAgent` task with a clear objective for that one concept, and its `i` parameter will be set later by the `prepare_tool_inputs_node` if needed (though typically `i` is for minor variations, not distinct design schemes).
+    *   **For `RhinoMCPCoordinator`:**
+        *   If the task involves geometric modeling, modification, or precise analysis: Define the specific Rhino operations needed.
+        *   If the task involves **functional layout, programmatic blocking, or quantitative/qualitative spatial arrangement**: Clearly state this objective. For example: "Develop a functional block layout for the ground floor based on [program requirements], and provide a top-down parallel projection screenshot." or "Perform a solar access analysis on the south facade and output results."
 3.  `inputs`: JSON object suggesting initial data needs (e.g., `{{"prompt": "..."}}`). Use placeholders like `{{output_from_task_id_xyz.key}}`. Indicate file needs clearly. **Do not invent paths.** Use `{{"}}` if no input suggestion applies. NEVER use `null`.
 4.  `requires_evaluation`: Boolean (`true`/`false`). **MUST be `true` if `selected_agent` is `EvaAgent`, `SpecialEvaAgent`, or `FinalEvaAgent`.**
 5.  `selected_agent`: **(CRITICAL)** The **exact name** of the agent from the list below. Mandatory for every task. **Use `EvaAgent`, `SpecialEvaAgent`, or `FinalEvaAgent` for evaluation tasks.**
@@ -181,23 +193,22 @@ For **each** task in the sequence, you MUST specify:
 --- BEGIN AGENT CAPABILITIES ---
 **Available Agent Capabilities & *Primary* Expected Prepared Input Keys:**
 *   `ArchRAGAgent`: Information Retrieval (Regulations, Expertise) -> Needs `prompt`, optional `top_k`.
-*   `ImageRecognitionAgent`: Image Analysis -> Needs `image_paths` (list), `prompt`.
+*   `ImageRecognitionAgent`: Image Analysis -> Needs `image_paths` (list), `prompt`. (Also used internally by ModelRenderAgent).
 *   `VideoRecognitionAgent`: Video/3D Model Analysis -> Needs `video_paths` (list), `prompt`.
-*   `ImageGenerationAgent`: General Image Generation/Editing (Gemini) -> Needs `prompt`, optional `image_inputs`, optional `i` (count). Good for visual exploration, detailed textures.
+*   `ImageGenerationAgent`: **Generates NEW images from text descriptions, or edits existing images.** Ideal for visual exploration, concept art, mood boards, or creating textures/details. -> Needs `prompt`, optional `image_inputs` (list of paths for editing), optional `i` (count for variations of the *same* prompt).
 *   `WebSearchAgent`: Web Search (Cases, General Info) -> Needs `prompt`.
-*   `CaseRenderAgent`: Architectural Rendering (ComfyUI) -> Needs `outer_prompt`, `i` (int), `strength` (string "0.0"-"0.8").
-*   `Generate3DAgent`: 3D MESH Model (.glb) Generation (Comfy3D) -> Needs `image_path` (string). Suited for **exploratory form-finding or generating detailed but less precise geometry**.
-*   `RhinoMCPCoordinator`: **Parametric/Precise 3D Modeling (Rhino)** -> Needs `user_request` (string command), optional `initial_image_path` (string path). Ideal for **multi-step Rhino operations, tasks requiring precise coordinates, dimensions, spatial relationships, or modifications to existing geometry**. Coordinates internal planning and tool calls within Rhino.
-*   `PinterestMCPCoordinator`: **Pinterest Image Search & Download** -> Needs `keyword` (string), optional `limit` (int). Downloads images based on the keyword.
-*   `OSMMCPCoordinator`: **Map Screenshot Generation (OpenStreetMap)** -> Needs `user_request` (string: **Prioritize coordinate string "lat,lon" if available in user input, otherwise use address**). Generates a map screenshot. Handles location-related tasks.
-*   `SimulateFutureAgent`: Future Scenario Simulation (ComfyUI) -> Needs `outer_prompt`, `render_image` (string filename).
-*   `LLMTaskAgent`: **Intermediate Processing & General Text Tasks** -> Needs `prompt`. Crucial for summarizing, extracting, reformatting, or generating prompts for other agents.
-*   `EvaAgent`: **Standard Evaluation (Pass/Fail).** Requires `requires_evaluation: true`. Needs inputs via `prepare_evaluation_inputs`.
-*   `SpecialEvaAgent`: **Special Evaluation (Multi-Option Comparison/Score).** Requires `requires_evaluation: true`. Needs inputs via `prepare_final_evaluation_inputs`. Can involve image/video eval.
-*   `FinalEvaAgent`: **Final Evaluation (Holistic Score).** Requires `requires_evaluation: true`. Needs inputs via `prepare_final_evaluation_inputs`. Uses LLM eval only.
+*   `ModelRenderAgent`: **Processes EXISTING images (e.g., from Rhino, or previous generations) for photorealistic rendering or future scenario simulation.** -> Needs `outer_prompt` (initial context for the task type - photorealism or future simulation), `image_inputs` (list of paths to *existing* images), `is_future_scenario` (boolean). Internally uses `ImageRecognitionAgent` to generate a final English ComfyUI prompt.
+*   `Generate3DAgent`: 3D MESH Model (.glb) Generation (Comfy3D) from an *existing* image -> Needs `image_path` (string).
+*   `RhinoMCPCoordinator`: **Parametric/Precise 3D Modeling, Functional Layout, and Quantitative/Qualitative Analysis (Rhino).** Ideal for multi-step Rhino operations, tasks requiring precise coordinates/dimensions, **functional blocking and arrangement, programmatic analysis. If task involves visual output of layouts or plans, **request a top-down parallel projection screenshot.** -> Needs `user_request` (string command), optional `initial_image_path` (string path).
+*   `PinterestMCPCoordinator`: **Pinterest Image Search & Download.** -> Needs `keyword` (string), optional `limit` (int).
+*   `OSMMCPCoordinator`: **Map Screenshot Generation (OpenStreetMap).** -> Needs `user_request` (string: address or "lat,lon").
+*   `LLMTaskAgent`: **General Text Tasks.** -> Needs `prompt`.
+*   `EvaAgent`: **Standard Evaluation (Pass/Fail).** Requires `requires_evaluation: true`.
+*   `SpecialEvaAgent`: **Special Evaluation (Multi-Option Comparison/Score).** Requires `requires_evaluation: true`.
+*   `FinalEvaAgent`: **Final Evaluation (Holistic Score).** Requires `requires_evaluation: true`.
 --- END AGENT CAPABILITIES ---
 
-Return the entire workflow as a **single, valid JSON list** object. Do NOT include any explanatory text before or after the JSON list. Ensure perfect JSON syntax, detailed steps, and that **every task includes the `selected_agent` and correct `requires_evaluation` key.** Use the correct evaluation agent name (`EvaAgent`, `SpecialEvaAgent`, `FinalEvaAgent`) based on the evaluation goal.
+Return the entire workflow as a **single, valid JSON list** object. Do NOT include any explanatory text before or after the JSON list. Ensure perfect JSON syntax, detailed steps, and that **every task includes the `selected_agent` and correct `requires_evaluation` key.**
 Respond in {llm_output_language}.
 """,
                         input_variables=["user_input", "llm_output_language"]
@@ -205,9 +216,6 @@ Respond in {llm_output_language}.
                     "failure_analysis": PromptConfig(
                         template="""
 Context: A task in an automated workflow has FAILED. Analyze the provided context to determine the failure type and suggest the best course of action aimed at RESOLVING the failure.
-
-**Failure Context:** {failure_context}
-
 **Failed Task Details:**
 Agent Originally Assigned: {selected_agent_name}
 Task Description: {task_description}
@@ -221,20 +229,18 @@ Last Feedback Log (Includes Eval Results like 'Assessment: Fail' or 'Assessment:
 *   `ArchRAGAgent`: Information Retrieval -> Needs `prompt`, optional `top_k`.
 *   `ImageRecognitionAgent`: Image Analysis -> Needs `image_paths` (list), `prompt`.
 *   `VideoRecognitionAgent`: Video/3D Model Analysis -> Needs `video_paths` (list), `prompt`.
-*   `ImageGenerationAgent`: Image Generation/Editing (Gemini) -> Needs `prompt`, optional `image_inputs`.
+*   `ImageGenerationAgent`: Generates NEW images from text descriptions, or edits existing images. -> Needs `prompt`, optional `image_inputs` (list of paths).
 *   `WebSearchAgent`: Web Search -> Needs `prompt`.
-*   `CaseRenderAgent`: Architectural Rendering (ComfyUI) -> Needs `outer_prompt`, `i` (int), `strength` (string "0.0"-"0.8").
-*   `Generate3DAgent`: 3D MESH Model Generation (Comfy3D) -> Needs `image_path` (string).
-*   `RhinoMCPCoordinator`: Parametric/Precise 3D Modeling (Rhino) -> Needs `user_request`, optional `initial_image_path`.
+*   `ModelRenderAgent`: Processes EXISTING images for photorealistic rendering or future scenario simulation. -> Needs `outer_prompt`, `image_inputs` (list of paths), `is_future_scenario` (boolean).
+*   `Generate3DAgent`: 3D MESH Model Generation (Comfy3D) from an existing image. -> Needs `image_path` (string).
+*   `RhinoMCPCoordinator`: Parametric/Precise 3D Modeling, Functional Layout, Analysis (Rhino). For functional layouts, request top-down parallel view screenshots. -> Needs `user_request`, optional `initial_image_path`.
 *   `PinterestMCPCoordinator`: Pinterest Image Search & Download -> Needs `keyword`, optional `limit`.
 *   `OSMMCPCoordinator`: Map Screenshot Generation (OpenStreetMap) -> Needs `user_request` (address).
-*   `SimulateFutureAgent`: Future Scenario Simulation (ComfyUI) -> Needs `outer_prompt`, `render_image` (string filename).
-*   `LLMTaskAgent`: Intermediate Processing & General Text Tasks -> Needs `prompt`.
+*   `LLMTaskAgent`: General Text Tasks -> Needs `prompt`.
 *   `EvaAgent`: Standard Pass/Fail Evaluation. Requires `requires_evaluation: true`.
 *   `SpecialEvaAgent`: Multi-Option Comparison/Score. Requires `requires_evaluation: true`.
 *   `FinalEvaAgent`: Final Holistic Score. Requires `requires_evaluation: true`.
 --- END AVAILABLE AGENT CAPABILITIES ---
-
 **Analysis Steps & Action Selection:**
 
 1.  **Identify Failure Type:** Determine if 'evaluation' (check `feedback_log` for "Assessment: Fail" - Note: `SpecialEvaAgent`/`FinalEvaAgent` scores don't represent failure this way) or 'execution'.
@@ -243,23 +249,28 @@ Last Feedback Log (Includes Eval Results like 'Assessment: Fail' or 'Assessment:
 **Action Options:**
 
 *   **`FALLBACK_GENERAL`:** Propose a new task/sequence to fix the issue or try an alternative approach **aimed at achieving the original objective `{task_objective}`**.
-    *   **If Failure Type is 'evaluation' (Only for `EvaAgent` - Standard Pass/Fail)**: MUST return `new_tasks_list` with TWO tasks.
-        1.  **Task 1 (Alternative Generation/Execution):** Analyze `feedback_log` and `original Task Objective`. Choose the **most appropriate agent** from the *Available Agent Capabilities* list **that can achieve the original objective, considering the feedback**. **Strongly prefer agents similar in function to the original `{selected_agent_name}` if possible, but DO NOT select an evaluation agent.** Define a **new `task_objective`** that reflects the alternative approach based on feedback. Suggest inputs `{{"}}`. Set `requires_evaluation=false`.
-        2.  **Task 2 (Re-Evaluation):** Create an `EvaAgent` task (standard eval). Set `selected_agent="EvaAgent"`, `task_objective="Evaluate outcome of the alternative task"`, `inputs={{}}`, `requires_evaluation=true`.
-    *   **If Failure Type is 'execution'**: Return `new_task` or `new_tasks_list`. Analyze `execution_error_log` and `original Task Objective`. Define objective(s) to overcome the error **while still aiming for the original goal `{task_objective}`**. Choose the **most appropriate agent** from the *Available Agent Capabilities* list to fulfill this corrected objective. **Consider retrying `{selected_agent_name}` with corrected inputs/parameters if the error suggests a fixable input issue, OR select an alternative agent if `{selected_agent_name}` seems fundamentally unsuitable due to the error.** Suggest inputs `{{"}}`. Keep original `requires_evaluation` (`{original_requires_evaluation}`) unless the fallback approach logically changes this need.
+    *   **If Failure Type is 'evaluation' (Only for `EvaAgent` - Standard Pass/Fail)**: **MUST** return `new_tasks_list` with **TWO** tasks:
+        1.  **Task 1 (Alternative Generation/Execution):** Analyze `feedback_log` and `original Task Objective`. Choose the **most appropriate agent** (NOT evaluation agent) from the list to achieve the objective based on feedback. Define a **new `task_objective`**. Suggest inputs `{{"}}`. Set `requires_evaluation=false`.
+        2.  **Task 2 (Re-Evaluation):** Create an `EvaAgent` task. Set `selected_agent="EvaAgent"`, `task_objective="Evaluate outcome of the alternative task"`, `inputs={{}}`, `requires_evaluation=true`.
+    *   **If Failure Type is 'execution'**: Generate **ONLY the necessary task(s)** to overcome the error and achieve the original objective. Return this as `new_task` (for a single task) or `new_tasks_list` (for a short sequence if needed).
+        *   Analyze `execution_error_log` and `original Task Objective`.
+        *   Choose the **most appropriate agent** from the list. Consider retrying `{selected_agent_name}` with corrected inputs if the error suggests it, or select an alternative if `{selected_agent_name}` seems unsuitable.
+        *   Define objective(s) for the fallback task(s).
+        *   Suggest inputs `{{"}}`.
+        *   Keep original `requires_evaluation` (`{original_requires_evaluation}`) **ONLY IF** the fallback task still logically needs it. **DO NOT automatically add a separate evaluation task.**
     *   Output JSON: `{{"action": "FALLBACK_GENERAL", ...}}`
 
-*   **`MODIFY`:** Modify the *current* failed task and retry it.
-    *   Appropriate for minor input errors or technical glitches where the original agent `{selected_agent_name}` is still suitable. Suggest modifications via `modify_description`/`modify_objective`.
+*   **`MODIFY`:** Modify the *current* failed task and retry it with `{selected_agent_name}`. Appropriate for minor input errors.
     *   Output JSON: `{{"action": "MODIFY", "modify_description": "...", "modify_objective": "..."}}`
 
-*   **`SKIP`:** (Available Always). Skip the failed task.
+*   **`SKIP`:** Skip the failed task.
     *   Output JSON: `{{"action": "SKIP"}}`
 
 **Instructions:**
-*   If **Is Max Retries Reached?** is `True`, you **MUST** choose `SKIP`.
+*   If **Is Max Retries Reached?** is `True`, **MUST** choose `SKIP`.
 *   Choose **only one action**. Provide **only** the single JSON output.
-*   Ensure agent selections and objectives directly address the failure analysis and **prioritize achieving the original task objective (`{task_objective}`)**.
+*   Ensure agent selections/objectives address the failure and prioritize the original objective (`{task_objective}`).
+*   **REMEMBER:** Only 'evaluation' failures require the fixed two-task structure. 'Execution' failures require only the task(s) needed to fix the error.
 *   Use language: {llm_output_language}
 """,
                         input_variables=[
@@ -274,10 +285,8 @@ Last Feedback Log (Includes Eval Results like 'Assessment: Fail' or 'Assessment:
                     ),
                     "process_interrupt": PromptConfig(
                         template="""
-You are a meticulous workflow manager reacting to a user interrupt during task execution. Analyze the user's interrupt request in the context of the overall goal and the currently planned task sequence. Decide the most appropriate action to take.
-
-**Overall Workflow Goal (User Request):** {user_input}
-**User Interrupt Request:** {interrupt_input}
+You are a meticulous workflow manager reacting to a user interrupt during task execution.
+**User Interrupt Request** (**Strictly Follow**): {interrupt_input}
 **Current Task Index (Point of Interruption):** {current_task_index}
 **Full Current Task Sequence (JSON):**
 ```json
@@ -292,20 +301,18 @@ You are a meticulous workflow manager reacting to a user interrupt during task e
 *   `ArchRAGAgent`: Information Retrieval -> Needs `prompt`, optional `top_k`.
 *   `ImageRecognitionAgent`: Image Analysis -> Needs `image_paths` (list), `prompt`.
 *   `VideoRecognitionAgent`: Video/3D Model Analysis -> Needs `video_paths` (list), `prompt`.
-*   `ImageGenerationAgent`: Image Generation/Editing (Gemini) -> Needs `prompt`, optional `image_inputs`.
+*   `ImageGenerationAgent`: Generates NEW images from text descriptions, or edits existing images. -> Needs `prompt`, optional `image_inputs` (list of paths).
 *   `WebSearchAgent`: Web Search -> Needs `prompt`.
-*   `CaseRenderAgent`: Architectural Rendering (ComfyUI) -> Needs `outer_prompt`, `i`, `strength`.
-*   `Generate3DAgent`: 3D MESH Model Generation (Comfy3D) -> Needs `image_path`.
-*   `RhinoMCPCoordinator`: Parametric/Precise 3D Modeling (Rhino) -> Needs `user_request`, optional `initial_image_path`.
+*   `ModelRenderAgent`: Processes EXISTING images for photorealistic rendering or future scenario simulation. -> Needs `outer_prompt`, `image_inputs` (list of paths), `is_future_scenario` (boolean).
+*   `Generate3DAgent`: 3D MESH Model Generation (Comfy3D) from an existing image. -> Needs `image_path`.
+*   `RhinoMCPCoordinator`: Parametric/Precise 3D Modeling, Functional Layout, Analysis (Rhino). For functional layouts, request top-down parallel view screenshots. -> Needs `user_request`, optional `initial_image_path`.
 *   `PinterestMCPCoordinator`: Pinterest Image Search & Download -> Needs `keyword`, optional `limit`.
 *   `OSMMCPCoordinator`: Map Screenshot Generation (OpenStreetMap) -> Needs `user_request` (address).
-*   `SimulateFutureAgent`: Future Scenario Simulation (ComfyUI) -> Needs `outer_prompt`, `render_image`.
-*   `LLMTaskAgent`: Intermediate Processing & General Text Tasks -> Needs `prompt`.
+*   `LLMTaskAgent`: General Text Tasks -> Needs `prompt`.
 *   `EvaAgent`: Evaluation Agent (standard pass/fail, special comparison scoring, final holistic scoring).
 *   `final_evaluation`: Objective for final holistic review.
 *   `special_evaluation`: Objective for multi-option comparison.
 --- END AGENT CAPABILITIES ---
-
 **Your Task:** Choose ONE action based on the interrupt:
 
 1.  **`PROCEED`**: Interrupt doesn't require plan changes. Continue from `current_task_index`. Output: `{{"action": "PROCEED"}}`
@@ -332,17 +339,17 @@ Respond in {llm_output_language}.
             ),
             "assign_agent": AgentConfig(
                 agent_name="assign_agent",
-                description="Selects the appropriate specialized agent for a given task objective.",
+                description="Prepares precise inputs for specialized agents based on task objectives and context.",
                 llm=gemini_flash_llm,
                 prompts={
                     "prepare_tool_inputs_prompt": PromptConfig(
                         template="""
-You are an expert input preprocessor for specialized AI tools. Your goal is to take a high-level task objective, the overall user request, task history/outputs, and information about the selected tool, then generate the precise JSON input dictionary required by that specific tool using standardized keys.
+You are an expert input preprocessor for specialized AI tools. Your goal is to take a high-level task objective, the overall user request, task history/outputs, and information about the selected tool, then generate the precise JSON input dictionary containing ONLY the keys REQUIRED by that specific tool, using standardized keys.
 
 **Selected Tool/Agent:** `{selected_agent_name}`
 **Tool Description:** {agent_description}
 **Current Task Description:** {task_description}
-**Current Task Objective:** {task_objective}
+**Current Task Objective (CRITICAL - READ CAREFULLY):** {task_objective}
 **Overall Workflow Goal (User Request, please prioritize this):** {user_input}
 
 **Workflow History Summary (Context):**
@@ -359,37 +366,54 @@ You are an expert input preprocessor for specialized AI tools. Your goal is to t
 **Context from Previous Attempt (if applicable):** {error_feedback}
 
 **Standardized Input Keys Reference & Tool Requirements:**
-*   `prompt`: (String) Textual query/instruction. REQUIRED for: `ArchRAGAgent`, `WebSearchAgent`, `ImageRecognitionAgent`, `VideoRecognitionAgent`, `ImageGenerationAgent`, `LLMTaskAgent`.
-*   `image_paths`: (List[String]) FULL paths to existing input images. REQUIRED for `ImageRecognitionAgent`. **Find VALID paths by parsing `aggregated_files_json`.**
-*   `video_paths`: (List[String]) FULL paths to existing input videos. REQUIRED for `VideoRecognitionAgent`. **Find VALID paths by parsing `aggregated_files_json`.**
-*   `image_path`: (String) FULL path to a SINGLE existing input image. REQUIRED for `Generate3DAgent`. **Find VALID path by parsing `aggregated_files_json`.**
-*   `outer_prompt`: (String) Textual prompt. REQUIRED for `CaseRenderAgent`, `SimulateFutureAgent`.
-*   `i`: (Integer, Default: 1) Number of images (> 0). For `CaseRenderAgent` and `ImageGenerationAgent`.
-*   `strength`: (String, Default: "0.5") Rendering strength ("0.0"-"1.0"). For `CaseRenderAgent`.
-*   `render_image`: (String) FILENAME of the base image (in RENDER_CACHE_DIR). REQUIRED for `SimulateFutureAgent`. **Find correct FILENAME by parsing `aggregated_files_json`.**
-*   `image_inputs`: (**List of Strings, Optional**) For `ImageGenerationAgent`, this MUST be a **LIST** containing the **FULL FILE PATHS** to the input image(s). **Find the relevant file(s)** in `aggregated_files_json` and use their **`path` values**. **Format the output as a LIST of these PATH strings.**
-*   `user_request`: (String) **Specific instruction/command for the MCP tool.** REQUIRED for `RhinoMCPCoordinator`. Also used for `OSMMCPCoordinator` (Prioritize "lat,lon" coordinates if available, otherwise use address ). Generate based on `task_objective`, `task_description`, and `aggregated_outputs_json` if needed.
-*   `initial_image_path`: (String, **Optional**) FULL path to an image to be used as initial input/reference by `RhinoMCPCoordinator`. **Find VALID path by parsing `aggregated_files_json`** if the objective requires it. **DO NOT include this key if not needed or path not found.**
-*   `keyword`: (String) Search term. REQUIRED for `PinterestMCPCoordinator`. Extract from objective/description.
-*   `limit`: (Integer, Optional, Default: 10) Number of images to search/download. For `PinterestMCPCoordinator`. Extract if specified.
-**Note:** Evaluation Agents (`EvaAgent`, `SpecialEvaAgent`, `FinalEvaAgent`) do not use this node; their inputs are prepared within the Evaluation subgraph.
+*   `prompt`: (String) REQUIRED for: `ArchRAGAgent`, `WebSearchAgent`, `ImageRecognitionAgent`, `VideoRecognitionAgent`, `ImageGenerationAgent`, `LLMTaskAgent`.
+*   `image_paths`: (List[String]) REQUIRED for `ImageRecognitionAgent`. Find VALID paths in `aggregated_files_json`.
+*   `video_paths`: (List[String]) REQUIRED for `VideoRecognitionAgent`. Find VALID paths in `aggregated_files_json`.
+*   `image_path`: (String) REQUIRED for `Generate3DAgent`. Find VALID path in `aggregated_files_json`.
+*   **For `ModelRenderAgent` (Processes EXISTING images):**
+    *   `outer_prompt`: (String) REQUIRED. Initial contextual prompt (generated based on `is_future_scenario`).
+    *   `image_inputs`: (List[String]) REQUIRED. List of FULL FILE PATHS of *existing* images to process (from `aggregated_files_json`).
+    *   `is_future_scenario`: (Boolean) REQUIRED. `true` if simulating future, `false` if photorealistic rendering.
+*   **For `ImageGenerationAgent` (Generates NEW images):**
+    *   `prompt`: (String) REQUIRED. Detailed textual description for generating a NEW image or for editing.
+    *   `image_inputs`: (List[String], Optional) For image editing tasks. List of FULL FILE PATHS from `aggregated_files_json`.
+    *   `i`: (Integer, Default: 1) Optional. Number of variations to generate for the *same* `prompt`.
+*   **For `RhinoMCPCoordinator`:**
+    *   `user_request`: (String) REQUIRED. Detailed command for Rhino. If the task objective involves functional layout, programmatic blocking, or visualization of plans, ensure the request asks Rhino to "capture a top-down parallel projection view" or "set view to Top and capture parallel projection" as part of its final steps if a visual is needed.
+    *   `initial_image_path`: (String, Optional) For `RhinoMCPCoordinator`. Find VALID path if needed.
+*   `keyword`: (String) REQUIRED for `PinterestMCPCoordinator`.
+*   `limit`: (Integer, Optional, Default: 10) For `PinterestMCPCoordinator`.
+*   `user_request` (for `OSMMCPCoordinator`): (String) REQUIRED. Address or "lat,lon".
+**Note:** Evaluation Agents (`EvaAgent`, `SpecialEvaAgent`, `FinalEvaAgent`) do not use this node.
 
 **Instructions:**
-1.  Analyze the **Current Task Objective/Description**, **Selected Tool/Agent**, and **Overall Goal**.
-2.  **Generate/Extract Textual Inputs (`prompt`, `outer_prompt`, `user_request`, `keyword`)**:
-    *   Generate/Extract based on Objective/Description/Goal. Use `aggregated_outputs_json` for context if needed. For MCPs, synthesize clear commands or extract keywords/addresses. **For `OSMMCPCoordinator`, prioritize "lat,lon" coordinates for `user_request` if found in objective/history, otherwise use the address.**
-    *   **For `ImageGenerationAgent`**: Generate a **highly detailed and descriptive prompt**. Incorporate elements from the `Overall Workflow Goal` and `Workflow History Summary`. Describe the desired scene, **style, composition, lighting, materials, mood, and specific architectural elements.**
-    *   For architectural renderings, try to present them in outdoor perspective; for architectural concept pictures, try to present them in plan and section, or perspective.
-3.  **Determine and Validate File Paths/Filenames (CRITICAL - Use Aggregated Data ONLY)**:
-    *   If the tool requires file inputs (`image_paths`, `video_paths`, `image_path`, `render_image`) **for this specific task objective**: parse `aggregated_files_json`, select appropriate files, **verify paths/filenames**. If required files are missing/invalid, RETURN ERROR JSON (step 7). Do NOT invent paths.
-    *   **For `RhinoMCPCoordinator`'s `initial_image_path`**: Check if the **Current Task Objective** explicitly requires using a reference image. If yes, parse `aggregated_files_json` to find the **correct and existing** FULL path. **If the objective does *not* require an image, OR if a required image path cannot be found/validated, DO NOT INCLUDE the `initial_image_path` key in the final JSON output.**
-    *   **For `ImageGenerationAgent`'s `image_inputs`**: Find the relevant file(s) in `aggregated_files_json`. **Extract their 'path' values.** Construct the `image_inputs` key in the output JSON as a **LIST of these file path strings**. Return ERROR JSON (step 7) if the required source image file(s) or their paths cannot be found/validated. **Ensure it's always a list, even for one image.**
-4.  **Handle Specific Parameters (`i`, `strength`, `top_k`, `limit`)**: Extract/validate from suggestion/objective. Provide defaults if applicable. For `ImageGenerationAgent`, extract `i` if present.
-5.  **Handle Retries**: Use `{error_feedback}` to modify inputs if appropriate.
-6.  **Construct Final JSON**: Create the final JSON input dictionary using only the required standardized keys for `{selected_agent_name}`. 
-7.  **Error Handling**: If critical inputs are missing/invalid (esp. unvalidated required paths, missing required text), return error JSON: `{{"error": "Missing/Invalid critical input [specify] for {selected_agent_name}, could not find/validate required data."}}`
+1.  Analyze the **Current Task Objective/Description**, **Selected Tool/Agent (`{selected_agent_name}`)**, and **Overall Goal**.
+2.  **Generate/Extract Required Textual Inputs & Flags**:
+    *   **If `{selected_agent_name}` is `ModelRenderAgent`:**
+        *   Carefully examine the **`Current Task Objective`** (case-insensitive search for keywords).
+        *   Set `is_future_scenario` to `true` if the objective contains terms like "future", "scenario", "simulate", "simulation", "predict", "forecast". Otherwise, set to `false` (for photorealistic rendering).
+        *   If `is_future_scenario` is `true`: Generate an `outer_prompt` that synthesizes user goals, site conditions, and architectural scheme details relevant to simulating a future scenario on an *existing* image. Example: "Simulate the building's appearance in 20 years, considering [user goal], on a [site condition], with [scheme details]. The focus is on [specific aspect like material weathering]."
+        *   If `is_future_scenario` is `false`: Generate an `outer_prompt` that describes the architectural scheme and requests analysis of the *existing* image's perspective for photorealistic rendering. Example: "Render the architectural design: [key scheme elements]. Analyze the image perspective (e.g., eye-level, aerial) to ensure a high-quality photorealistic output of this existing view."
+    *   **If `{selected_agent_name}` is `ImageGenerationAgent`:**
+        *   The `Current Task Objective` should clearly define the **single, specific visual concept or design option** to be generated from scratch or edited.
+        *   Generate a `prompt` that is a **highly detailed and specific textual description** for this single concept. Incorporate elements from the `Overall Workflow Goal` and `Workflow History Summary`. Describe the desired scene, style, composition, lighting, materials, mood, and specific architectural elements for this *one* option.
+        *   If the `Current Task Objective` seems to ambiguously describe multiple distinct options, focus on the first or most prominent one for the `prompt`, as this agent task is intended for one detailed generation/edit at a time. (The Process Management Agent should have created separate tasks for distinct options.)
+    *   **If `{selected_agent_name}` is `RhinoMCPCoordinator`:**
+        *   Synthesize a clear `user_request` for Rhino.
+        *   **Crucially, if the `Current Task Objective` implies creating a plan, layout, or requires a top-down view for analysis (e.g., "functional blocking", "layout design", "site plan generation"), append a clear instruction to the `user_request` for Rhino to "capture a top-down parallel projection screenshot of the result" or similar phrasing to ensure the correct view is generated by Rhino's `capture_viewport` tool.**
+    *   For other agents, generate/extract text (`prompt`, `user_request`, `keyword`) as usual.
+3.  **Determine and Validate Required File Paths/Filenames**:
+    *   If `{selected_agent_name}` REQUIRES file inputs (`image_paths`, `video_paths`, `image_path`, `image_inputs` for `ModelRenderAgent` or `ImageGenerationAgent` if editing):
+        *   Carefully parse `aggregated_files_json`.
+        *   For `image_inputs` (`ModelRenderAgent`): This MUST be a LIST of full file paths to *existing* images.
+        *   For `image_inputs` (`ImageGenerationAgent`, optional for editing): This MUST be a LIST of full file paths.
+        *   Verify paths are valid. If required files are missing/invalid, RETURN ERROR JSON.
+4.  **Handle Specific Parameters**: If `{selected_agent_name}` is `ImageGenerationAgent`, check if `i` (image count for variations of the same prompt) is suggested by `Current Task Objective` or `initial_plan_suggestion_json` and include it if valid.
+5.  **Handle Optional Inputs**: As per standard logic.
+6.  **Construct Final JSON**: Create the JSON dictionary containing ONLY the keys explicitly REQUIRED or validly determined OPTIONAL keys for **`{selected_agent_name}`**.
+7.  **Error Handling**: If REQUIRED inputs are missing/invalid (e.g., `image_inputs` is empty for `ModelRenderAgent`), return error JSON.
 
-**Output:** Return ONLY the final JSON input dictionary for the tool, or the error JSON. No other text.
+**Output:** Return ONLY the final JSON input dictionary for `{selected_agent_name}`, or the error JSON. No other text.
 Language: {llm_output_language}
 """,
                         input_variables=[
@@ -397,7 +421,7 @@ Language: {llm_output_language}
                             "task_objective", "task_description",
                             "aggregated_summary",
                             "aggregated_outputs_json",
-                            "aggregated_files_json", # Contains paths/info
+                            "aggregated_files_json",
                             "error_feedback", "llm_output_language"
                         ]
                     )
@@ -405,16 +429,15 @@ Language: {llm_output_language}
                 parameters={
                      "specialized_agents_description": {
                         "ArchRAGAgent": "Retrieves information from the architectural knowledge base based on a query.",
-                        "ImageRecognitionAgent": "Analyzes and describes the content of one or more images based on a prompt.",
+                        "ImageRecognitionAgent": "Analyzes and describes the content of one or more images based on a prompt. Also used internally by ModelRenderAgent to generate final English ComfyUI prompts.",
                         "VideoRecognitionAgent": "Analyzes the content of one or more videos or 3D models based on a prompt.",
-                        "ImageGenerationAgent": "Generates or edits images using AI based on a textual description and optional input images.",
+                        "ImageGenerationAgent": "Generates NEW images from detailed text descriptions, or edits existing images. Ideal for visual concept generation, style exploration, and creating specific artistic renditions from scratch. Takes a `prompt` for the core description, optionally `image_inputs` (list of paths) for editing context, and optionally `i` for generating multiple variations of the *same* described concept.",
                         "WebSearchAgent": "Performs a web search to find grounded information, potentially including relevant images and sources.",
-                        "CaseRenderAgent": "Renders architectural images using ComfyUI based on a prompt, count, and strength.",
+                        "ModelRenderAgent": "Handles advanced image processing: either photorealistic rendering of existing model views OR simulation of future scenarios on images, using ComfyUI. Requires: `outer_prompt` (initial context for the task type - photorealism or future simulation), `image_inputs` (list of image paths), and `is_future_scenario` (boolean flag: true for future simulation, false for photorealistic rendering). Internally uses ImageRecognitionAgent to refine the `outer_prompt` into a final English ComfyUI prompt for each image.",
                         "Generate3DAgent": "Generates a 3D model and preview video from a single input image using ComfyUI diffusion.",
-                        "RhinoMCPCoordinator": "Coordinates complex tasks within Rhino 3D using planning and multiple tool calls. Ideal for multi-step Rhino operations, tasks requiring precise coordinates/dimensions, or modifications to existing geometry.",
-                        "PinterestMCPCoordinator": "Searches for images on Pinterest based on a keyword and downloads them to a predefined cache directory.",
-                        "OSMMCPCoordinator": "Generates a map screenshot for a given address using OpenStreetMap and geocoding. Takes the address string as input.",
-                        "SimulateFutureAgent": "Simulates future scenarios on a previously rendered image using ComfyUI based on a prompt.",
+                        "RhinoMCPCoordinator": "Coordinates complex tasks within Rhino 3D, including parametric modeling, precise geometric operations, **functional layout design, programmatic blocking, and quantitative/qualitative spatial analysis.** Ideal for multi-step Rhino operations. **If the task involves visualizing plans or layouts, instruct it to capture top-down parallel projection screenshots.**",
+                        "PinterestMCPCoordinator": "Searches for images on Pinterest based on a keyword and downloads them.",
+                        "OSMMCPCoordinator": "Generates a map screenshot for a given address using OpenStreetMap and geocoding.",
                         "LLMTaskAgent": "Handles general text-based tasks like analysis, summarization, reformatting, complex reasoning, or generating prompts.",
                         "EvaAgent": "Performs standard (Pass/Fail) evaluation of a preceding task's output.",
                         "SpecialEvaAgent": "Performs special evaluation comparing multiple options/artifacts, providing a score and selection.",
@@ -533,57 +556,73 @@ You are evaluating the results of a design task based on specific criteria. Dete
 **Specific Evaluation Criteria/Rubric for this Task:**
 {specific_criteria}
 
-**(IF Standard Evaluation - `EvaAgent`) Results to Evaluate:**
+--- BEGIN Inputs for Assessment ---
+
+**(IF Standard Evaluation - `EvaAgent`) Primary Results:**
 *   Structured Outputs (JSON): ```json\n{evaluation_target_outputs_json}\n```
 *   Generated Image Files: {evaluation_target_image_paths_str}
 *   Generated Video Files: {evaluation_target_video_paths_str}
 *   Other Generated Files: {evaluation_target_other_files_str}
-**(Note: Actual image/video content is evaluated by specialized tools if applicable).**
 
 **(IF Final or Special Evaluation - `FinalEvaAgent` or `SpecialEvaAgent`) Context & Artifacts for Review:**
 *   Full Workflow Summary: {full_task_summary}
 *   Key Artifact Summary (Paths/Info prepared by previous step):
-    *   Key Images: {evaluation_target_key_image_paths_str}
-    *   Key Videos: {evaluation_target_key_video_paths_str}
-    *   Other Artifacts Summary: {evaluation_target_other_artifacts_summary_str}
+       *   Key Images: {evaluation_target_key_image_paths_str}
+       *   Key Videos: {evaluation_target_key_video_paths_str}
+       *   Other Artifacts Summary: {evaluation_target_other_artifacts_summary_str}
 
-**Instructions:** Perform evaluation based on the `{selected_agent}`:
+**Feedback from Visual Analysis Tools (if applicable):**
+*   Image Tool Feedback:
+```text
+{image_tool_feedback}
+```
+*   Video Tool Feedback:
+```text
+{video_tool_feedback}
+```
+--- END Inputs for Assessment ---
+
+**Instructions:** Perform the **FINAL evaluation** based on the `{selected_agent}` type, **considering ALL provided inputs above (text, file info, criteria, AND visual tool feedback)**.
 
 *   **IF `{selected_agent}` is `EvaAgent` (Standard Evaluation):**
-    *   Assess results against criteria. Determine overall "Pass" or "Fail".
-    *   Provide feedback explaining Pass/Fail based on criteria. Suggest improvements if "Fail".
-    *   **Output Format:** Return JSON: `{{"assessment": "Pass" or "Fail", "feedback": "...", "improvement_suggestions": "...", "assessment_type": "Standard"}}`
+       *   Assess results against criteria, incorporating insights from visual tool feedback if available. Determine overall "Pass" or "Fail".
+       *   Provide feedback explaining Pass/Fail based on criteria AND visual analysis. Suggest improvements if "Fail".
+       *   **Output Format:** Return JSON: `{{"assessment": "Pass" or "Fail", "feedback": "...", "improvement_suggestions": "...", "assessment_type": "Standard"}}`
 
-*   **IF `{selected_agent}` is `FinalEvaAgent` (Final Evaluation):**
-    *   Review **Full Summary, Key Artifacts** against the holistic criteria/rubric.
-    *   Assign a holistic score (1-10) based strictly on the rubric.
-    *   Provide feedback justifying the score based on the rubric. Suggest overall improvements.
-    *   **Output Format:** Return JSON: `{{"assessment": "Score (1-10)", "assessment_type": "Final", "feedback": "Rubric-based justification. Holistic feedback.", "improvement_suggestions": "Overall improvement ideas."}}`
+   *   **IF `{selected_agent}` is `FinalEvaAgent` (Final Evaluation):**
+       *   Review **Full Summary, Key Artifacts, and Visual Tool Feedback** against the holistic criteria/rubric.
+       *   Assign a holistic score (1-10) based strictly on the rubric and all evidence.
+       *   Provide feedback justifying the score based on the rubric and visual analysis. Suggest overall improvements.
+       *   **Output Format:** Return JSON: `{{"assessment": "Score (1-10)", "assessment_type": "Final", "feedback": "Rubric-based justification incorporating visual feedback. Holistic feedback.", "improvement_suggestions": "Overall improvement ideas."}}`
 
-*   **IF `{selected_agent}` is `SpecialEvaAgent` (Special Evaluation):**
-    *   Review **Full Summary (focus on option generation), Key Artifacts (options)**. Compare options using the comparative criteria/rubric.
-    *   Assign a comparative score (1-10) reflecting the *best* option's quality, based strictly on the rubric. **Identify the single best option** (e.g., by task ID or filename).
-    *   Provide feedback explaining the comparison, score rationale, and selection based on the rubric. Suggest improvements (usually "N/A").
-    *   **Output Format:** Return JSON: `{{"assessment": "Score (1-10)", "assessment_type": "Special", "selected_option_identifier": "Identifier of the best option", "feedback": "Rubric-based comparison justification.", "improvement_suggestions": "N/A"}}`
+   *   **IF `{selected_agent}` is `SpecialEvaAgent` (Special Evaluation):**
+       *   Review **Full Summary, Key Artifacts representing options, and Visual Tool Feedback** related to those options. Compare options using the **detailed comparative criteria/rubric provided in `{specific_criteria}`**.
+       *   For each option, assess it against each dimension defined in the rubric.
+       *   Assign a comparative score (1-10) reflecting the *best* option's quality and fit, based strictly on the rubric and all evidence (including visual feedback and alignment with `{user_input}`). **Identify the single best option** (e.g., by task ID or filename or descriptive name if available).
+       *   Provide detailed feedback explaining the comparison across the specified dimensions (e.g., Green Building, Aesthetics, Functionality, Cost). Justify the score rationale and the selection based on the rubric, visual analysis, and how well options meet the `{user_input}`.
+       *   **Output Format:** Return JSON: `{{"assessment": "Score (1-10)", "assessment_type": "Special", "selected_option_identifier": "Identifier of the best option", "feedback": "Detailed rubric-based comparison across dimensions (e.g., Cost, Functionality, Green Building), incorporating visual feedback and alignment with user goal.", "improvement_suggestions": "N/A or specific if one option is close but needs minor tweak"}}`
 
 **Instructions (Continued):**
 *   Your response **MUST** be only the single, valid JSON object required for the agent type. No other text.
-*   Adhere **strictly** to the output format and criteria/rubric.
+*   Adhere **strictly** to the output format and criteria/rubric. Base your final judgment on the **totality of the evidence provided, especially `{user_input}` and `{specific_criteria}`**.
 Respond in {llm_output_language}.
 """,
-                       input_variables=[
-                           "selected_agent",
-                           "evaluation_target_description", "evaluation_target_objective",
-                           "specific_criteria", "llm_output_language",
-                           "evaluation_target_outputs_json",
-                           "evaluation_target_image_paths_str",
-                           "evaluation_target_video_paths_str",
-                           "evaluation_target_other_files_str",
-                           "full_task_summary",
-                           "evaluation_target_key_image_paths_str",
-                           "evaluation_target_key_video_paths_str",
-                           "evaluation_target_other_artifacts_summary_str"
-                       ]
+                        input_variables=[
+                            "selected_agent",
+                            "evaluation_target_description", "evaluation_target_objective",
+                            "specific_criteria", "llm_output_language",
+                            "evaluation_target_outputs_json",
+                            "evaluation_target_image_paths_str",
+                            "evaluation_target_video_paths_str",
+                            "evaluation_target_other_files_str",
+                            "full_task_summary",
+                            "user_input", # Added user_input here for direct access during evaluation
+                            "evaluation_target_key_image_paths_str",
+                            "evaluation_target_key_video_paths_str",
+                            "evaluation_target_other_artifacts_summary_str",
+                            "image_tool_feedback",
+                            "video_tool_feedback"
+                        ]
                     ),
                     "prepare_final_evaluation_inputs": PromptConfig(
                         template="""
@@ -591,8 +630,8 @@ You are preparing inputs for the **FINAL HOLISTIC EVALUATION (`FinalEvaAgent`)**
 
 **Current Task Agent:** `{selected_agent}`
 **Current Task Objective:** {current_task_objective}
-**Overall Workflow Goal:** {user_input}
-**Full Workflow Task Summary (History - Primary source for outputs/options):**
+**Overall Workflow Goal (User Request - CRITICAL for identifying key comparison aspects):** {user_input}
+**Full Workflow Task Summary (History - Source for outputs/options & contextual analysis like site/case studies):**
 {full_task_summary}
 **Aggregated Outputs from Completed Tasks (JSON String):**
 ```json
@@ -606,23 +645,23 @@ You are preparing inputs for the **FINAL HOLISTIC EVALUATION (`FinalEvaAgent`)**
 **Your Goal:**
 1. Consolidate critical information and artifacts into a structured JSON object for the final/special evaluation nodes.
 2. Filter artifacts to focus on the *most relevant* final outputs (`FinalEvaAgent`) or the specific options being compared (`SpecialEvaAgent`).
-3. **Determine if gathering external sources (RAG/Search) is necessary for generating the detailed rubric/criteria.**
+3. **Determine if gathering external sources (RAG/Search) is necessary for generating the detailed rubric/criteria (Usually YES for Special/Final).**
 
 **Required Input Format for Final/Special Evaluation:**
-- `evaluation_target_description`: (String) Set based on agent: "Final Workflow Review" or "Special Multi-Option Comparison".
+- `evaluation_target_description`: (String) Set based on agent: "Final Workflow Review" or "Special Multi-Option Comparison of [briefly describe what is being compared, e.g., facade designs]".
 - `evaluation_target_objective`: (String) Pass through the `current_task_objective`.
 - `evaluation_target_full_summary`: (String) Pass through the provided Full Workflow Task Summary.
-- `evaluation_target_key_image_paths`: (List[String]) Identify and list FULL PATHS of the **most important output images**.
-- `evaluation_target_key_video_paths`: (List[String]) Identify and list FULL PATHS of the **most important output videos**.
-- `evaluation_target_other_artifacts_summary`: (String) Briefly summarize other key artifacts relevant to the agent type.
+- `evaluation_target_key_image_paths`: (List[String]) Identify and list FULL PATHS of the **most important output images representing the options or final result**.
+- `evaluation_target_key_video_paths`: (List[String]) Identify and list FULL PATHS of the **most important output videos representing the options or final result**.
+- `evaluation_target_other_artifacts_summary`: (String) Briefly summarize other key artifacts relevant to the agent type (e.g., textual descriptions of each option if comparing).
 - `needs_detailed_criteria`: (Boolean) Set to `true`. Final and Special evaluations almost always benefit from RAG/Search context for generating a comprehensive rubric or comparative criteria.
 
 **Instructions:**
-1. Set `evaluation_target_description` based on `{selected_agent}`. Pass through `current_task_objective`.
+1. Set `evaluation_target_description` based on `{selected_agent}`. If `SpecialEvaAgent`, try to briefly mention what options are being compared using info from `current_task_objective` or `full_task_summary`. Pass through `current_task_objective`.
 2. Pass through `full_task_summary`.
-3. Parse `aggregated_files_json`. Analyze `full_task_summary` to understand context.
-4. Iterate through parsed files, identifying key images/videos relevant to `{selected_agent}`. Add their `path` to the appropriate list. Note other significant artifacts.
-5. Create the `evaluation_target_other_artifacts_summary` string.
+3. Parse `aggregated_files_json` and `aggregated_outputs_json`. Analyze `full_task_summary` and `user_input` to understand context and identify the options/artifacts for comparison if `{selected_agent}` is `SpecialEvaAgent`.
+4. Iterate through parsed files and outputs, identifying key images/videos/text descriptions relevant to `{selected_agent}`. Add their `path` (for files) or summarized content (for text) to the appropriate list/summary field.
+5. Create the `evaluation_target_other_artifacts_summary` string, ensuring it captures key distinguishing features if comparing options.
 6. **Set `needs_detailed_criteria` to `true` for these evaluation types.**
 7. Construct the final JSON object using ONLY the specified keys.
 
@@ -644,28 +683,42 @@ You are defining the HOLISTIC evaluation criteria/rubric for a completed workflo
 
 **Current Task Agent:** `{selected_agent}`
 **Current Task Objective:** {current_task_objective}
-**Overall Workflow Goal:** {user_input}
-**Full Workflow Task Summary (History):**
+**Overall Workflow Goal (User Request - CRITICAL SOURCE for evaluation priorities):** {user_input}
+**Full Workflow Task Summary (History - contains analysis like site/case studies, and outputs of options):**
 {full_task_summary}
-**Input Artifacts Provided for Review (prepared paths/summaries):**
+**Input Artifacts Provided for Review (prepared paths/summaries of options/final results):**
 ```json
 {final_eval_inputs_json}
 ```
-**Context from RAG/Search (if gathered):**
+**Context from RAG/Search (if gathered, e.g., specific green building standards, cost benchmarks):**
 {rag_context}
 {search_context}
 
 **Your Task:** Generate specific criteria and a **detailed scoring rubric/guideline** suitable for the evaluation agent type.
 
 **IF `{selected_agent}` is `FinalEvaAgent`:**
-*   **Criteria Should Address:** Goal Achievement, Quality of Final Artifacts, Process Efficiency/Logic (Optional). Incorporate insights from RAG/Search if relevant.
+*   **Criteria Should Address:** Goal Achievement (alignment with `{user_input}`), Quality of Final Artifacts, Process Efficiency/Logic (Optional). Incorporate insights from RAG/Search if relevant.
 *   **Scoring Rubric:** Define a **detailed** 1-10 scale rubric with clear descriptions for each score range (e.g., 1-3, 4-6, 7-8, 9-10) relating to goal achievement and artifact quality, informed by context.
 
 **IF `{selected_agent}` is `SpecialEvaAgent`:**
-*   **Comparative Criteria Should Address:** Quality Comparison (objective criteria like style, feasibility, aesthetics), Relevance to Sub-Goal, Key Differentiators. Incorporate insights from RAG/Search if relevant.
-*   **Scoring Rubric & Selection:** Define a **detailed** 1-10 scale rubric for *comparative* assessment (score reflects how well the *best* option performs). Describe characteristics for different score ranges. Specify how to rank options and identify the single best one, informed by context.
+*   **Comparative Criteria MUST Address Multiple Dimensions:**
+    *   **Identify Key Dimensions from `{user_input}` and `{full_task_summary}`:** Determine which aspects are most important for comparing the options (e.g., user explicitly mentioned "low cost" or "innovative facade").
+    *   **Standard Architectural Dimensions (Consider if relevant):**
+        *   `Green Building Potential`: e.g., passive design features, material choices, estimated energy performance (qualitative or simple rating like Low/Med/High).
+        *   `Aesthetics/Form`: e.g., visual appeal, innovation, contextual fit, style adherence.
+        *   `Functionality/Programmatic Fit`: e.g., how well the option meets stated functional needs, space efficiency, circulation.
+        *   `Estimated Cost/Constructability`: e.g., qualitative assessment (Low/Med/High cost), or if possible, a rough comparative cost estimation or ranking based on materials/complexity.
+        *   `Specific Standards/Client Requirements`: If mentioned in `{user_input}` or RAG/Search context (e.g., "must achieve LEED Gold potential," "prioritize local materials").
+*   **Develop Discriminatory Metrics/Descriptions for Each Dimension:** For each chosen dimension, describe how to compare the options. Aim for more than just "good/bad."
+    *   Example for Cost: "Option A appears most cost-effective (simple form, standard materials). Option B is likely highest cost (complex geometry, custom facade). Option C is mid-range."
+    *   Example for Green Building: "Option A: Good solar shading, potential for natural ventilation (High Potential). Option B: Large glass areas, might require significant HVAC (Low Potential)."
+*   **Scoring Rubric & Selection:**
+    *   Define a **detailed** 1-10 scale rubric for *comparative* assessment. The score reflects how well the *best* option performs *overall* considering the weighted importance of the criteria.
+    *   Describe characteristics for different score ranges, clearly linking back to the defined dimensions.
+    *   Specify how to rank options and **identify the single best option** based on the comprehensive comparison.
+    *   The final feedback should clearly explain the reasoning for the selection across the different dimensions.
 
-**Output:** Output ONLY the criteria and the detailed scoring rubric/guideline as clear text, tailored to the agent type and informed by available context.
+**Output:** Output ONLY the criteria and the detailed scoring rubric/guideline as clear text, tailored to the agent type and informed by available context. Emphasize quantifiable or clearly comparable metrics where possible for `SpecialEvaAgent`.
 Respond in {llm_output_language}.
 """,
                         input_variables=[
@@ -701,9 +754,9 @@ Respond in {llm_output_language}.
                         請綜合以上所有資訊（目標、長期記憶、短期問答記錄），回答使用者最後的問題或陳述。
 
                         **你的回答指示：**
-                        1.  如果使用者表示要結束對話 (例如，說謝謝、再見、沒問題了等)，請 **只** 回覆 `TERMINATE`。
-                        2.  如果使用者要求執行一個全新的、需要重新規劃的任務 (例如，"現在幫我做..."、"我們來換個主題..." 等)，請回覆 `NEW_TASK:` 並接著清晰地、完整地總結這個新任務的目標。
-                        3.  **如果使用者表示沒事了，並且想要繼續執行*當前*的任務流程 (例如，"沒事了，繼續吧"、"請繼續執行任務")，請 **只** 回覆 `RESUME_TASK`。**
+                        1.  如果使用者意圖結束對話 (例如，說謝謝、再見、沒問題了等)，請 **只** 回覆 `TERMINATE`。
+                        2.  如果使用者意圖執行一個全新的、需要重新規劃的任務、或是不屬於當前任務的需求 (例如，"幫我做..."、"新任務..."、"幫我生成圖片..."等)，請回覆 `NEW_TASK:` 並接著清晰地、完整地總結這個新任務的目標。
+                        3.  如果使用者表示沒事了，並且想要繼續執行*當前*的任務流程 (例如，"繼續執行..."、"幫我繼續..."等)，請 **只** 回覆 `RESUME_TASK`。
                         4.  否則，請正常回答使用者的問題。如果使用者沒有明確問題，可以嘗試根據對話記錄和任務摘要提供相關資訊或詢問是否需要進一步幫助。
                         你的回答語言應為：{llm_output_language}
                         """,

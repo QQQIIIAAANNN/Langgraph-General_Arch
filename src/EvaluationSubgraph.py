@@ -105,24 +105,27 @@ def _append_feedback(task: TaskState, feedback: str, node_name: str):
 def _update_eval_status_at_end(task: TaskState, node_name: str):
     """Sets final task status based on evaluation assessment.
        Handles different assessment types (Pass/Fail vs Score).
+       Always sets Special/Final Agents to completed unless internal error occurred.
     """
     # 如果已經因內部錯誤設置為failed，不要覆蓋
     if task.get("status") == "failed" and task.get("error_log"):
         print(f"  - [{node_name}] Task already failed internally ({task.get('error_log')}), skipping final status update based on assessment.")
         return
 
-    assessment = task.get("evaluation", {}).get("assessment", "Fail") # 預設為Fail
     selected_agent = task.get("selected_agent", "")  # 獲取代理名稱
+    assessment = task.get("evaluation", {}).get("assessment", "Fail") # 使用主要的 assessment
 
-    # 關鍵修改點：特殊評估代理永遠返回成功狀態（除非有技術錯誤）
+    # --- <<< 關鍵修改：優先處理 Special/Final Agent >>> ---
     if selected_agent in ["SpecialEvaAgent", "FinalEvaAgent"]:
         task["status"] = "completed"
-        print(f"  - [{node_name}] {selected_agent} Assessment is {assessment}. ENFORCING final status to COMPLETED regardless of tool assessment.")
-        return
+        print(f"  - [{node_name}] Agent is {selected_agent}. ENFORCING final status to COMPLETED.")
+        return # 直接返回，不再執行後續的 Pass/Fail 判斷
+    # --- <<< 結束修改 >>> ---
 
     # 標準評估代理(EvaAgent)的原始邏輯
+    # Note: assessment here refers to the *main* assessment, likely from LLM or combined visual.
     is_pass_fail_eval = not isinstance(assessment, str) or assessment.lower() in ["pass", "fail"]
-    is_score_eval = isinstance(assessment, str) and assessment.lower().startswith("score")
+    is_score_eval = isinstance(assessment, str) and assessment.lower().startswith("score") # Should not happen for EvaAgent
 
     if is_pass_fail_eval:
         if assessment == "Pass":
@@ -136,19 +139,13 @@ def _update_eval_status_at_end(task: TaskState, node_name: str):
                  failure_reason = f"Evaluation resulted in '{assessment}'."
                  task["error_log"] = f"[{node_name}] {failure_reason}" # Use error_log for logical fail
                  _append_feedback(task, failure_reason, node_name)
-
-    elif is_score_eval:
-        # Special/Final evaluations provide a score.
-        # Assume completion even with a low score, unless specific logic is added later.
-        task["status"] = "completed"
-        print(f"  - [{node_name}] Special/Final Assessment Score: {assessment}. Setting final status to COMPLETED.")
-        # Feedback log already contains score details.
-    else:
-        # Unexpected assessment value
-        task["status"] = "completed" if selected_agent in ["SpecialEvaAgent", "FinalEvaAgent"] else "failed"
-        err_msg = f"Unexpected assessment value '{assessment}'. For standard agent setting status to FAILED, for special agents COMPLETED."
+    # --- (Removed score handling here as it's covered by Special/Final logic above) ---
+    # elif is_score_eval: ...
+    else: # Unexpected assessment value for EvaAgent
+        task["status"] = "failed"
+        err_msg = f"Unexpected assessment value '{assessment}' for EvaAgent. Setting status to FAILED."
         print(f"  - [{node_name}] Note: {err_msg}")
-        if task.get("error_log") is None and task["status"] == "failed": 
+        if task.get("error_log") is None:
             task["error_log"] = f"[{node_name}] {err_msg}"
         _append_feedback(task, err_msg, node_name)
 
@@ -746,31 +743,29 @@ def evaluate_with_image_node(state: WorkflowState, config: RunnableConfig) -> Di
     # Ensure necessary dictionaries exist
     if "evaluation" not in current_task: current_task["evaluation"] = {}
     if "task_inputs" not in current_task: current_task["task_inputs"] = {}
-    subgraph_error = current_task.get("evaluation", {}).get("subgraph_error", "")
+    subgraph_error = current_task.get("evaluation", {}).get("subgraph_error", "") or "" # Ensure string
 
     print(f"  - Performing Image Evaluation (related to Agent: {selected_agent})")
-
-    # --- Read Prepared Inputs & Criteria ---
     prepared_inputs = current_task.get("task_inputs", {})
-    # Get image paths from either standard or final/special prepared keys
     image_paths = prepared_inputs.get("evaluation_target_image_paths", []) or \
                   prepared_inputs.get("evaluation_target_key_image_paths", [])
-    # Get relevant text/outputs (could be from standard outputs or final summary)
     image_related_text = prepared_inputs.get("evaluation_target_outputs_json", "{}")
-    if image_related_text == '{}': # Fallback to summary if standard outputs empty
-         image_related_text = prepared_inputs.get("evaluation_target_full_summary", "N/A")
-
+    if image_related_text == '{}': image_related_text = prepared_inputs.get("evaluation_target_full_summary", "N/A")
     specific_criteria = current_task.get("evaluation", {}).get("specific_criteria", "Default criteria apply / Rubric not generated.")
 
     # Default results
-    assessment = "Fail"; feedback = "Image evaluation failed to run."; suggestions = "N/A" # Standard Pass/Fail for tool output
+    image_tool_assessment = "N/A"; feedback = "Image evaluation failed to run."; # Use neutral default
+    
+    # --- <<< 修改：用於收集多個圖像評估結果 >>> ---
+    individual_image_results = []
+    has_multiple_images = len(image_paths) > 1
+    # --- <<< 結束修改 >>> ---
 
     if not image_paths:
         err_msg = "Image evaluation required but no valid image paths found in prepared inputs."
         print(f"Eval Subgraph Error ({node_name}): {err_msg}")
         feedback = err_msg
         subgraph_error = (subgraph_error + f"; {err_msg}").strip("; ")
-        # Let it proceed to routing - if no video follows, it will end.
     else:
         # --- Prepare Prompt for Image Tool ---
         eval_prompt_for_img_tool = f"""請根據以下具體標準/評分準則，評估提供的圖片和相關文字輸出：
@@ -786,97 +781,216 @@ def evaluate_with_image_node(state: WorkflowState, config: RunnableConfig) -> Di
 
 **任務:**
 請提供詳細的評估，說明圖片是否符合上述標準/準則。
+{'' if not has_multiple_images else '''
+由於有多張圖片，請針對每張圖片分別評估，並在評估後清楚標示各張圖片的優缺點及排名。
+請明確指出哪張圖片是最佳選擇，並解釋選擇理由。
+'''} 
 你的評估應包含：
 1.  **整體評估:** 在回應的 **最開頭** 明確指出 "整體評估：通過" 或 "整體評估：失敗"。 (這是工具層面的評估)
 2.  **詳細回饋:** 針對標準/準則進行分析，解釋評估結果的原因。
 3.  **改進建議:** (可選) 如果評估為 "失敗"，請提供具體的改進建議。
+{'' if not has_multiple_images else '''
+4.  **圖片排名:** 請將多張圖片從最好到最差排序，並指明最佳圖片的檔案名。
+'''} 
 
 Respond in {LLM_OUTPUT_LANGUAGE_DEFAULT}.
 """
         # --- Invoke Image Tool & Parse Result ---
         try:
             print(f"  - Calling Image Recognition tool for {len(image_paths)} image(s)...")
-            # Ensure tool can handle list of paths
-            result = img_recognition.run({
+            # --- <<< 修改：正確的工具調用方式 >>> ---
+            tool_input_dict = {
                 "image_paths": image_paths,
                 "prompt": eval_prompt_for_img_tool
-            })
+            }
+            result = img_recognition.run(tool_input=tool_input_dict)
+            # --- <<< 結束修改 >>> ---
 
             if isinstance(result, str):
-                # Parse Pass/Fail assessment from the tool's output
-                if result.strip().lower().startswith("整體評估：通過") or "overall assessment: pass" in result.lower():
-                     assessment = "Pass"
-                elif result.strip().lower().startswith("整體評估：失敗") or "overall assessment: fail" in result.lower():
-                     assessment = "Fail"
-                else:
-                     # Infer if possible, otherwise default to Fail
-                     assessment = "Pass" if "pass" in result.lower() else "Fail"
-                     print(f"  - Warning: Could not explicitly parse Pass/Fail from image tool output. Inferred: {assessment}")
                 feedback = result # Store the full tool output
-                # Extract suggestions if available (simple split)
-                if "建議：" in result: suggestions = result.split("建議：", 1)[1].strip()
-                elif "suggestions:" in result.lower(): suggestions = result.split("suggestions:", 1)[-1].strip()
-                print(f"  - Image Tool Assessment: {assessment}")
+                
+                # --- 原有的解析 Pass/Fail 邏輯繼續保持不變 ---
+                if selected_agent == "EvaAgent":
+                    if result.strip().lower().startswith("整體評估：通過") or "overall assessment: pass" in result.lower():
+                         image_tool_assessment = "Pass"
+                    elif result.strip().lower().startswith("整體評估：失敗") or "overall assessment: fail" in result.lower():
+                         image_tool_assessment = "Fail"
+                    else:
+                         image_tool_assessment = "Pass" if "pass" in result.lower() else "Fail"
+                         print(f"  - Warning (EvaAgent): Could not explicitly parse Pass/Fail from image tool output. Inferred: {image_tool_assessment}")
+                    print(f"  - Image Tool Assessment (EvaAgent): {image_tool_assessment}")
+                else: # Special/Final Agent
+                    image_tool_assessment = "Not Applicable" # Indicate Pass/Fail is not relevant here
+                    print(f"  - Image Tool Raw Output Stored (Special/Final Agent).")
+                
+                # --- <<< 添加：如果是 SpecialEvaAgent 且有多圖，嘗試直接解析排名結果 >>> ---
+                if has_multiple_images and selected_agent in ["SpecialEvaAgent"]:
+                    print(f"  - Analyzing multi-image result for {selected_agent}...")
+                    
+                    # 嘗試從結果中提取最佳圖像信息
+                    best_image = None
+                    ranking = []
+                    
+                    # 查找包含「最佳圖像」或「最好的圖像」等關鍵詞的行
+                    result_lines = result.split('\n')
+                    for line in result_lines:
+                        line = line.strip().lower()
+                        if any(term in line for term in ["最佳圖像", "最好的圖像", "最適合的圖像", "排名第一", "最佳選擇"]):
+                            # 尋找這行中的檔案名稱
+                            for img_path in image_paths:
+                                img_name = os.path.basename(img_path)
+                                if img_name.lower() in line.lower():
+                                    best_image = img_name
+                                    print(f"  - Found potential best image: {best_image}")
+                                    break
+                        
+                        # 查找包含「排名」的行來提取完整排名
+                        if "排名" in line and ":" in line:
+                            rank_text = line.split(":", 1)[1].strip()
+                            # 從排名文本中提取文件名
+                            for img_path in image_paths:
+                                img_name = os.path.basename(img_path)
+                                if img_name.lower() in rank_text.lower() and img_name not in ranking:
+                                    ranking.append(img_name)
+                    
+                    # 如果找到了最佳圖像，更新評估結果
+                    if best_image:
+                        print(f"  - Setting best image as selected option: {best_image}")
+                        current_task["evaluation"]["selected_option_identifier"] = best_image
+                        
+                        # 如果有排名，也將其存儲
+                        if ranking:
+                            current_task["evaluation"]["image_ranking"] = ranking
+                            print(f"  - Extracted ranking: {ranking}")
+                    
+                    # 如果無法從輸出中提取最佳圖像，考慮進行附加的LLM分析
+                    if not best_image and not ranking:
+                        print(f"  - Could not extract best image or ranking. May need follow-up LLM analysis.")
+                # --- <<< 結束添加 >>> ---
             else: # Tool returned unexpected type
                 err_msg = f"Image tool returned unexpected type: {type(result)}"
                 print(f"Eval Subgraph Error ({node_name}): {err_msg}")
-                assessment = "Fail"; feedback = err_msg; suggestions = "Tool output format error."
+                image_tool_assessment = "Fail"; feedback = err_msg;
                 subgraph_error = (subgraph_error + f"; {err_msg}").strip("; ")
 
         except Exception as e: # Tool call error
             err_msg = f"Error calling image tool: {e}"
             print(f"Eval Subgraph Error ({node_name}): {err_msg}")
-            # This is an internal failure of the node/tool
-            _set_task_failed(current_task, err_msg, node_name)
+            # --- <<< 修改：處理 TypeError >>> ---
+            # 將錯誤消息添加到 feedback_log
+            _append_feedback(current_task, f"Video tool call failed: {e}", node_name)
+            # 設置任務失敗
+            _set_task_failed(current_task, err_msg, node_name) # Pass the specific error message
             subgraph_error = (subgraph_error + f"; {err_msg}").strip("; ")
             tasks[current_idx] = current_task
             if "evaluation" in current_task: current_task["evaluation"]["subgraph_error"] = subgraph_error
-            return {"tasks": tasks} # Return early on tool error
+            # 打印 traceback 以便調試
+            traceback.print_exc()
+            return {"tasks": tasks} # 工具錯誤時提前返回
+            # --- <<< 結束修改 >>> ---
+
+    # --- <<< 修改：仅当无法从工具输出直接提取排名时才调用LLM >>> ---
+    if has_multiple_images and selected_agent in ["SpecialEvaAgent"] and not current_task["evaluation"].get("selected_option_identifier"):
+        print(f"  - Multiple images detected ({len(image_paths)}) for {selected_agent}. Running additional LLM analysis...")
+        
+        # 獲取LLM配置
+        runtime_config = config.get("configurable", {})
+        ea_llm_config = runtime_config.get("ea_llm", {})
+        llm = initialize_llm(ea_llm_config)
+        llm_output_language = runtime_config.get("global_llm_output_language", LLM_OUTPUT_LANGUAGE_DEFAULT)
+        
+        # 構建比較提示
+        comparison_prompt = f"""
+您需要從以下圖像評估結果中提取關鍵信息，作為特殊評估（SpecialEvaAgent）的一部分。
+
+**評估標準/準則:**
+{specific_criteria}
+
+**圖像路徑:**
+{chr(10).join([f"{i+1}. {os.path.basename(path)}" for i, path in enumerate(image_paths)])}
+
+**圖像評估結果:**
+{feedback}
+
+**任務:**
+1. 分析上述評估結果
+2. 確定哪張圖像是最佳選擇
+3. 如可能，對所有圖像進行排序（從最好到最差）
+4. 提供最佳圖像的檔案名
+
+請以JSON格式回覆，包含以下欄位：
+- ranking: 圖像排名（從最佳到最差的檔案名稱列表）
+- best_image: 最佳圖像的檔案名
+- comparison_reasoning: 排名理由
+- improvement_suggestions: 對最佳圖像的改進建議（如果有）
+
+回應語言: {llm_output_language}
+"""
+        
+        try:
+            # 調用LLM進行比較
+            comparison_response = llm.invoke(comparison_prompt)
+            comparison_text = comparison_response.content.strip()
+            
+            # 嘗試解析JSON
+            comparison_result = {}
+            try:
+                if comparison_text.startswith("```json"):
+                    comparison_text = comparison_text[7:-3].strip()
+                elif comparison_text.startswith("```"):
+                    comparison_text = comparison_text[3:-3].strip()
+                    
+                comparison_result = json.loads(comparison_text)
+                print(f"  - Successfully parsed comparison result: {list(comparison_result.keys())}")
+                
+                # 更新評估結果
+                current_task["evaluation"]["image_comparison"] = comparison_result
+                current_task["evaluation"]["selected_option_identifier"] = comparison_result.get("best_image", "")
+                
+                # 加入比較結果到feedback
+                additional_feedback = f"\n\n--- 多圖像比較結果 ---\n排名: {comparison_result.get('ranking', [])}\n最佳圖像: {comparison_result.get('best_image', 'N/A')}\n分析理由: {comparison_result.get('comparison_reasoning', 'N/A')}"
+                feedback += additional_feedback
+                
+            except json.JSONDecodeError:
+                print(f"  - Warning: Could not parse LLM comparison result as JSON. Using raw text.")
+                current_task["evaluation"]["image_comparison_text"] = comparison_text
+                feedback += f"\n\n--- 多圖像比較結果 ---\n{comparison_text}"
+                
+        except Exception as comp_e:
+            print(f"  - Error during image comparison: {comp_e}")
+            feedback += f"\n\n--- 多圖像比較錯誤 ---\n{comp_e}"
+    # --- <<< 結束修改 >>> ---
 
     # --- Update TaskState (Assessment and Feedback) ---
-    # Store the image tool's assessment. If subsequent steps exist (video), this might be intermediate.
-    # For simplicity, let's store this tool-level assessment. The final status is set later.
-    current_task["evaluation"]["image_tool_assessment"] = assessment # Store tool specific result
-    feedback_details = f"Image Tool Assessment: {assessment}\nTool Raw Output:\n{feedback}"
+    current_task["evaluation"]["image_tool_assessment"] = image_tool_assessment # Store tool specific result
+    feedback_details = f"Image Tool Assessment: {image_tool_assessment}\nTool Raw Output:\n{feedback}"
     _append_feedback(current_task, feedback_details, node_name)
     if subgraph_error: current_task["evaluation"]["subgraph_error"] = subgraph_error
 
-    # --- Provisional Status Update ---
-    if assessment == "Fail":
-        if current_task.get("status") != "failed": # Avoid overriding previous internal failure
-            selected_agent = current_task.get("selected_agent", "")
-            if selected_agent in ["SpecialEvaAgent", "FinalEvaAgent"]:
-                print(f"  - [{node_name}] Image Tool Assessment is Fail, but agent is {selected_agent}. Keeping status as pending.")
-                _append_feedback(current_task, f"Image tool evaluation resulted in 'Fail', but {selected_agent} will continue regardless.", node_name)
-            else:
-                print(f"  - [{node_name}] Image Tool Assessment is Fail. Setting provisional status to FAILED.")
-                current_task["status"] = "failed"
-                if "Image Tool Assessment: Fail" not in current_task.get("feedback_log", ""):
-                    _append_feedback(current_task, "Image tool evaluation resulted in 'Fail'.", node_name)
-
-    # --- <<< 新增代碼：計算 needs_video_eval >>> ---
+    # --- Check if video eval is needed (logic remains) ---
     prepared_inputs = current_task.get("task_inputs", {})
     needs_video_eval = bool(prepared_inputs.get("evaluation_target_video_paths")) or \
                        bool(prepared_inputs.get("evaluation_target_key_video_paths"))
-    # --- <<< 結束新增 >>> ---
 
-    # 準備最終狀態更新
-    if not needs_video_eval:  # 如果不需要視頻評估，即這是最後一步
-        # 獲取圖像工具評估
-        image_assessment = current_task.get("evaluation", {}).get("image_tool_assessment", "Fail")
-        # 創建臨時字典以傳遞給狀態更新幫助函數
-        temp_eval_state_for_status = {"assessment": image_assessment}
-        temp_task_for_status = current_task.copy()
-        temp_task_for_status["evaluation"] = temp_eval_state_for_status
-        # 確保保留selected_agent信息
-        temp_task_for_status["selected_agent"] = current_task.get("selected_agent", "")
-        # 基於圖像評估結果調用幫助函數
-        _update_eval_status_at_end(temp_task_for_status, f"{node_name} (Image Only)")
-        # 將確定的狀態應用回主任務對象
-        current_task['status'] = temp_task_for_status['status']
-        if temp_task_for_status.get('error_log'):
-            current_task['error_log'] = temp_task_for_status['error_log']
-        print(f"  - 最終狀態設置為: {current_task['status']}")
+    # If this is the last visual eval step, call the final status updater
+    if not needs_video_eval:
+        # --- <<< 修改：調用 _update_eval_status_at_end >>> ---
+        # The assessment used by _update_eval_status_at_end will be the main 'assessment' field,
+        # which is not yet set here (only image_tool_assessment is).
+        # For Special/Final, _update_eval_status_at_end forces 'completed'.
+        # For EvaAgent, we need to set the main 'assessment' based on image_tool_assessment now.
+        if selected_agent == "EvaAgent":
+            current_task["evaluation"]["assessment"] = image_tool_assessment # Set main assessment for EvaAgent
+        else:
+            # For Special/Final, the main assessment comes from the LLM later.
+            # We don't need to set a main assessment here.
+            pass
+
+        print(f"  - No video evaluation needed. Calling final status update...")
+        # The helper function will now correctly handle the agent type.
+        _update_eval_status_at_end(current_task, f"{node_name} (Image Only)")
+        print(f"  - Final status set to: {current_task['status']}")
+        # --- <<< 結束修改 >>> ---
 
     tasks[current_idx] = current_task
     return {"tasks": tasks}
@@ -884,147 +998,243 @@ Respond in {LLM_OUTPUT_LANGUAGE_DEFAULT}.
 
 def evaluate_with_video_node(state: WorkflowState, config: RunnableConfig) -> Dict[str, Any]:
     """
-    執行影片評估，支援多個影片檔案處理。
-    基於 Gemini API 的最佳實踐處理。
+    執行影片評估，循環處理多個影片檔案。
     """
     node_name = "Video Evaluation"
     print(f"--- Running Node: {node_name} ---")
     tasks = [t.copy() for t in state["tasks"]]
     current_idx = state["current_task_index"]
-    if not (0 <= current_idx < len(tasks)): return {"tasks": tasks} # 安全檢查
+    if not (0 <= current_idx < len(tasks)): return {"tasks": tasks} # Safeguard
     current_task = tasks[current_idx]
     selected_agent = current_task.get('selected_agent')
 
-    # 略過前面失敗的步驟
+    # Skip if previous step failed
     if current_task.get("status") == "failed":
-        print(f"  - 跳過節點 {node_name}，任務狀態已設為'失敗'。")
+        print(f"  - Skipping node {node_name}, task status already 'failed'.")
         return {"tasks": tasks}
 
-    # 確保必要的字典存在
+    # Ensure necessary dictionaries exist
     if "evaluation" not in current_task: current_task["evaluation"] = {}
     if "task_inputs" not in current_task: current_task["task_inputs"] = {}
-    subgraph_error = current_task.get("evaluation", {}).get("subgraph_error", "")
-
-    print(f"  - 執行影片評估 (相關代理: {selected_agent})")
-
-    # --- 讀取準備好的輸入和評估標準 ---
+    subgraph_error = current_task.get("evaluation", {}).get("subgraph_error", "") or "" # Ensure string
     prepared_inputs = current_task.get("task_inputs", {})
-    # 從標準或特殊/最終準備好的鍵中獲取視頻路徑
     video_paths = prepared_inputs.get("evaluation_target_video_paths", []) or \
                   prepared_inputs.get("evaluation_target_key_video_paths", [])
-    # 獲取相關文本/輸出
     video_related_text = prepared_inputs.get("evaluation_target_outputs_json", "{}")
-    if video_related_text == '{}':
-         video_related_text = prepared_inputs.get("evaluation_target_full_summary", "N/A")
+    if video_related_text == '{}': video_related_text = prepared_inputs.get("evaluation_target_full_summary", "N/A")
+    specific_criteria = current_task.get("evaluation", {}).get("specific_criteria", "Default criteria apply / Rubric not generated.")
 
-    specific_criteria = current_task.get("evaluation", {}).get("specific_criteria", "默認標準適用 / 未生成評分標準。")
-
-    # 預設結果
-    assessment = "Fail"; feedback = "影片評估執行失敗。" # 工具輸出的標準 Pass/Fail
+    # --- <<< 修改：初始化用於循環的變數 >>> ---
+    accumulated_feedback: List[str] = [] # 儲存每個影片的反饋
+    overall_video_assessment = "Pass" if selected_agent == "EvaAgent" else "Not Applicable"
+    any_video_failed = False # 追蹤是否有影片分析出錯或評估失敗
+    
+    # --- 添加結構化儲存每個影片的結果 ---
+    individual_video_results = []
+    has_multiple_videos = len(video_paths) > 1
+    # --- <<< 結束修改 >>> ---
 
     if not video_paths:
-        err_msg = "需要影片評估但在準備好的輸入中找不到有效的影片路徑。"
+        err_msg = "Video evaluation required but no valid video paths found in prepared inputs."
         print(f"Eval Subgraph Error ({node_name}): {err_msg}")
-        feedback = err_msg
+        accumulated_feedback.append(f"錯誤: {err_msg}")
         subgraph_error = (subgraph_error + f"; {err_msg}").strip("; ")
-        # 如果沒有視頻，整體評估依賴於先前的步驟/LLM。
-        # 如果可用，根據先前的步驟設置評估，否則設為 Fail。
-        assessment = current_task.get("evaluation", {}).get("image_tool_assessment", "Fail")
+        overall_video_assessment = current_task.get("evaluation", {}).get("image_tool_assessment", "Fail") # Fallback based on image
     else:
-        # --- 準備視頻工具的提示 ---
-        eval_prompt_for_vid_tool = f"""請根據以下具體標準/評分準則，評估提供的影片和相關文字輸出：
+        # --- 循環處理每個影片路徑 ---
+        for idx, video_path in enumerate(video_paths):
+            print(f"\n  --- Analyzing Video {idx+1}/{len(video_paths)}: {os.path.basename(video_path)} ---")
+            # --- 準備單個影片的提示 ---
+            eval_prompt_for_single_vid = f"""請根據以下具體標準/評分準則，評估**這個影片**和相關文字輸出：
 **評估標準/準則:**
 {specific_criteria}
 
-**相關文字輸出/摘要:**
+**相關文字輸出/摘要 (供參考):**
 ```
 {video_related_text}
 ```
 
-**影片路徑:** {', '.join(video_paths)}
+**當前影片路徑:** {video_path}
 
 **任務:**
-請提供詳細的評估，說明影片是否符合上述標準/準則。
+請提供對**這個影片**的詳細評估，說明其是否符合上述標準/準則。
 你的評估應包含：
-1.  **整體評估:** 在回應的 **最開頭** 明確指出 "整體評估：通過" 或 "整體評估：失敗"。 (工具層面評估)
+1.  **對此影片的整體評估:** 在回應的 **最開頭** 明確指出 "整體評估：通過" 或 "整體評估：失敗"。 (工具層面評估)
 2.  **詳細回饋:** 針對標準/準則進行分析，解釋評估結果的原因。
 3.  **改進建議:** (可選) 如果評估為 "失敗"，請提供具體的改進建議。
 4.  **時間戳記分析:** 指出影片中關鍵時刻的時間戳記，格式為 MM:SS。
 
 請以繁體中文回應。
 """
-        # --- 調用視頻工具和解析結果 ---
-        try:
-            print(f"  - 調用影片識別工具處理 {len(video_paths)} 個影片...")
-            
-            # 確保調用格式正確
-            result = video_recognition.run({
-                "video_paths": video_paths, 
-                "prompt": eval_prompt_for_vid_tool
-            })
-            
-            # 如果返回的結果為空或非字串
-            if not result or not isinstance(result, str):
-                err_msg = f"影片工具返回無效結果: {result}"
-                print(f"Eval Subgraph Error ({node_name}): {err_msg}")
-                assessment = "Fail"
-                feedback = f"影片分析工具返回無效結果。這可能是由於影片格式不支援或工具內部錯誤。"
-                subgraph_error = (subgraph_error + f"; {err_msg}").strip("; ")
-            else:
-                # 解析評估結果
-                if "整體評估：通過" in result or "overall assessment: pass" in result.lower():
-                    assessment = "Pass"
-                elif "整體評估：失敗" in result or "overall assessment: fail" in result.lower():
-                    assessment = "Fail"
-                else:
-                    # 如果找不到明確的通過/失敗標記，嘗試推斷
-                    assessment = "Pass" if "pass" in result.lower() and "fail" not in result.lower() else "Fail"
-                    print(f"  - 警告: 無法從影片工具輸出中明確解析 Pass/Fail。推斷結果: {assessment}")
-                
-                feedback = result
-                print(f"  - 影片工具評估: {assessment}")
-                
-                # 強制設置特殊代理的評估結果
-                if current_task.get("selected_agent") in ["SpecialEvaAgent", "FinalEvaAgent"]:
-                    print(f"  - 注意: 由於是特殊代理評估，即使影片工具評估為 {assessment}，最終狀態仍將設為'已完成'")
-                    # 這裡不修改 assessment，而是在最終狀態設置時使用強制邏輯
-        except Exception as e: # 工具調用錯誤
-            err_msg = f"調用影片工具時出錯: {e}"
-            print(f"Eval Subgraph Error ({node_name}): {err_msg}")
-            _set_task_failed(current_task, err_msg, node_name) # 內部失敗
-            subgraph_error = (subgraph_error + f"; {err_msg}").strip("; ")
-            tasks[current_idx] = current_task
-            if "evaluation" in current_task: current_task["evaluation"]["subgraph_error"] = subgraph_error
-            return {"tasks": tasks} # 工具錯誤時提前返回
+            single_video_feedback = f"影片 '{os.path.basename(video_path)}' 分析失敗。" # 預設失敗反饋
+            single_video_assessment = "Fail" # 預設失敗
 
-    # --- 更新任務狀態和評估 ---
-    current_task["evaluation"]["video_tool_assessment"] = assessment
-    feedback_details = f"影片工具評估: {assessment}\n工具原始輸出:\n{feedback}"
+            try:
+                print(f"    - 調用 video_recognition 工具...")
+                # --- <<< 關鍵修改：將參數打包成字典傳遞給 .run() >>> ---
+                tool_input_dict = {
+                    "video_path": video_path,
+                    "prompt": eval_prompt_for_single_vid
+                }
+                result = video_recognition.run(tool_input=tool_input_dict)
+                # --- <<< 結束修改 >>> ---
+
+                if not result or not isinstance(result, str):
+                    err_msg = f"影片工具對 '{os.path.basename(video_path)}' 返回無效結果: {result}"
+                    print(f"    Eval Subgraph Error ({node_name}): {err_msg}")
+                    single_video_feedback = f"錯誤: {err_msg}"
+                    subgraph_error = (subgraph_error + f"; {err_msg}").strip("; ")
+                    any_video_failed = True # 標記有影片處理失敗
+                elif result.startswith("錯誤："): # 檢查工具返回的錯誤訊息
+                    err_msg = f"影片工具對 '{os.path.basename(video_path)}' 返回錯誤: {result}"
+                    print(f"    Eval Subgraph Error ({node_name}): {err_msg}")
+                    single_video_feedback = result # 使用工具返回的錯誤信息
+                    subgraph_error = (subgraph_error + f"; {result}").strip("; ")
+                    any_video_failed = True # 標記有影片處理失敗
+                else:
+                    single_video_feedback = result # 儲存完整的工具輸出
+                    
+                    # --- <<< 添加：儲存結構化結果 >>> ---
+                    individual_video_results.append({
+                        "path": video_path,
+                        "filename": os.path.basename(video_path),
+                        "assessment": single_video_assessment,  # 單個影片的通過/失敗狀態
+                        "raw_output": result  # 完整工具輸出
+                    })
+                    # --- <<< 結束添加 >>> ---
+                    
+                    # 僅為 EvaAgent 解析 Pass/Fail
+                    if selected_agent == "EvaAgent":
+                        if "整體評估：通過" in result or "overall assessment: pass" in result.lower():
+                            single_video_assessment = "Pass"
+                        elif "整體評估：失敗" in result or "overall assessment: fail" in result.lower():
+                            single_video_assessment = "Fail"
+                        else:
+                            single_video_assessment = "Fail" # 嚴格模式：未明確說通過則視為失敗
+                            print(f"    - Warning (EvaAgent): 無法從影片工具輸出中明確解析 Pass/Fail。設為 Fail。")
+                        print(f"    - 單個影片評估 (EvaAgent): {single_video_assessment}")
+                        if single_video_assessment == "Fail":
+                            any_video_failed = True # 標記有影片評估失敗
+                    else: # Special/Final Agent
+                        single_video_assessment = "Not Applicable"
+                        print(f"    - 單個影片原始輸出已儲存 (Special/Final Agent)")
+
+            except Exception as e: # Tool call error for single video
+                # --- <<< 修改：更清晰地打印錯誤來源 >>> ---
+                err_msg = f"調用 video_recognition.run() 處理 '{os.path.basename(video_path)}' 時捕獲到異常: {e}"
+                print(f"    Eval Subgraph Error ({node_name}): {err_msg}")
+                single_video_feedback = f"錯誤: {err_msg}"
+                subgraph_error = (subgraph_error + f"; Tool Exception: {err_msg}").strip("; ") # Add marker
+                any_video_failed = True # 標記有影片處理失敗
+                traceback.print_exc() # 打印錯誤追蹤
+                # --- <<< 結束修改 >>> ---
+
+            # 累積每個影片的反饋
+            accumulated_feedback.append(f"--- 影片: {os.path.basename(video_path)} (評估: {single_video_assessment}) ---\n{single_video_feedback}\n")
+            # --- 結束單個影片的 try-except ---
+        # --- <<< 結束循環 >>> ---
+
+        # --- 根據循環結果設置最終評估值 ---
+        if selected_agent == "EvaAgent":
+            overall_video_assessment = "Fail" if any_video_failed else "Pass"
+        else:
+            overall_video_assessment = "Not Applicable" # Special/Final Agent 不基於 Pass/Fail
+
+    # --- <<< 添加：當有多個影片時進行LLM比較 >>> ---
+    if has_multiple_videos and selected_agent in ["SpecialEvaAgent"] and len(individual_video_results) > 1:
+        print(f"  - Multiple videos detected ({len(video_paths)}) for {selected_agent}. Running comparison LLM...")
+        
+        # 獲取LLM配置
+        runtime_config = config.get("configurable", {})
+        ea_llm_config = runtime_config.get("ea_llm", {})
+        llm = initialize_llm(ea_llm_config)
+        llm_output_language = runtime_config.get("global_llm_output_language", LLM_OUTPUT_LANGUAGE_DEFAULT)
+        
+        # 構建比較提示
+        comparison_prompt = f"""
+您需要比較並排序以下多個影片的評估結果，作為特殊評估（SpecialEvaAgent）的一部分。
+
+**評估標準/準則:**
+{specific_criteria}
+
+**每個影片的評估結果:**
+{chr(10).join([f"--- 影片 {i+1} ({res['filename']}) ---{chr(10)}{res['raw_output']}{chr(10)}" 
+               for i, res in enumerate(individual_video_results)])}
+
+**任務:**
+1. 仔細分析每個影片的評估結果
+2. 根據上述評估標準/準則，對所有影片進行排序（從最好到最差）
+3. 清楚識別哪個影片是最佳選擇，並解釋原因
+4. 提供最佳影片的檔案名
+
+請以JSON格式回覆，包含以下欄位：
+- ranking: 影片排名（從最佳到最差的檔案名稱列表）
+- best_video: 最佳影片的檔案名
+- comparison_reasoning: 詳細的比較分析和排名理由
+- improvement_suggestions: 對最佳影片的改進建議（如果有）
+
+回應語言: {llm_output_language}
+"""
+        
+        try:
+            # 調用LLM進行比較
+            comparison_response = llm.invoke(comparison_prompt)
+            comparison_text = comparison_response.content.strip()
+            
+            # 嘗試解析JSON
+            comparison_result = {}
+            try:
+                if comparison_text.startswith("```json"):
+                    comparison_text = comparison_text[7:-3].strip()
+                elif comparison_text.startswith("```"):
+                    comparison_text = comparison_text[3:-3].strip()
+                    
+                comparison_result = json.loads(comparison_text)
+                print(f"  - Successfully parsed comparison result: {list(comparison_result.keys())}")
+                
+                # 更新評估結果
+                current_task["evaluation"]["video_comparison"] = comparison_result
+                current_task["evaluation"]["selected_option_identifier"] = comparison_result.get("best_video", "")
+                
+                # 加入比較結果到累積反饋
+                additional_feedback = f"\n\n--- 多影片比較結果 ---\n排名: {comparison_result.get('ranking', [])}\n最佳影片: {comparison_result.get('best_video', 'N/A')}\n分析理由: {comparison_result.get('comparison_reasoning', 'N/A')}"
+                accumulated_feedback.append(additional_feedback)
+                
+            except json.JSONDecodeError:
+                print(f"  - Warning: Could not parse LLM comparison result as JSON. Using raw text.")
+                current_task["evaluation"]["video_comparison_text"] = comparison_text
+                accumulated_feedback.append(f"\n\n--- 多影片比較結果 ---\n{comparison_text}")
+                
+        except Exception as comp_e:
+            print(f"  - Error during video comparison: {comp_e}")
+            accumulated_feedback.append(f"\n\n--- 多影片比較錯誤 ---\n{comp_e}")
+    # --- <<< 結束添加 >>> ---
+
+    # --- Update TaskState ---
+    final_feedback_str = "\n".join(accumulated_feedback) if accumulated_feedback else "沒有生成影片評估反饋。"
+    current_task["evaluation"]["video_tool_assessment"] = overall_video_assessment
+    feedback_details = f"影片工具總體評估 (基於所有影片): {overall_video_assessment}\n{final_feedback_str}"
     _append_feedback(current_task, feedback_details, node_name)
     if subgraph_error: current_task["evaluation"]["subgraph_error"] = subgraph_error
 
-    # --- 設置此分支的最終狀態 ---
-    final_assessment_for_path = assessment # 預設為影片評估
-    if assessment == "Pass":
-         # 如果影片通過，整體狀態取決於影像評估 (如已完成) 是否通過
-         image_assessment = current_task.get("evaluation", {}).get("image_tool_assessment")
-         if image_assessment == "Fail": # 影像先前失敗
-             final_assessment_for_path = "Fail"
-    
-    # 儲存組合評估以清晰呈現最終狀態
+    # --- Set Final Status for this branch ---
+    final_assessment_for_path = overall_video_assessment
+    # 如果整體影片評估通過（僅對 EvaAgent），檢查圖像評估
+    if overall_video_assessment == "Pass" and selected_agent == "EvaAgent":
+        image_assessment = current_task.get("evaluation", {}).get("image_tool_assessment")
+        if image_assessment == "Fail": # Image failed previously
+            final_assessment_for_path = "Fail" # 整體視為失敗
+    elif selected_agent == "EvaAgent" and overall_video_assessment != "Pass":
+        final_assessment_for_path = "Fail" # 如果 EvaAgent 的影片評估不是明確 Pass，則整體失敗
+
     current_task["evaluation"]["combined_visual_assessment"] = final_assessment_for_path
-    current_task["evaluation"]["assessment"] = final_assessment_for_path # 設置主要評估結果
-    
-    # 特別強調的邏輯：為特殊代理強制設置完成狀態
-    selected_agent = current_task.get("selected_agent", "")
-    if selected_agent in ["SpecialEvaAgent", "FinalEvaAgent"]:
-        # 對於特殊代理，我們總是設置完成狀態（除非有技術錯誤）
-        current_task["status"] = "completed"
-        print(f"  - [{node_name}] {selected_agent} with combined assessment '{final_assessment_for_path}'. ENFORCING status to COMPLETED.")
-    else:
-        # 對於標準代理，使用正常的狀態更新邏輯
-        _update_eval_status_at_end(current_task, f"{node_name} (Combined Visual)")
-    
+    current_task["evaluation"]["assessment"] = final_assessment_for_path # Update main assessment
+
+    print(f"  - Combined Visual Assessment: {final_assessment_for_path}")
+    print(f"  - Calling final status update...")
+    _update_eval_status_at_end(current_task, f"{node_name} (Combined Visual)")
+    print(f"  - Final status set to: {current_task['status']}")
+
     tasks[current_idx] = current_task
     return {"tasks": tasks}
 
@@ -1076,7 +1286,10 @@ def route_after_image_eval(state: WorkflowState) -> Literal["evaluate_with_video
         state['tasks'][current_idx]['status'] = temp_task_for_status['status']
         state['tasks'][current_idx]['error_log'] = temp_task_for_status.get('error_log', state['tasks'][current_idx].get('error_log'))
         print(f"  - Final status set to: {state['tasks'][current_idx]['status']}")
-        return "finished"
+
+        # tasks[current_idx] = current_task # State is modified directly above, no need to reassign to local var
+        # return {"tasks": tasks} # <<< REMOVE THIS LINE >>>
+        return "finished" # <<< ADD THIS LINE >>>
 
 # --- MODIFIED: Condition Function after Prep ---
 def route_after_eval_prep(state: WorkflowState) -> Literal["gather_criteria_sources", "generate_specific_criteria", "finished"]:
