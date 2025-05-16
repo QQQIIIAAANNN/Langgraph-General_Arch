@@ -6,6 +6,7 @@ import uuid
 import json
 import base64
 import shutil # NEW IMPORT for file copying
+import cv2 # 新增或確保 cv2 在頂部被引入
 from typing import Dict, List, Any, Annotated, Literal, Union, Optional, Tuple
 from datetime import datetime
 from pathlib import Path
@@ -1126,145 +1127,697 @@ def save_final_summary(state: WorkflowState) -> WorkflowState:
     Saves the final summary of the workflow, including all task details,
     outputs, and generated files into a Word document and a JSON file.
     The Word document includes a title, overall goal, task summaries, and images.
+    The radar chart and its context are now placed under the Detailed Assessment section.
     """
+    from docx.shared import Inches, Pt
+    from docx.enum.text import WD_ALIGN_PARAGRAPH # Ensure this is imported
+
     print("--- Saving Final Workflow Summary ---")
     if not state:
         print("Error: State is None, cannot save summary.")
-        return state # Should not happen if graph is structured correctly
+        return state
 
-    # Ensure output directory exists at the root level
-    # OUTPUT_DIR = "output" # Removed, use config
-    # --- MODIFIED: Get output_directory from config ---
-    runtime_config = state.get('config', {}).get('configurable', {})
-    output_dir_from_config = runtime_config.get('output_directory', 'output') # Default to 'output' if not in config
-    # Ensure this is a top-level 'output' directory, not nested like 'output/Cache'
-    # For simplicity, let's assume output_dir_from_config IS the intended top-level like "./output"
-    # If it could be "./output/Cache", we'd need to go up one level: os.path.dirname(output_dir_from_config)
-    # For now, let's assume it's set correctly to the desired root output folder.
-    final_summary_output_dir = os.path.abspath(output_dir_from_config)
+    final_summary_output_dir = "D:/MA system/LangGraph/output/Report"
     os.makedirs(final_summary_output_dir, exist_ok=True)
-    # --- END MODIFIED ---
+
+    tasks = state.get("tasks", [])
+    print(f"Save Summary Debug: Total tasks in state: {len(tasks)}")
+    for i, task_debug in enumerate(tasks):
+        print(f"Save Summary Debug: Task {i+1} ID: {task_debug.get('task_id', 'N/A')}, Agent: {task_debug.get('selected_agent', 'N/A')}, Status: {task_debug.get('status', 'N/A')}")
+        if task_debug.get("selected_agent") in ["SpecialEvaAgent", "FinalEvaAgent"]:
+            print(f"  Eval Task Debug: Outputs: {task_debug.get('outputs', {}).keys()}")
+            print(f"  Eval Task Debug: Output Files: {task_debug.get('output_files')}")
+            print(f"  Eval Task Debug: Evaluation Dict: {task_debug.get('evaluation')}")
+
 
     timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-    
-    # --- MODIFIED: Filenames to be saved in final_summary_output_dir ---
+
     base_filename = f"Final_Workflow_Summary_{timestamp}"
     word_filename = f"{base_filename}.docx"
     json_filename = f"{base_filename}.json"
     word_filepath = os.path.join(final_summary_output_dir, word_filename)
     json_filepath = os.path.join(final_summary_output_dir, json_filename)
-    # --- END MODIFIED ---
 
     doc = DocxDocument()
-    doc.add_heading('Workflow Final Summary', level=0)
+    # Report Title
+    heading_paragraph = doc.add_heading('Workflow Final Summary', level=0)
+    if heading_paragraph.runs:
+        heading_paragraph.runs[0].bold = True
+
     doc.add_paragraph(f"User Goal: {state.get('user_input', 'N/A')}")
     doc.add_paragraph(f"Report Generated: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
-    doc.add_paragraph() # Add a blank line for spacing
+    doc.add_paragraph()
 
-    # --- Workflow Details Section ---
-    doc.add_heading("Workflow Details", level=1)
+    # --- Find the LATEST completed evaluation task for Detailed Assessment section ---
+    # We need the data and files from the MOST RECENT completed evaluation task.
+    latest_eval_task = None
+    print(f"Save Summary: Searching for latest completed evaluation task for Detailed Assessment section.")
 
-    if not state.get("tasks", []):
+    for task_idx in range(len(tasks) - 1, -1, -1): # Iterate backwards
+        task_eval_check = tasks[task_idx]
+        task_id_check = task_eval_check.get('task_id', f'task_at_idx_{task_idx}')
+        print(f"Save Summary: Checking task (ID: {task_id_check}, Agent: {task_eval_check.get('selected_agent')}, Status: {task_eval_check.get('status')}) for latest evaluation data.")
+
+        if task_eval_check.get("selected_agent") in ["SpecialEvaAgent", "FinalEvaAgent"] and \
+           task_eval_check.get("status") == "completed": # Ensure it's a completed evaluation task
+            print(f"Save Summary: Task {task_id_check} is a relevant completed evaluation task. Using it for evaluation data and charts.")
+            latest_eval_task = task_eval_check # Store the task
+            break # Found the latest completed evaluation task, exit loop
+
+
+    print(f"Save Summary: Found latest relevant eval task (if any): ID {latest_eval_task.get('task_id') if latest_eval_task else 'N/A'}")
+
+    # --- Start of Workflow Details Section ---
+    doc.add_heading("工作流程細節 (Workflow Details)", level=1)
+
+    if not tasks:
         doc.add_paragraph("No tasks were executed in this workflow.")
     else:
-        for i, task in enumerate(state.get("tasks", [])):
-            doc.add_heading(f"Task {i+1}: {task.get('description', 'N/A')}", level=2)
-            
-            p_objective = doc.add_paragraph()
-            p_objective.add_run("Objective: ").bold = True
-            p_objective.add_run(task.get('task_objective', 'N/A'))
+        completed_tasks_count = sum(1 for t in tasks if t.get("status") == "completed")
+        print(f"Save Summary Debug: Found {completed_tasks_count} completed tasks out of {len(tasks)} total for Workflow Details section.")
 
-            p_agent = doc.add_paragraph()
-            p_agent.add_run("Agent: ").bold = True
-            p_agent.add_run(task.get('selected_agent', 'N/A'))
+        for i, task in enumerate(tasks):
+            task_status = task.get("status", "N/A")
+            task_agent = task.get("selected_agent")
+            print(f"Save Summary Debug: Processing task {i+1}/{len(tasks)} for details, Status: {task_status}, Agent: {task_agent}")
 
-            p_status = doc.add_paragraph()
-            p_status.add_run("Status: ").bold = True
-            p_status.add_run(task.get('status', 'N/A'))
-            
-            doc.add_paragraph() # Spacing before outputs
+            # --- MODIFIED: Skip evaluation tasks from this main details list ---
+            # Their detailed assessment and charts will be handled in the dedicated section later.
+            if task_agent in ["SpecialEvaAgent", "FinalEvaAgent"]:
+                 print(f"Save Summary Debug: Skipping evaluation task {task.get('task_id', 'N/A')} from Workflow Details section.")
+                 continue # Skip to the next task
 
-            # --- Text Outputs ---
-            text_outputs_found = False
-            if task.get("outputs"):
-                for key, value in task["outputs"].items():
-                    if isinstance(value, str) and key not in ["mcp_internal_messages", "grounding_sources", "search_suggestions"]:
-                        if len(value) > 10: # Consider it significant text
-                            if not text_outputs_found:
-                                doc.add_heading("Key Text Outputs:", level=3)
-                                text_outputs_found = True
-                            
-                            doc.add_paragraph(f"{key.replace('_', ' ').title()}:", style='Intense Quote') # Or another style
-                            # For pre-formatted text or code-like output, consider a different approach
-                            # For now, just add as paragraph. User can reformat.
-                            doc.add_paragraph(value)
-                            doc.add_paragraph() # Spacing
 
-            # --- Files (Images, Videos, Models, Others) ---
-            if task.get("output_files"):
-                doc.add_heading("Associated Files:", level=3)
-                for file_info in task.get("output_files", []):
-                    original_path_str = file_info.get("path")
-                    file_description = file_info.get("description", Path(original_path_str).name if original_path_str else "N/A")
-                    file_type = file_info.get("type", "Unknown").lower()
-                    
-                    p_file = doc.add_paragraph()
-                    p_file.add_run(f"File: {file_description} ").bold = True
-                    p_file.add_run(f"(Type: {file_type.capitalize()})")
+            # Process non-evaluation tasks that are completed, failed, or max_retries_reached
+            if task_status in ["completed", "failed", "max_retries_reached"]:
+                # Use original task index for heading number
+                doc.add_heading(f"Task {i+1}: {task.get('description', 'N/A')}", level=2)
 
-                    if original_path_str and Path(original_path_str).exists():
-                        # Copy file to report directory for easier access if needed
-                        # This makes the Word doc more self-contained with its assets if user wants to keep them together
-                        try:
-                            asset_target_dir = final_summary_output_dir / "task_assets" / task.get('task_id', f"task_{i+1}")
-                            os.makedirs(asset_target_dir, exist_ok=True)
-                            
-                            original_file = Path(original_path_str)
-                            destination_file = asset_target_dir / original_file.name
-                            shutil.copy2(original_file, destination_file)
-                            
-                            # Add a hyperlink to the copied file (relative path might not work well in Word from different machines)
-                            # So, we'll just state where it's copied.
-                            # Users can also drag-and-drop images/videos into Word.
-                            p_file.add_run(f"\n  - Copied to: .\\task_assets\\{task.get('task_id', f'task_{i+1}')}\\{original_file.name}")
-                            # Add placeholder for direct embedding if image
-                            if "image" in file_type:
+                p_objective = doc.add_paragraph()
+                p_objective.add_run("Objective: ").bold = True
+                p_objective.add_run(task.get('task_objective', 'N/A'))
+
+                p_agent = doc.add_paragraph()
+                p_agent.add_run("Agent: ").bold = True
+                p_agent.add_run(task.get('selected_agent', 'N/A'))
+
+                p_status = doc.add_paragraph()
+                p_status.add_run("Status: ").bold = True
+                p_status.add_run(task_status)
+
+                doc.add_paragraph()
+
+                # Evaluation Criteria/Rubric (Still include for non-eval tasks if somehow present)
+                if task.get("evaluation") and isinstance(task["evaluation"], dict):
+                    specific_criteria = task["evaluation"].get("specific_criteria")
+                    is_specific_criteria_valid_and_not_default = (
+                        specific_criteria and
+                        isinstance(specific_criteria, str) and
+                        specific_criteria.strip() and
+                        specific_criteria.lower() not in [
+                            "default criteria apply / rubric not generated.",
+                            "default criteria apply / rubric not generated",
+                            "default criteria apply"
+                            ]
+                    )
+
+                    # Only add the heading if there's specific criteria or we will add the general explanation
+                    if is_specific_criteria_valid_and_not_default or True: # Always include general explanation
+                        doc.add_heading("Evaluation Criteria/Rubric:", level=3)
+
+                        if is_specific_criteria_valid_and_not_default:
+                            doc.add_paragraph(specific_criteria)
+                            doc.add_paragraph() # Add a paragraph break
+                            doc.add_paragraph().add_run("通用評估標準補充說明：").bold = True
+                        else:
+                            doc.add_paragraph("（以下為通用評估標準說明）").italic = True
+
+                        # Always add the hardcoded explanations
+                        # Cost-benefit explanation
+                        p_cost_title = doc.add_paragraph()
+                        p_cost_title.add_run("早期成本效益估算說明：").bold = True
+                        doc.add_paragraph(
+                            "有預算上限時：因為屬於前期成本概算，設定成本偏差閾值 ±50%計算得分。低於預算50%（即預算 * 0.5）因可能低於合理標的底價，視為1分；高於預算50%（即預算 * 1.5）因成本效益過低，亦視為1分。在預算 ±50%範圍內，成本越低（越接近預算 * 0.5），分數越高，呈線性關係。"
+                        )
+                        doc.add_paragraph(
+                            "無預算上限時：基於成本效率分數計算，通常將觀察到的成本範圍（例如從最低成本到最高成本）進行線性映射給分，成本越低，分數越高。"
+                        )
+                        doc.add_paragraph() # Spacer
+
+                        # Green building explanation
+                        p_green_title = doc.add_paragraph()
+                        p_green_title.add_run("綠建築永續潛力估算說明：").bold = True
+                        doc.add_paragraph(
+                            "大致基於綠建築標章之主要評估指標（如生態、健康、節能、減廢等四大項）進行計分。潛力分數的計算方式可能為各指標預期得分的加權總和，再轉換為0-10分制（例如，總達成率百分比除以10）。"
+                        )
+                        doc.add_paragraph(
+                            "此潛力分數可對應至業界常見的綠建築評級潛力：3分以下約為合格級；3-6分約為銅級；6-8分約為銀級；8-9.5分約為黃金級；9.5分以上則具備鑽石級潛力。"
+                        )
+                        doc.add_paragraph()
+                # --- END MODIFICATION (Adjusted check for heading) ---
+
+
+                text_outputs_found = False
+                if task.get("outputs"):
+                    for key, value in task["outputs"].items():
+                        # Exclude evaluation-specific keys from standard text outputs
+                        if isinstance(value, str) and key not in ["mcp_internal_messages", "grounding_sources", "search_suggestions", "radar_chart_path", "detailed_option_scores", "detailed_assessment", "assessment", "feedback_llm_overall", "final_llm_feedback_overall"]:
+                            if len(value) > 10: # Only include meaningful text outputs
+                                if not text_outputs_found:
+                                    doc.add_heading("關鍵文字輸出 (Key Text Outputs):", level=3) # Modified heading
+                                    text_outputs_found = True
+
+                                doc.add_paragraph(f"{key.replace('_', ' ').title()}:", style='Intense Quote')
+                                doc.add_paragraph(value)
+                                doc.add_paragraph()
+
+
+                if task.get("output_files"):
+                    # Modified heading text
+                    doc.add_heading("關聯檔案 (Associated Files):", level=3)
+                    files_processed = 0
+
+                    for file_info in task.get("output_files", []):
+                        if not isinstance(file_info, dict):
+                            print(f"Save Summary Warning: Skipping non-dict file_info in Task {i+1}: {file_info}")
+                            continue
+
+                        original_path_str = file_info.get("path")
+                        file_description = file_info.get("description", Path(original_path_str).name if original_path_str else "N/A")
+                        file_type = file_info.get("type", "Unknown").lower()
+                        file_filename = file_info.get("filename", Path(original_path_str).name if original_path_str else "N/A")
+
+                        # --- MODIFIED: Skip specific evaluation charts (radar, bar) from *any* task's file list ---
+                        # Use updated matching criteria
+                        is_eval_chart = False
+                        if original_path_str and Path(original_path_str).exists() and "image" in file_type:
+                             filename_lower = file_filename.lower() if file_filename else ""
+                             description_lower = file_description.lower() if file_description else ""
+                             # --- UPDATED MATCHING CRITERIA ---
+                             if "evaluation_radar" in filename_lower or "evaluation_stacked_bar" in filename_lower or \
+                                "radar_chart" in description_lower or "bar_chart" in description_lower: # Keep description check as fallback
+                                  is_eval_chart = True
+                                  print(f"Save Summary Debug: File {file_filename} identified as an evaluation chart.")
+
+                        if is_eval_chart:
+                            print(f"Save Summary: Skipping evaluation chart file {file_filename} in task details as it will be handled in the Detailed Assessment section.")
+                            continue # Skip this file in this section
+                        # --- END MODIFIED ---
+
+
+                        files_processed += 1
+                        # --- MODIFIED: Change file info display format ---
+                        # Create the first line: File: SourceAgent: ...; TaskDesc: ...; ImageNum: ...
+                        p_info_line1 = doc.add_paragraph()
+                        # Check if description contains agent/task info to avoid duplication
+                        source_agent = file_info.get("SourceAgent", "N/A")
+                        # Use TaskDescShort if available, otherwise fallback to full description
+                        task_desc_short = file_info.get("TaskDescShort", file_description) 
+                        image_num_info = file_info.get("ImageNum", "")
+                        image_num_display = f"; ImageNum: {image_num_info}" if image_num_info else ""
+
+                        # Construct the first line text
+                        info_line1_text = f"File: SourceAgent: {source_agent}; TaskDesc: {task_desc_short}{image_num_display}"
+                        p_info_line1.add_run(info_line1_text).bold = True
+
+                        # Create the second line: "檔案位置: [檔案路徑]"
+                        p_file_path = doc.add_paragraph()
+                        p_file_path.add_run("檔案位置 (File Path): ").bold = True # Modified text
+                        p_file_path.add_run(original_path_str if original_path_str else "N/A")
+
+                        # Create the third line (optional): Filename and Type if needed, or just add space
+                        p_file_details = doc.add_paragraph()
+                        # --- MODIFIED: Get the Run object and set properties on it ---
+                        run_file_details = p_file_details.add_run(f"(檔名: {file_filename}, 類型: {file_type.capitalize()})") # Get the Run object
+                        run_file_details.italic = True
+                        run_file_details.font.size = Pt(9) # Set font size on the Run object
+                        # --- END MODIFIED ---
+
+                        doc.add_paragraph() # Add space after the file info block
+                        # --- END MODIFIED ---
+
+
+                        if original_path_str:
+                             original_file_path = Path(original_path_str)
+                             if original_file_path.exists():
+                                print(f"Save Summary: Found file {file_filename} at {original_path_str}. Type: {file_type}")
+                                # Create task-specific asset directory *once* per task
+                                asset_target_dir = Path(final_summary_output_dir) / "task_assets" / task.get('task_id', f"task_{i+1}")
+                                os.makedirs(asset_target_dir, exist_ok=True)
+
                                 try:
-                                    doc.add_paragraph("  [Placeholder for image below - Please insert manually if needed]")
-                                    doc.add_picture(str(destination_file), width=Inches(4.0)) # Example width
-                                except Exception as img_e:
-                                     doc.add_paragraph(f"  [Could not automatically embed image: {img_e}]")
-                                     print(f"Warning: Could not embed image {destination_file}: {img_e}")
+                                    destination_file = asset_target_dir / original_file_path.name
+                                    print(f"Save Summary: Copying {original_file_path} to {destination_file}")
+                                    # Ensure parent directory exists for destination
+                                    destination_file.parent.mkdir(parents=True, exist_ok=True)
+                                    shutil.copy2(original_path_str, destination_file) # Use original_path_str for source
 
-                        except Exception as copy_e:
-                            print(f"Error copying asset {original_path_str} for Word report: {copy_e}")
-                            p_file.add_run(f"\n  - Original path: {original_path_str} (Error copying)")
-                        
-                        if "video" in file_type:
-                            doc.add_paragraph("  [Video file - Please link or embed manually if Word version supports it]")
-                        elif "model" in file_type:
-                             doc.add_paragraph("  [3D Model file - Path provided for external viewing]")
-                    elif original_path_str:
-                         p_file.add_run(f"\n  - Original path (file not found): {original_path_str}")
-                    else:
-                        p_file.add_run("\n  - Path not specified.")
-                    doc.add_paragraph() # Spacing
-            
-            if i < len(state.get("tasks", [])) - 1:
-                doc.add_page_break() # Add a page break between tasks if not the last one
+                                    # Removed the "Copied to" paragraph addition as requested previously
+                                    # doc.add_paragraph(f"  - Copied to: .\\task_assets\\{task.get('task_id', f'task_{i+1}')}\\{original_file_path.name}")
+                                    print(f"Save Summary: Successfully copied {file_filename}.")
 
-    # --- Footer or final notes ---
+                                    if "image" in file_type:
+                                        try:
+                                            print(f"Save Summary: Attempting to embed image {destination_file} directly for task file.")
+                                            doc.add_picture(str(destination_file), width=Inches(5.0))
+                                            print(f"Save Summary: Successfully embedded task image {file_filename} directly.")
+
+                                            # Keep the caption for embedded images
+                                            para_caption = doc.add_paragraph()
+                                            # Use file description for caption
+                                            run_caption = para_caption.add_run(f"圖: {file_description}") # Modified text
+                                            run_caption.italic = True
+                                            run_caption.font.size = Pt(9)
+                                            para_caption.alignment = WD_ALIGN_PARAGRAPH.CENTER
+                                            doc.add_paragraph()
+
+                                        except Exception as direct_embed_err:
+                                            print(f"Save Summary Error: Direct embedding of task image {destination_file} failed: {direct_embed_err}. Trying PIL.")
+                                            traceback.print_exc()
+                                            try:
+                                                from PIL import Image # Ensure PIL is imported if not already at top
+                                                img = Image.open(str(destination_file))
+                                                if img.mode == 'RGBA':
+                                                    rgb_img = Image.new('RGB', img.size, (255, 255, 255))
+                                                    rgb_img.paste(img, mask=img.split()[3])
+                                                    img = rgb_img
+                                                
+                                                temp_task_img_path = str(destination_file) + "_pil_temp.jpg"
+                                                img.save(temp_task_img_path, format='JPEG')
+                                                
+                                                doc.add_picture(temp_task_img_path, width=Inches(5.0))
+                                                print(f"Save Summary: Successfully embedded task image {file_filename} using PIL conversion.")
+
+                                                para_caption_pil = doc.add_paragraph()
+                                                run_caption_pil = para_caption_pil.add_run(f"圖: {file_description} (PIL 處理)") # Modified text
+                                                run_caption_pil.italic = True
+                                                run_caption_pil.font.size = Pt(9)
+                                                run_caption_pil.alignment = WD_ALIGN_PARAGRAPH.CENTER
+                                                doc.add_paragraph()
+                                            except Exception as pil_err_task:
+                                                print(f"Save Summary Error: PIL embedding of task image {destination_file} also failed: {pil_err_task}")
+                                                traceback.print_exc()
+                                                doc.add_paragraph(f"  [無法自動嵌入圖片 '{file_filename}': 直接嵌入與 PIL 處理皆失敗。錯誤: {pil_err_task}]") # Modified text
+                                                doc.add_paragraph()
+                                        
+                                    elif "video" in file_type:
+                                        # --- MODIFIED: Add logic to extract and embed video specific frames ---
+                                        print(f"Save Summary: File {file_filename} is a video. Attempting to extract frames at 12s and 18s.")
+                                        video_path = original_path_str # Use the original path to open the video
+                                        temp_frame_paths = [] # List to store temporary frame file paths
+
+                                        try:
+                                            # import cv2 # Moved import to top
+                                            vidcap = cv2.VideoCapture(video_path)
+                                            if not vidcap.isOpened():
+                                                print(f"Save Summary Warning: Could not open video file {video_path}")
+                                                doc.add_paragraph(f"  [無法打開影片檔案 '{file_filename}'] ([Could not open video file '{file_filename}'])")
+                                                doc.add_paragraph()
+                                            else:
+                                                fps = vidcap.get(cv2.CAP_PROP_FPS)
+                                                frame_count = int(vidcap.get(cv2.CAP_PROP_FRAME_COUNT))
+                                                duration = frame_count / fps if fps > 0 else 0
+
+                                                print(f"Save Summary Debug: Video {file_filename} - FPS: {fps}, Frame Count: {frame_count}, Duration: {duration:.2f}s")
+
+                                                # Define timestamps in seconds
+                                                timestamps_seconds = [12, 18]
+
+                                                for ts in timestamps_seconds:
+                                                    if duration > ts:
+                                                        # Calculate target frame number
+                                                        target_frame_number = int(ts * fps)
+                                                        print(f"Save Summary Debug: Attempting to capture frame at {ts}s (Frame number: {target_frame_number})")
+
+                                                        # Set video position to the target frame
+                                                        vidcap.set(cv2.CAP_PROP_POS_FRAMES, target_frame_number)
+
+                                                        # Read the frame
+                                                        success, image = vidcap.read()
+
+                                                        if success:
+                                                            # Save the frame as a temporary image file
+                                                            frame_filename = f"{Path(video_path).stem}_{ts}s.jpg"
+                                                            temp_dir = Path(final_summary_output_dir) / "temp"
+                                                            temp_dir.mkdir(parents=True, exist_ok=True)
+                                                            temp_frame_path = temp_dir / frame_filename
+                                                            
+                                                            # Ensure image is in BGR for saving (cv2.imwrite expects BGR)
+                                                            cv2.imwrite(str(temp_frame_path), image)
+                                                            temp_frame_paths.append(temp_frame_path) # Add to list for cleanup
+                                                            print(f"Save Summary: Successfully extracted and saved frame at {ts}s to {temp_frame_path}")
+
+                                                            # Embed the saved frame into the document
+                                                            try:
+                                                                print(f"Save Summary: Attempting to embed frame image {temp_frame_path}.")
+                                                                doc.add_picture(str(temp_frame_path), width=Inches(5.0)) # Adjust width as needed
+                                                                print(f"Save Summary: Successfully embedded frame image for {ts}s.")
+
+                                                                # Add caption
+                                                                para_caption = doc.add_paragraph()
+                                                                run_caption = para_caption.add_run(f"圖: 影片 '{file_filename}' 在 {ts} 秒的畫面 (Frame at {ts}s of video '{file_filename}')") # Modified text
+                                                                run_caption.italic = True
+                                                                run_caption.font.size = Pt(9)
+                                                                para_caption.alignment = WD_ALIGN_PARAGRAPH.CENTER
+                                                                doc.add_paragraph() # Add space
+
+                                                            except Exception as embed_frame_err:
+                                                                 print(f"Save Summary Error: Failed to embed frame from {ts}s ({temp_frame_path}): {embed_frame_err}")
+                                                                 traceback.print_exc()
+                                                                 doc.add_paragraph(f"  [無法自動嵌入影片 '{file_filename}' 在 {ts} 秒的畫面。錯誤: {embed_frame_err}] ([Could not automatically embed frame at {ts}s of video '{file_filename}'. Error: {embed_frame_err}]") # Modified text
+                                                                 doc.add_paragraph()
+
+                                                        else:
+                                                            print(f"Save Summary Warning: Could not read frame at {ts}s from video {file_filename}.")
+                                                            doc.add_paragraph(f"  [無法讀取影片 '{file_filename}' 在 {ts} 秒的畫面] ([Could not read frame at {ts}s of video '{file_filename}'])") # Modified text
+                                                            doc.add_paragraph()
+                                                    else:
+                                                         print(f"Save Summary Warning: Video {file_filename} is shorter than {ts}s ({duration:.2f}s). Skipping frame extraction at {ts}s.")
+                                                         doc.add_paragraph(f"  [影片 '{file_filename}' 時長不足 {ts} 秒，無法擷取該時間點畫面] ([Video '{file_filename}' is shorter than {ts}s, cannot extract frame at this time])") # Modified text
+                                                         doc.add_paragraph()
+
+
+                                            vidcap.release() # Release the video capture object
+
+                                        except Exception as frame_extract_err:
+                                            print(f"Save Summary Error: Error extracting/embedding frames from video {file_filename}: {frame_extract_err}")
+                                            traceback.print_exc()
+                                            doc.add_paragraph(f"  [處理影片 '{file_filename}' 時發生錯誤：{frame_extract_err}] ([Error processing video '{file_filename}': {frame_extract_err}]") # Modified text
+                                            doc.add_paragraph()
+                                        finally:
+                                            # Clean up the temporary frame files
+                                            for temp_path in temp_frame_paths:
+                                                if temp_path.exists():
+                                                    try:
+                                                        temp_path.unlink()
+                                                        print(f"Save Summary: Cleaned up temporary frame file {temp_path}")
+                                                    except Exception as cleanup_err:
+                                                        print(f"Save Summary Warning: Failed to clean up temporary frame file {temp_path}: {cleanup_err}")
+                                        # --- END MODIFIED ---
+
+                                        # Add the note about the original video file being copied
+                                        doc.add_paragraph("  [影片檔案已複製 - 請至 task_assets 資料夾觀看] (Video file copied - Please view externally from the task_assets folder)") # Modified text
+                                        doc.add_paragraph()
+
+                                    elif "model" in file_type or original_file_path.suffix.lower() in ['.glb', '.obj', '.fbx', '.stl']:
+                                        # Modified text for external viewing note
+                                        doc.add_paragraph("  [3D 模型檔案已複製 - 請至 task_assets 資料夾觀看] (3D Model file copied - Please view externally from the task_assets folder)") # Modified text
+                                        doc.add_paragraph()
+                                    else:
+                                         print(f"Save Summary: File type '{file_type}' not automatically embedded.")
+                                         # Modified text for file copied note
+                                         doc.add_paragraph(f"  [檔案類型 '{file_type}' 已複製 - 路徑已提供] (File type '{file_type}' copied - Path provided)") # Modified text
+                                         doc.add_paragraph()
+                                except Exception as copy_e:
+                                    print(f"Save Summary Error: Error copying asset {original_path_str} for Word report: {copy_e}")
+                                    traceback.print_exc()
+                                    # Modified error message
+                                    doc.add_paragraph(f"\n  - 原始路徑: {original_path_str} (複製錯誤: {copy_e}) (Original path: {original_path_str} (Error copying: {copy_e}))") # Modified text
+                                    doc.add_paragraph()
+                             else:
+                                 print(f"Save Summary Warning: File path does not exist: {original_path_str}")
+                                 # Modified warning message
+                                 doc.add_paragraph(f"\n  - 原始路徑 (檔案未找到): {original_path_str} (Original path (file not found): {original_path_str})") # Modified text
+                                 doc.add_paragraph()
+                        else:
+                            print(f"Save Summary Warning: File info dictionary missing 'path': {file_info}")
+                            # Modified warning message
+                            doc.add_paragraph("\n  - 檔案資訊缺少 'path' 欄位。(Path not specified in file info.)") # Modified text
+                            doc.add_paragraph()
+
+                    print(f"Save Summary Debug: Processed {files_processed} files for task {i+1}")
+
+
+                # Add page break after each non-evaluation task details section, unless the very last task is also non-eval.
+                # Check if the next task exists and is *not* an evaluation task.
+                # Also check if there are subsequent non-eval tasks
+                has_subsequent_non_eval_task = False
+                for j in range(i + 1, len(tasks)):
+                    if not (tasks[j].get("selected_agent") in ["SpecialEvaAgent", "FinalEvaAgent"]):
+                        has_subsequent_non_eval_task = True
+                        break
+
+                if has_subsequent_non_eval_task:
+                    doc.add_page_break()
+                 # No page break needed if it's the last non-eval task or the next task IS an eval task
+
+
+            # --- End of completed/failed/max_retries_reached block for non-eval tasks ---
+
+            else:
+                 # This covers 'pending', 'in_progress', or other unexpected statuses for non-eval tasks
+                 # or eval tasks that weren't completed. These aren't included in the summary details section.
+                 print(f"Save Summary Debug: Skipping task {i+1} with status '{task_status}' from Workflow Details section (or it's an eval task not completed).")
+
+
+    # --- Start of Detailed Assessment Results Section ---
+    # Modified heading text
+    doc.add_heading("詳細評估結果 (Detailed Assessment Results)", level=1)
+    detailed_assessment = None
+    eval_assessment_text = "N/A"
+    eval_feedback_text = "N/A"
+    eval_chart_files = [] # List to hold relevant chart file_info dicts
+
+    # Use the latest_eval_task found earlier
+    if latest_eval_task:
+        print(f"Save Summary: Processing latest eval task (ID: {latest_eval_task.get('task_id')}) for Detailed Assessment section.")
+        eval_data = latest_eval_task.get("evaluation", {})
+        # Prefer detailed_assessment, fallback to detailed_option_scores
+        detailed_assessment = eval_data.get("detailed_assessment") or eval_data.get("detailed_option_scores")
+        eval_assessment_text = eval_data.get("assessment", "N/A")
+        # Try multiple keys for overall feedback
+        eval_feedback_text = eval_data.get("final_llm_feedback_overall", eval_data.get("feedback_llm_overall", "N/A"))
+
+        # Find charts in this evaluation task's output_files
+        output_files_eval = latest_eval_task.get("output_files", [])
+        print(f"Save Summary: Checking {len(output_files_eval)} files in the latest eval task ({latest_eval_task.get('task_id')}) for charts.")
+        for f_info in output_files_eval:
+             if isinstance(f_info, dict):
+                  original_path_str = f_info.get("path")
+                  file_type = f_info.get("type", "Unknown").lower()
+                  file_filename = f_info.get("filename", Path(original_path_str).name if original_path_str else "")
+                  description_lower = f_info.get("description", "").lower()
+
+                  # Check if path exists and is an image, and filename/description indicates chart
+                  if original_path_str and Path(original_path_str).exists() and "image" in file_type:
+                       filename_lower = file_filename.lower()
+                       # --- UPDATED MATCHING CRITERIA ---
+                       if "evaluation_radar" in filename_lower or "evaluation_stacked_bar" in filename_lower or \
+                          "radar_chart" in description_lower or "bar_chart" in description_lower: # Keep description check as fallback
+                            eval_chart_files.append(f_info) # Add the whole file_info dict
+                            print(f"Save Summary Debug: Found an evaluation chart for Detailed Assessment section: {file_filename} (Path: {original_path_str}, Desc: {f_info.get('description')})")
+                       else:
+                            print(f"Save Summary Debug: File {file_filename} (Path: {original_path_str}, Type: {file_type}) is an image but not identified as an eval chart for this section.")
+
+    # --- Only add content to this section if we found detailed data OR charts ---
+    if detailed_assessment or eval_chart_files:
+        print(f"Save Summary: Adding Detailed Assessment content. Detailed data found: {bool(detailed_assessment)}, Charts found: {len(eval_chart_files)}")
+
+        # --- Add overall assessment and feedback before the detailed options/charts ---
+        doc.add_heading("整體評估與回饋摘要 (Overall Assessment and Feedback Summary):", level=2) # New heading
+
+        p_assessment = doc.add_paragraph()
+        p_assessment.add_run("整體評估 (Overall Assessment): ").bold = True
+        p_assessment.add_run(eval_assessment_text)
+
+        p_feedback = doc.add_paragraph()
+        p_feedback.add_run("整體 LLM 回饋 (Overall LLM Feedback): ").bold = True
+        p_feedback.add_run(eval_feedback_text)
+        doc.add_paragraph() # Spacer
+
+
+        if eval_chart_files: # Only add chart section if charts were found
+             # Add a heading for the charts section within Detailed Assessment
+             if detailed_assessment: # If detailed data was present, add this as a sub-heading
+                  doc.add_heading("評估圖表總覽 (Evaluation Charts Overview):", level=2)
+             else: # If no detailed data, this acts as the main content after the Level 1 heading
+                  # Keep level 2 heading for consistency within the section
+                  doc.add_heading("評估圖表總覽 (Evaluation Charts Overview):", level=2)
+
+             # Add explanatory text regardless of detailed data presence
+             doc.add_paragraph("以下圖表視覺化呈現了設計方案在各評估指標上的表現。")
+
+             # Sort charts if needed (e.g., radar first, then bars)
+             # Simple sort: radar charts first
+             eval_chart_files.sort(key=lambda x: 0 if "evaluation_radar" in x.get("filename", "").lower() else 1) # Use updated sorting key
+
+             print(f"Save Summary: Proceeding to embed {len(eval_chart_files)} charts.")
+             for chart_file_info in eval_chart_files:
+                  chart_path_str = chart_file_info.get("path")
+                  chart_filename = chart_file_info.get("filename", "N/A")
+                  chart_description = chart_file_info.get("description", chart_filename)
+
+                  # --- NEW: Add the three-line file info for the chart file itself ---
+                  if chart_path_str: # Only add file info if path exists
+                      print(f"Save Summary: Adding file info for chart {chart_filename}")
+                      p_chart_info_line1 = doc.add_paragraph()
+                      chart_source_agent = chart_file_info.get("SourceAgent", "N/A")
+                      chart_task_desc_short = chart_file_info.get("TaskDescShort", chart_description)
+                      chart_image_num_info = chart_file_info.get("ImageNum", "")
+                      chart_image_num_display = f"; ImageNum: {chart_image_num_info}" if chart_image_num_info else ""
+                      chart_info_line1_text = f"File: SourceAgent: {chart_source_agent}; TaskDesc: {chart_task_desc_short}{chart_image_num_display}"
+                      p_chart_info_line1.add_run(chart_info_line1_text).bold = True
+
+                      p_chart_file_path = doc.add_paragraph()
+                      p_chart_file_path.add_run("檔案位置 (File Path): ").bold = True
+                      p_chart_file_path.add_run(chart_path_str)
+
+                      p_chart_file_details = doc.add_paragraph()
+                      run_chart_file_details = p_chart_file_details.add_run(f"(檔名: {chart_filename}, 類型: Image/png)") # Assume charts are png
+                      run_chart_file_details.italic = True
+                      run_chart_file_details.font.size = Pt(9)
+                      doc.add_paragraph() # Space after chart file info
+                  # --- END NEW ---
+
+
+                  if chart_path_str and Path(chart_path_str).exists():
+                       print(f"Save Summary: Embedding evaluation chart: {chart_filename} from {chart_path_str}")
+                       try:
+                            # Copy chart to assets folder for consistency
+                            asset_target_dir = Path(final_summary_output_dir) / "eval_charts"
+                            os.makedirs(asset_target_dir, exist_ok=True)
+                            destination_chart_file = asset_target_dir / Path(chart_path_str).name
+                            # Ensure parent exists
+                            destination_chart_file.parent.mkdir(parents=True, exist_ok=True)
+                            shutil.copy2(chart_path_str, destination_chart_file)
+                            print(f"Save Summary: Copied chart to {destination_chart_file}")
+
+
+                            try:
+                                # Attempt to embed the chart image
+                                print(f"Save Summary: Attempting to embed chart image {destination_chart_file}.")
+                                # --- MODIFIED: Create paragraph for chart image and set alignment ---
+                                p_chart_image = doc.add_paragraph()
+                                run_chart_image = p_chart_image.add_run()
+                                run_chart_image.add_picture(str(destination_chart_file), width=Inches(6.0))
+                                p_chart_image.alignment = WD_ALIGN_PARAGRAPH.CENTER # Center the image paragraph
+                                # --- END MODIFIED ---
+                                print(f"Save Summary: Successfully embedded chart image {chart_filename} directly and centered.")
+
+                                # Add caption for the chart
+                                para_caption = doc.add_paragraph()
+                                # Use the file description for the caption
+                                run_caption = para_caption.add_run(f"圖: {chart_description}")
+                                run_caption.italic = True
+                                run_caption.font.size = Pt(9)
+                                para_caption.alignment = WD_ALIGN_PARAGRAPH.CENTER
+                                doc.add_paragraph() # Add space after image/caption
+
+                            except Exception as chart_embed_err:
+                                print(f"Save Summary Error: Direct embedding of chart image {destination_chart_file} failed: {chart_embed_err}. Trying PIL.")
+                                traceback.print_exc()
+                                try:
+                                    from PIL import Image # Ensure PIL is imported
+                                    img = Image.open(str(destination_chart_file))
+                                    if img.mode == 'RGBA':
+                                        rgb_img = Image.new('RGB', img.size, (255, 255, 255))
+                                        rgb_img.paste(img, mask=img.split()[3])
+                                        img = rgb_img
+
+                                    temp_chart_img_path = str(destination_chart_file) + "_pil_temp.jpg"
+                                    img.save(temp_chart_img_path, format='JPEG')
+
+                                    doc.add_picture(temp_chart_img_path, width=Inches(6.0))
+                                    print(f"Save Summary: Successfully embedded chart image {chart_filename} using PIL conversion.")
+
+                                    para_caption_pil = doc.add_paragraph()
+                                    run_caption_pil = para_caption_pil.add_run(f"圖: {chart_description} (PIL 處理)")
+                                    run_caption_pil.italic = True
+                                    run_caption_pil.font.size = Pt(9)
+                                    para_caption_pil.alignment = WD_ALIGN_PARAGRAPH.CENTER
+                                    doc.add_paragraph()
+
+                                except Exception as pil_chart_err:
+                                    print(f"Save Summary Error: PIL embedding of chart image {destination_chart_file} also failed: {pil_chart_err}")
+                                    traceback.print_exc()
+                                    doc.add_paragraph(f"  [無法自動嵌入圖表 '{chart_filename}': 直接嵌入與 PIL 處理皆失敗。錯誤: {pil_chart_err}] ([Could not automatically embed chart '{chart_filename}': Both direct and PIL failed. Error: {pil_chart_err}]")
+                                    doc.add_paragraph()
+
+                       except Exception as chart_copy_err:
+                            print(f"Save Summary Error: Error copying chart asset {chart_path_str} for Word report: {chart_copy_err}")
+                            traceback.print_exc()
+                            doc.add_paragraph(f"\n  [圖表檔案複製錯誤: {chart_copy_err}] (Chart file copy error: {chart_copy_err})")
+                            doc.add_paragraph()
+                  else:
+                       print(f"Save Summary Warning: Chart file path does not exist: {chart_path_str}")
+                       doc.add_paragraph(f"[圖表檔案未找到: {chart_filename} (路徑無效或不存在: {chart_path_str})] (Chart file not found: {chart_filename} (Invalid or non-existent path: {chart_path_str}))")
+                       doc.add_paragraph()
+
+        doc.add_paragraph() # Spacer after charts section
+
+
+        if detailed_assessment and isinstance(detailed_assessment, list): # Only add detailed scores if data exists
+            # --- Add Detailed Option Scores Table ---
+            # Add a page break before the detailed scores table IF charts were added before it
+            if eval_chart_files:
+                 doc.add_page_break()
+
+            doc.add_heading("各方案詳細評估分數 (Detailed Scores per Option):", level=2) # New heading
+
+            for option_data in detailed_assessment:
+                if isinstance(option_data, dict):
+                    option_id = option_data.get("option_id", "未知方案 (Unknown Option)") # Modified text
+                    doc.add_heading(f"方案: {option_id}", level=3) # Changed level to 3
+
+                    desc = option_data.get("description", "無可用描述 (No description available)") # Modified text
+                    p_desc = doc.add_paragraph()
+                    p_desc.add_run("描述 (Description): ").bold = True # Modified text
+                    p_desc.add_run(desc)
+
+                    doc.add_heading("分數 (Scores):", level=4) # Changed level to 4
+                    table = doc.add_table(rows=1, cols=2)
+                    table.style = 'Table Grid'
+                    hdr_cells = table.rows[0].cells
+                    hdr_cells[0].text = '評估標準 (Criteria)' # Modified text
+                    hdr_cells[1].text = '分數 (0-10) (Score (0-10))' # Modified text
+
+                    score_keys = [
+                        ("user_goal_responsiveness_score_final", "使用者目標響應度 (User Goal Responsiveness)"), # Modified text
+                        ("aesthetics_context_score_final", "美學與情境契合度 (Aesthetics & Context)"), # Modified text
+                        ("functionality_flexibility_score_final", "功能性與彈性 (Functionality & Flexibility)"), # Modified text
+                        ("durability_maintainability_score_final", "耐久性與可維護性 (Durability & Maintainability)"), # Modified text
+                        ("cost_efficiency_score_final", "成本效益 (Cost Efficiency)"), # Modified text
+                        ("green_building_score_final", "綠建築永續潛力 (Green Building Potential)") # Modified text
+                    ]
+
+                    for key, display_name in score_keys:
+                        row_cells = table.add_row().cells
+                        row_cells[0].text = display_name
+                        score_val = option_data.get(key)
+                        if isinstance(score_val, (int, float)):
+                            row_cells[1].text = f"{score_val:.1f}" if isinstance(score_val, float) else str(score_val)
+                        elif score_val is None:
+                            row_cells[1].text = "N/A"
+                        else:
+                            row_cells[1].text = str(score_val)
+
+                    rationale = option_data.get("scoring_rationale", "無詳細分數理由 (No detailed rationale available)") # Modified text
+                    doc.add_heading("分數理由 (Scoring Rationale):", level=4) # Changed level to 4
+                    doc.add_paragraph(rationale)
+                    doc.add_paragraph() # Spacer after each option
+
+        doc.add_page_break() # Add page break after the entire detailed assessment section if content was added
+
+
+    else: # No detailed assessment data AND no chart files found in the latest eval task
+        doc.add_paragraph("未在已完成的評估任務中找到詳細評估結果或相關圖表資料。(No detailed assessment data or related charts found in the completed evaluation tasks.)") # Modified text
+        print(f"Save Summary: No detailed assessment data or charts found to include in the Detailed Assessment section.")
+        doc.add_paragraph() # Add space even if empty
+        doc.add_page_break() # Add page break even if empty
+
+    # --- End of Detailed Assessment Results Section ---
+
+
     doc.add_paragraph()
-    doc.add_heading("End of Report", level=1)
-    # You could add a final summary or disclaimer here
+    # Modified heading text
+    doc.add_heading("報告結束 (End of Report)", level=1)
 
-    # --- Save the Word document ---
     try:
         doc.save(word_filepath)
         print(f"Final summary Word document saved to: {word_filepath}")
     except Exception as e:
         print(f"Error saving Word document: {e}")
-        # Fallback: try saving with a generic name if permission issues with timestamped name
+        traceback.print_exc()
         try:
             fallback_word_path = os.path.join(final_summary_output_dir, "Fallback_Summary.docx")
             doc.save(fallback_word_path)
@@ -1272,48 +1825,49 @@ def save_final_summary(state: WorkflowState) -> WorkflowState:
         except Exception as fe:
             print(f"Failed to save Word document with fallback name: {fe}")
 
-
-    # Save the full state as JSON for debugging or programmatic access
+    # ... (JSON saving logic remains the same) ...
     try:
-        # Create a serializable version of the state
         serializable_state = {}
         for key, value in state.items():
-            if key == "config": # Config can be complex, maybe exclude or simplify
+            if key == "config":
                 serializable_state[key] = "Configuration object (not fully serialized)"
-                # Or attempt to serialize parts of it if needed
-                # serializable_state[key] = {
-                #     "configurable": value.get('configurable', {}),
-                #     # "recursion_limit": value.get('recursion_limit') # etc.
-                # }
             elif isinstance(value, Path):
                 serializable_state[key] = str(value)
             elif key == "tasks" and isinstance(value, list):
                  serializable_state[key] = []
                  for task_item in value:
-                     if isinstance(task_item, dict): # Assuming TaskState is a TypedDict, so it's a dict
+                     if isinstance(task_item, dict):
                          s_task = {}
                          for t_key, t_val in task_item.items():
                              if t_key == "mcp_internal_messages" and isinstance(t_val, list):
-                                 # Already handled to be serializable in _update_task_state_after_tool
                                  s_task[t_key] = t_val
+                             elif t_key == "output_files" and isinstance(t_val, list): # Filter base64 from files before saving state
+                                 s_task[t_key] = []
+                                 for f_item in t_val:
+                                     if isinstance(f_item, dict):
+                                         f_copy = f_item.copy()
+                                         f_copy.pop("base64_data", None)
+                                         s_task[t_key].append(f_copy)
+                                     else:
+                                         s_task[t_key].append(f_item) # Should not happen
                              elif isinstance(t_val, (dict, list, str, int, float, bool, type(None))):
                                  s_task[t_key] = t_val
                              else:
                                  s_task[t_key] = f"<Non-serializable type: {type(t_val).__name__}>"
                          serializable_state[key].append(s_task)
-                     else: # Should not happen if tasks are TaskState
+                     else:
                          serializable_state[key].append(f"<Non-dict task item: {type(task_item).__name__}>")
             elif isinstance(value, (dict, list, str, int, float, bool, type(None))):
                 serializable_state[key] = value
             else:
                 serializable_state[key] = f"<Non-serializable type: {type(value).__name__}>"
 
+
         with open(json_filepath, 'w', encoding='utf-8') as f:
-            json.dump(serializable_state, f, indent=4, ensure_ascii=False, default=str) # Added default=str for safety
+            json.dump(serializable_state, f, indent=4, ensure_ascii=False, default=str)
         print(f"Final summary JSON state saved to: {json_filepath}")
     except Exception as e:
         print(f"Error saving JSON state: {e}")
-        # Fallback for JSON
         try:
             fallback_json_path = os.path.join(final_summary_output_dir, "Fallback_State.json")
             with open(fallback_json_path, 'w', encoding='utf-8') as f:
@@ -1323,13 +1877,11 @@ def save_final_summary(state: WorkflowState) -> WorkflowState:
             print(f"Failed to save JSON state with fallback name: {fe}")
 
 
-    # Update state with the path to the saved summary (optional)
-    updated_tasks = list(state.get("tasks", []))
-    if updated_tasks: # Check if there are any tasks to potentially update
-        # Add to the last task's output or create a new field in the state
-        # For simplicity, let's assume we can add it to the state directly
-        state["final_summary_word_path"] = word_filepath
-        state["final_summary_json_path"] = json_filepath
+    state["final_summary_word_path"] = word_filepath
+    state["final_summary_json_path"] = json_filepath
+
+    state["current_phase"] = "qa"
+    print(f"Final summary saved. Set current_phase to 'qa' for routing to QA loop.")
 
     return state
 

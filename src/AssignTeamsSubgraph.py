@@ -168,6 +168,13 @@ def _filter_base64_from_files(file_list: List[Dict[str, Any]]) -> List[Dict[str,
         filtered_list.append(filtered_dict)
     return filtered_list
 
+def _append_feedback(task: TaskState, feedback: str, node_name: str):
+    """Appends feedback to the task's feedback_log."""
+    current_log = task.get("feedback_log") or ""
+    prefix = f"[{node_name} Feedback]:"
+    # Append new feedback block
+    task["feedback_log"] = (current_log + f"\n{prefix}\n{feedback}").strip()
+
 def _update_task_state_after_tool(
     current_task: TaskState,
     outputs: Optional[Dict[str, Any]] = None,
@@ -195,9 +202,14 @@ def _update_task_state_after_tool(
             print(f"Merging MCP result into task outputs...")
             mcp_history = mcp_result.get("mcp_message_history")
             if mcp_history:
+                # --- MODIFIED: Truncate mcp_history to first 2 messages ---
+                truncated_history = mcp_history[:2]
+                print(f"  Original MCP history length: {len(mcp_history)}, Truncated to: {len(truncated_history)} messages for storage.")
+                # --- END MODIFICATION ---
+
                 # --- Make MCP History serializable before storing ---
                 serializable_history = []
-                for msg in mcp_history:
+                for msg in truncated_history: # Iterate over truncated_history
                      if isinstance(msg, BaseMessage):
                          # Convert BaseMessage to a serializable dict representation
                          try:
@@ -205,21 +217,29 @@ def _update_task_state_after_tool(
                               # Example simple representation:
                               msg_dict = {
                                    "type": msg.type,
-                                   "content": repr(msg.content)[:500] + "..." if len(repr(msg.content)) > 500 else repr(msg.content), # Use repr for safety
+                                   # --- MODIFIED: Ensure content is also truncated for display if it's very long ---
+                                   "content": (
+                                       (repr(msg.content)[:200] + "..." if len(repr(msg.content)) > 200 else repr(msg.content))
+                                       if msg.content else "[No Content]"
+                                   ),
                                    "additional_kwargs": msg.additional_kwargs,
                               }
                               if hasattr(msg, 'name'): msg_dict['name'] = msg.name
                               if hasattr(msg, 'tool_call_id'): msg_dict['tool_call_id'] = msg.tool_call_id
-                              if hasattr(msg, 'tool_calls'): msg_dict['tool_calls'] = msg.tool_calls # Might still contain unserializable parts if complex
+                              if hasattr(msg, 'tool_calls'): 
+                                  # Also truncate tool_calls representation if it's too verbose
+                                  tool_calls_repr = repr(msg.tool_calls)
+                                  msg_dict['tool_calls'] = tool_calls_repr[:200] + "..." if len(tool_calls_repr) > 200 else tool_calls_repr
                               serializable_history.append(msg_dict)
                          except Exception as msg_ser_err:
                               print(f"  Warning: Could not serialize message {type(msg)}: {msg_ser_err}")
                               serializable_history.append({"type": "serialization_error", "original_type": type(msg).__name__})
                      else:
                           serializable_history.append(msg) # Append if already serializable
+                # --- END MODIFICATION for content truncation ---
 
                 current_task["outputs"]["mcp_internal_messages"] = serializable_history
-                print(f"  Added {len(serializable_history)} messages from MCP internal history (serialized).")
+                print(f"  Added {len(serializable_history)} messages from MCP internal history (serialized and truncated).")
                 # --- End Serialization Fix ---
 
 
@@ -309,7 +329,7 @@ def _save_file(data: bytes, prefix: str, ext: str, is_binary: bool = True) -> Tu
     """Saves data to a file in OUTPUT_DIR. Needs implementation."""
     # WARNING: Dummy implementation. Needs proper file saving logic.
     try:
-        filename = f"{prefix}_{uuid.uuid4().hex[:8]}.{ext}"
+        filename = f"{prefix}_{uuid.uuid4().hex[:2]}.{ext}"
         # Use imported OUTPUT_DIR
         filepath = os.path.join(OUTPUT_DIR, filename)
         mode = "wb" if is_binary else "w"
@@ -353,291 +373,231 @@ def _save_tool_output_file(filename: str, cache_dir: str, mime_type: str, descri
 # --- Node: Prepare Tool Inputs (Modified for TypeError Fix) ---
 async def prepare_tool_inputs_node(state: WorkflowState, config: RunnableConfig) -> Dict[str, Any]:
     """
-    Uses LLM to prepare the 'task_inputs' field in the current TaskState.
-    Includes logic for Rhino, Pinterest, and OSM MCP Coordinators.
-    FIXED: Handles non-serializable 'mcp_internal_messages' during summary generation.
+    根據當前任務的需求，準備適合給 LLM (Agent) 思考或給工具使用的輸入。
+    這可能涉及從狀態中提取、格式化資訊，或生成給 LLM 的提示。
     """
     node_name = "Prepare Tool Inputs"
-    print(f"--- Running Node: {node_name} ---")
-    current_idx = state.get("current_task_index", -1)
-    tasks = [t.copy() for t in state.get("tasks", [])]
+    # Access tasks list from state directly to modify in place for current_task
+    tasks = [t.copy() for t in state['tasks']] # Create a copy to avoid modifying state directly before returning
+    current_idx = state['current_task_index']
+    if not (0 <= current_idx < len(tasks)):
+        print(f"Assign Subgraph Error ({node_name}): Invalid current_task_index {current_idx}")
+        # Set task as failed if index is valid range but still problematic
+        if 0 <= current_idx < len(tasks):
+             _set_task_failed(tasks[current_idx], f"Invalid current_task_index {current_idx}", node_name)
+        return {"tasks": tasks}
 
-    if current_idx < 0 or current_idx >= len(tasks):
-        print(f"{node_name} Error: Invalid task index {current_idx}.")
-        return {"tasks": state.get("tasks", []), "current_task": state.get("current_task")}
+    current_task = tasks[current_idx]
+    selected_agent = current_task.get('selected_agent')
+    print(f"--- Running Node: {node_name} for Task {current_idx} (Agent: {selected_agent}, Objective: {current_task.get('description')}) ---")
 
-    current_task = tasks[current_idx] # Work on the copy
-    selected_agent_name = current_task.get('selected_agent')
+    # Retrieve runtime configuration
+    runtime_config = config.get("configurable", {})
 
-    if not selected_agent_name:
-        prep_error = "Input Preparation Failed: No agent selected for the task."
-        _set_task_failed(current_task, prep_error, node_name)
+    # Determine which LLM to use (specific agent LLM or default)
+    aa_llm_config_params = runtime_config.get("aa_llm", {})
+    llm = initialize_llm(aa_llm_config_params, agent_name_for_default_lookup="assign_agent") # Use assign_agent config
+
+    prompt_template = None
+    prompt_template_name = "prepare_tool_inputs_prompt" # This is the name in config
+
+    # Get the prompt template string, prioritize runtime config
+    prompt_template_str = runtime_config.get("aa_prepare_tool_inputs_prompt") # Check runtime config first
+    if not prompt_template_str: # Fallback to static config
+         agent_cfg = config_manager.get_agent_config("assign_agent")
+         if agent_cfg and agent_cfg.prompts:
+             prompt_config_obj = agent_cfg.prompts.get(prompt_template_name) # Now prompt_template_name is "prepare_tool_inputs_prompt"
+             prompt_template = prompt_config_obj.template if prompt_config_obj else None
+         else:
+            prompt_template = None # Agent or prompts dict not found
+    else: # Use the string from runtime config
+         prompt_template = prompt_template_str
+
+
+    if not prompt_template:
+        err_msg = f"Missing required prompt template. Searched runtime key 'aa_prepare_tool_inputs_prompt' and static config key '{prompt_template_name}' for AssignAgent."
+        print(f"Assign Subgraph Error ({node_name}): {err_msg}")
+        _set_task_failed(current_task, err_msg, node_name)
         tasks[current_idx] = current_task
-        return {"tasks": tasks, "current_task": current_task.copy()}
+        return {"tasks": tasks} # Return updated tasks list
 
-    print(f"--- {node_name}: Preparing Inputs for Agent: {selected_agent_name} ---")
+    # Gather information for the prompt
+    user_input = state.get("user_input", "N/A")
+    # workflow_history = state.get("workflow_history", []) # Not directly used, aggregated_summary is built
+    previous_task_results = state.get("tasks", []) # Get the *actual* list from state to examine previous completed tasks
 
-    # --- Aggregation Logic ---
-    task_objective = current_task.get('task_objective', '')
-    task_description = current_task.get('description', '')
-    initial_plan_suggestion = current_task.get('task_inputs', {})
-    overall_goal = state.get('user_input', "N/A")
-    print(f"{node_name}: Aggregating outputs and files from previous tasks...")
-    aggregated_outputs = {}
-    aggregated_files_raw = []
-    aggregated_summary_parts = ["Workflow History Summary:"]
-    for i, task in enumerate(tasks[:current_idx]):
-        task_id = task.get("task_id", f"task_{i}")
-        task_desc = task.get('description', 'N/A')
-        task_status = task.get("status")
-        agent_used = task.get("selected_agent", "N/A")
-        objective = task.get("task_objective", "N/A")
-        error_log = task.get('error_log', 'N/A'); feedback_log = task.get('feedback_log', 'N/A')
-        error_log_summary = error_log[:100] + "..." if error_log else "N/A"
-        feedback_log_summary = feedback_log[:100] + "..." if feedback_log else "N/A"
-        aggregated_summary_parts.append(f"  Task {i} (ID: {task_id}, Agent: {agent_used}, Status: {task_status}): {task_desc} (Objective: {objective})")
-        aggregated_summary_parts.append(f"    Status: {task_status} - Error: {error_log_summary} Feedback: {feedback_log_summary}")
-        if task_status == "completed":
-            task_outputs = task.get("outputs")
-            if task_outputs:
-                # --- <<< 修改：過濾輸出以生成摘要 >>> ---
-                outputs_for_summary = task_outputs.copy()
-                outputs_for_summary.pop("mcp_internal_messages", None)
-                outputs_for_summary.pop("grounding_sources", None)
-                outputs_for_summary.pop("search_suggestions", None)
-                # --- <<< 結束修改 >>> ---
-                aggregated_outputs[task_id] = task_outputs # 儲存原始輸出
-                try:
-                    # 使用過濾後的字典生成摘要字串
-                    summary_outputs_json = json.dumps(outputs_for_summary, ensure_ascii=False, indent=None, default=str) # 添加 default=str
-                    aggregated_summary_parts.append(f"    Outputs: {summary_outputs_json[:500]}{'...' if len(summary_outputs_json)>500 else ''}") # 限制摘要長度
-                except Exception as e:
-                    print(f"    Warning: Could not JSON dump filtered outputs for task {task_id} summary: {e}. Skipping outputs in summary string.")
-                    aggregated_summary_parts.append(f"    Outputs: [Could not serialize - check logs for task {task_id}]")
-            task_files = task.get("output_files")
-            if task_files:
-                for file_dict in task_files:
-                     if 'source_task_id' not in file_dict: file_dict['source_task_id'] = task_id
-                aggregated_files_raw.extend(task_files); aggregated_summary_parts.append(f"    Files Generated: {[f.get('filename', 'N/A') for f in task_files]}")
-        elif task_status == "failed" or task_status == "max_retries_reached":
-             error_log = task.get('error_log', 'N/A'); feedback_log = task.get('feedback_log', 'N/A')
-             error_log_summary = error_log[:100] + "..." if error_log else "N/A"
-             feedback_log_summary = feedback_log[:100] + "..." if feedback_log else "N/A"
-             aggregated_summary_parts.append(f"    Status: {task_status} - Error: {error_log_summary} Feedback: {feedback_log_summary}")
-    filtered_aggregated_files = _filter_base64_from_files(aggregated_files_raw)
-    # --- MODIFIED: Use the aggregated_outputs dict (which contains original task outputs) for the final JSON string ---
+    # Summarize workflow history and previous task results (excluding the current task being prepared)
+    history_summary_parts = ["Workflow and Task History Summary (Aggregated Summary):"]
+    # Iterate through *all* tasks up to the current index to provide context
+    for i, task in enumerate(previous_task_results[:current_idx]):
+         task_id = task.get("task_id", f"task_{i}")
+         desc = task.get("description", "N/A")
+         agent = task.get("selected_agent", "N/A")
+         status = task.get("status", "N/A")
+         # error_log_summary = task.get("error_log", "N/A") # Not directly part of this summary text, but available for specific error_feedback
+         # Get file info without base64
+         output_files_filtered_summary = _filter_base64_from_files(task.get("output_files", []))
+
+         history_summary_parts.append(
+             f"  - Task {i} (ID: {task_id}): '{desc}' | Agent: {agent} | Status: {status}"
+         )
+         # Add outputs and files if task was completed
+         if status == "completed":
+              # Limit output size for history summary
+              outputs_summary_str = json.dumps(task.get("outputs", {}), ensure_ascii=False, default=str)[:200] + "..." if len(json.dumps(task.get("outputs", {}))) > 200 else json.dumps(task.get("outputs", {}))
+              files_summary_str = json.dumps(output_files_filtered_summary, ensure_ascii=False, default=str)[:200] + "..." if len(json.dumps(output_files_filtered_summary)) > 200 else json.dumps(output_files_filtered_summary)
+              history_summary_parts.append(f"    Outputs: {outputs_summary_str}")
+              history_summary_parts.append(f"    Output Files ({len(output_files_filtered_summary)}): {files_summary_str}")
+         elif status == "failed":
+              error_log_summary_str = (task.get("error_log", "N/A")[:200] + "...") if len(task.get("error_log", "N/A")) > 200 else task.get("error_log", "N/A")
+              history_summary_parts.append(f"    Error Log: {error_log_summary_str}")
+
+    prepared_history_summary = "\n".join(history_summary_parts)
+
+    # Get task-specific context
+    task_objective = current_task.get("task_objective", "N/A")
+    task_description = current_task.get("description", "N/A")
+    # task_parameters = current_task.get("parameters", {}) # Not directly used in default prompt
+    # task_input_files = current_task.get("input_files", []) # Not directly used in default prompt
+    # filtered_input_files_for_prompt = _filter_base64_from_files(task_input_files)
+
+
+    # Prepare filtered evaluation summary from the current task
+    evaluation_data = current_task.get("evaluation", {})
+    keys_to_keep_from_evaluation = [
+        "selected_option_identifier",
+        "assessment",
+        "feedback_llm_overall", # This was in your original code, but not in prompt's input_vars
+        "detailed_assessment", # This was in your original code, but not in prompt's input_vars
+        # Keys more aligned with typical evaluation output structure:
+        "assessment_type", "feedback", "improvement_suggestions", "detailed_option_scores"
+    ]
+    filtered_evaluation_data = {
+        key: evaluation_data.get(key)
+        for key in keys_to_keep_from_evaluation
+        if evaluation_data.get(key) is not None # Only include keys that are present and not None
+    }
+    latest_evaluation_results_json = json.dumps(filtered_evaluation_data, ensure_ascii=False, indent=2, default=str)
+
+    # Prepare aggregated outputs and files from PREVIOUSLY COMPLETED tasks for the prompt
+    aggregated_outputs_list_for_prompt = []
+    aggregated_files_list_for_prompt = []
+    for task in previous_task_results[:current_idx]: # Only tasks *before* the current one
+        if task.get("status") == "completed":
+            task_output_entry_for_prompt = {
+                "task_id": task.get("task_id"),
+                "task_description": task.get("description"),
+                "selected_agent": task.get("selected_agent"),
+                "outputs": task.get("outputs", {}),
+                "output_files_summary": _filter_base64_from_files(task.get("output_files", []))
+            }
+            aggregated_outputs_list_for_prompt.append(task_output_entry_for_prompt)
+            
+            for file_item in task.get("output_files", []):
+                file_copy = _filter_base64_from_files([file_item])[0] 
+                file_copy["source_task_id"] = task.get("task_id")
+                aggregated_files_list_for_prompt.append(file_copy)
+
+    aggregated_outputs_json_str = json.dumps(aggregated_outputs_list_for_prompt, ensure_ascii=False, default=str, indent=2)
+    aggregated_files_json_str = json.dumps(aggregated_files_list_for_prompt, ensure_ascii=False, default=str, indent=2)
+    
+    # error_feedback for the current task if it's a retry or has previous error context.
+    # The prompt variable "error_feedback" refers to "Context from Previous Attempt".
+    # This would typically be the error_log from the current task if it's being retried.
+    error_feedback_str = current_task.get("error_log", "N/A")
+
+
+    # Prepare prompt inputs for the LLM, matching input_variables for 'prepare_tool_inputs_prompt'
+    prompt_inputs = {
+        "selected_agent_name": selected_agent if selected_agent else "N/A",
+        "agent_description": agent_descriptions.get(selected_agent, "N/A") if selected_agent else "N/A",
+        "user_input": user_input,
+        "task_objective": task_objective,
+        "task_description": task_description,
+        "aggregated_summary": prepared_history_summary, # This is the text summary of workflow history
+        "aggregated_outputs_json": aggregated_outputs_json_str, # JSON string of previous outputs
+        "aggregated_files_json": aggregated_files_json_str, # JSON string of previous files
+        "error_feedback": error_feedback_str, # Error from previous attempt of this task
+        "llm_output_language": runtime_config.get("global_llm_output_language", LLM_OUTPUT_LANGUAGE_DEFAULT),
+        "user_budget_limit": state.get("user_budget_limit", None), # Pass None if not set
+        "latest_evaluation_results_json": latest_evaluation_results_json,
+    }
+
+    # Catch KeyError during format
     try:
-        aggregated_outputs_json = json.dumps(aggregated_outputs, ensure_ascii=False, default=lambda o: f"<Object {type(o).__name__}>", indent=2) # Use default handler for safety
-    except TypeError:
-         aggregated_outputs_json = json.dumps({"error": "Could not serialize aggregated outputs"}, ensure_ascii=False)
-    # --- END MODIFIED ---
-    aggregated_files_json = json.dumps(filtered_aggregated_files, ensure_ascii=False)
-    aggregated_summary_str = "\n".join(aggregated_summary_parts)
-    print(f"{node_name}: Aggregation complete. {len(aggregated_outputs)} output sets, {len(filtered_aggregated_files)} files (filtered).")
-    # --- End Aggregation Logic ---
-
-    error_feedback_str = "N/A (First Attempt)"
-    last_error = current_task.get('error_log')
-    last_feedback = current_task.get('feedback_log')
-    if last_error or last_feedback:
-        error_feedback_str = f"Context from Previous Attempt (Task {current_task['task_id']}):\nLast Error: {last_error or 'None'}\nLast Feedback/Analysis: {last_feedback or 'None'}"
-        print(f"{node_name}: Including feedback for retry:\n{error_feedback_str[:200]}...")
-
-    runtime_config = config["configurable"]
-    prep_llm_config_dict = runtime_config.get("aa_llm", {})
-    llm = initialize_llm(prep_llm_config_dict)
-    llm_output_language = runtime_config.get("global_llm_output_language", LLM_OUTPUT_LANGUAGE_DEFAULT)
-    agent_description = agent_descriptions.get(selected_agent_name, "No description available.")
-
-    # --- Updated Prompt Handling to use config_manager ---
-    prepare_inputs_prompt_template_str = None
-    aa_prompts_config = config_manager.get_agent_config("assign_agent").prompts
-    if aa_prompts_config:
-        prompt_config_obj = aa_prompts_config.get("prepare_tool_inputs_prompt")
-        if prompt_config_obj:
-            prepare_inputs_prompt_template_str = prompt_config_obj.template
-
-    if not prepare_inputs_prompt_template_str:
-        prep_error = "Input Preparation Failed: Missing 'prepare_tool_inputs_prompt' template!"
-        _set_task_failed(current_task, prep_error, node_name)
+        prep_prompt = prompt_template.format(**prompt_inputs)
+    except KeyError as ke:
+        err_msg = f"Formatting error (KeyError: {ke}). Check prompt template '{prompt_template_name}' and its input_variables. Missing key in prompt_inputs: '{ke}'."
+        print(f"Assign Subgraph Error ({node_name}): {err_msg}")
+        print(f"--- Problematic Prompt Template ('{prompt_template_name}') Content ---")
+        print(repr(prompt_template)) # Print the actual template string
+        print(f"--- Provided Inputs for .format() ---")
+        print(json.dumps(prompt_inputs, indent=2, ensure_ascii=False, default=str))
+        print(f"---------------------------------")
+        _set_task_failed(current_task, err_msg, node_name)
         tasks[current_idx] = current_task
-        return {"tasks": tasks, "current_task": current_task.copy()}
+        return {"tasks": tasks} # Return updated tasks list
 
+
+    print(f"  - Invoking LLM for tool input preparation...")
     try:
-        prompt_inputs = {
-            "selected_agent_name": selected_agent_name, "agent_description": agent_description,
-            "user_input": overall_goal, "task_objective": task_objective, "task_description": task_description,
-            "initial_plan_suggestion_json": json.dumps(initial_plan_suggestion, ensure_ascii=False, indent=2),
-            "aggregated_summary": aggregated_summary_str,
-            "aggregated_outputs_json": aggregated_outputs_json, # Use the potentially handled JSON string
-            "aggregated_files_json": aggregated_files_json, "error_feedback": error_feedback_str,
-            "llm_output_language": llm_output_language
-        }
-        required_format_keys = list(prompt_inputs.keys()) # Get keys dynamically
-        missing_format_keys = [key for key in required_format_keys if key not in prompt_inputs] # Should be empty now
-        if missing_format_keys: raise KeyError(f"Internal Error: Missing keys required for prompt formatting: {missing_format_keys}")
-
-        print(f"{node_name}: Formatting prompt '{prepare_inputs_prompt_template_str[:50]}...'")
-        prep_prompt = prepare_inputs_prompt_template_str.format(**prompt_inputs)
-        print(f"{node_name}: Invoking LLM for agent {selected_agent_name}...")
         prep_response = await llm.ainvoke(prep_prompt)
         prep_content = prep_response.content.strip()
 
-        if prep_content.startswith("```json"): prep_content = prep_content[7:-3].strip()
-        elif prep_content.startswith("```"): prep_content = prep_content[3:-3].strip()
+        # Clean potential markdown code block
+        if prep_content.startswith("```json"):
+            prep_content = prep_content[7:-3].strip()
+        elif prep_content.startswith("```"):
+             # Handle generic code blocks too, assuming JSON within
+            prep_content = prep_content[3:-3].strip()
 
+
+        # Attempt to parse the LLM's response as JSON
         try:
-            prepared_inputs = json.loads(prep_content)
-            if isinstance(prepared_inputs, dict) and "error" in prepared_inputs:
-                err_msg = f"Input Preparation Failed (LLM): {prepared_inputs['error']}"
-                _set_task_failed(current_task, err_msg, node_name)
-            elif not isinstance(prepared_inputs, dict):
-                err_msg = f"Input Prep Failed: LLM returned invalid format (expected dict). Content: {prep_content}"
-                _set_task_failed(current_task, err_msg, node_name)
-            else:
-                # --- Validation ---
-                agent_key_map = {
-                    "ArchRAGAgent": ["prompt"], "WebSearchAgent": ["prompt"],
-                    "ImageRecognitionAgent": ["image_paths", "prompt"], "VideoRecognitionAgent": ["video_paths", "prompt"],
-                    "ModelRenderAgent": ["outer_prompt", "image_inputs", "is_future_scenario"], # Updated keys
-                    "Generate3DAgent": ["image_path"],
-                    "ImageGenerationAgent": ["prompt"], # image_inputs is optional for ImageGenerationAgent
-                    "LLMTaskAgent": ["prompt"],
-                    "RhinoMCPCoordinator": ["user_request"],
-                    "PinterestMCPCoordinator": ["keyword"],
-                    "OSMMCPCoordinator": ["user_request"]
-                }
-                optional_keys = []
-                if selected_agent_name == "RhinoMCPCoordinator":
-                    optional_keys.append("initial_image_path")
-                elif selected_agent_name == "PinterestMCPCoordinator":
-                    optional_keys.append("limit")
-                elif selected_agent_name == "ImageGenerationAgent":
-                    optional_keys.append("i")
-                    optional_keys.append("image_inputs") # image_inputs is optional for ImageGenerationAgent
+            prepared_tool_inputs_dict = json.loads(prep_content) # Rename variable for clarity
+            # Validate the expected structure (at least check if it's a dictionary)
+            if isinstance(prepared_tool_inputs_dict, dict):
+                # Store the prepared inputs in the current task state UNDER 'task_inputs'
+                current_task["task_inputs"] = prepared_tool_inputs_dict # MODIFIED: Store under "task_inputs"
+                # Optionally log success
+                print(f"  - Tool inputs prepared successfully by LLM and stored in 'task_inputs'.")
+                # Add feedback to the task log
+                _append_feedback(current_task, "Tool inputs prepared and stored.", node_name)
 
-                missing_keys = []
-                invalid_paths = []
-                invalid_values = []
-
-                # Check required keys
-                required_keys = agent_key_map.get(selected_agent_name, [])
-                for key in required_keys:
-                    value = prepared_inputs.get(key)
-                    
-                    if key == "is_future_scenario" and selected_agent_name == "ModelRenderAgent":
-                        if value is None: # Must be explicitly true or false by the LLM
-                            missing_keys.append(key)
-                        elif not isinstance(value, bool):
-                            invalid_values.append(f"{key}: Value '{value}' is not a boolean (true/false).")
-                    elif key == "image_inputs" and selected_agent_name == "ModelRenderAgent":
-                        if value is None or not isinstance(value, list) or not value: # Must be a non-empty list
-                            missing_keys.append(key)
-                            if value is not None and isinstance(value,list) and not value :
-                                invalid_values.append(f"{key}: List cannot be empty for ModelRenderAgent.")
-                        elif not all(isinstance(item, str) for item in value):
-                             invalid_values.append(f"{key}: All items in list must be string paths.")
-                    elif value is None or (isinstance(value, str) and not value): # Check for empty strings for other required keys
-                        missing_keys.append(key)
-                    # If it's a list type other than image_inputs for ModelRenderAgent, and it's empty, it's missing
-                    elif isinstance(value, list) and not value and key not in ["image_inputs"]: # e.g. image_paths for ImageRecognitionAgent
-                        missing_keys.append(key)
-
-
-                # Check optional keys and validate if present
-                for key in optional_keys:
-                    value = prepared_inputs.get(key)
-                    if value is not None: # Only validate if present
-                        if key == "initial_image_path":
-                            if not isinstance(value, str) or not os.path.exists(value):
-                                invalid_paths.append(f"{key}: '{value}' (Optional path provided but not found or invalid type)")
-                        elif key == "limit":
-                            try: int(value)
-                            except (ValueError, TypeError): invalid_values.append(f"{key}: '{value}' (Must be integer)")
-                        elif key == "i" and selected_agent_name == "ImageGenerationAgent":
-                            try: prepared_inputs[key] = int(value)
-                            except (ValueError, TypeError): invalid_values.append(f"{key}: '{value}' (Must be int for ImageGenerationAgent)")
-                        elif key == "image_inputs" and selected_agent_name == "ImageGenerationAgent": # Optional image_inputs for ImageGen
-                             if not isinstance(value, list) or not all(isinstance(item, str) for item in value):
-                                 invalid_values.append(f"{key}: Optional input must be a list of string paths.")
-                             else: # Validate paths if list is provided
-                                 for item_idx, item_path in enumerate(value):
-                                     if not os.path.exists(item_path):
-                                        invalid_paths.append(f"{key}[{item_idx}]: Optional path '{item_path}' not found.")
-
-
-                # Perform general validation on present keys (that are not None)
-                for key, value in prepared_inputs.items():
-                    if value is None: continue
-
-                    if key in ["image_paths", "video_paths"] and isinstance(value, list): # For ImageRecognitionAgent, VideoRecognitionAgent
-                         if not value: # Empty list for a required path list is an error unless handled above
-                             if key in required_keys and key not in missing_keys: # If it wasn't caught as missing
-                                invalid_values.append(f"{key}: List is empty. Must provide at least one path.")
-                         for path_idx, path_val in enumerate(value):
-                             if not isinstance(path_val, str) or not os.path.exists(path_val):
-                                 invalid_paths.append(f"{key}[{path_idx}]: '{path_val}' (Path not found or invalid type)")
-                    elif key == "image_path" and isinstance(value, str) and key not in optional_keys: # For Generate3DAgent
-                         if not os.path.exists(value): invalid_paths.append(f"{key}: '{value}' (Path not found)")
-                    
-                    # Validation for ModelRenderAgent's image_inputs (paths inside the list)
-                    elif key == "image_inputs" and selected_agent_name == "ModelRenderAgent" and isinstance(value, list) and value: # Already checked for non-list or empty list
-                        for item_idx, item_path in enumerate(value):
-                            # Path existence check (can be more robust, checking cache/output dirs like before)
-                            # For now, a simple os.path.exists(), assuming LLM provides resolvable paths
-                            if not isinstance(item_path, str): # Should have been caught by LLM prompt, but good to double check
-                                if f"{key}[{item_idx}]" not in invalid_values : invalid_values.append(f"{key}[{item_idx}]: Item '{item_path}' is not a string path.")
-                                continue
-                            
-                            # Re-check path validation logic here, ensuring it matches the previous detailed one.
-                            # The current simple os.path.exists(item_path) might be too restrictive if paths are relative to cache.
-                            # Let's use the more comprehensive check:
-                            full_path_cache_item = os.path.join(RENDER_CACHE_DIR, os.path.basename(item_path))
-                            full_path_output_item = os.path.join(OUTPUT_DIR, os.path.basename(item_path))
-                            if not os.path.exists(item_path) and \
-                               not os.path.exists(full_path_cache_item) and \
-                               not os.path.exists(full_path_output_item):
-                                invalid_paths.append(f"{key}[{item_idx}]: '{item_path}' (Not found as absolute, in cache, or in output dir)")
-
-                    elif key == "is_future_scenario" and selected_agent_name == "ModelRenderAgent":
-                        if not isinstance(value, bool): # Already caught None, this catches non-bool
-                             if f"{key}: Value '{value}' is not a boolean (true/false)." not in invalid_values: # Avoid duplicates
-                                invalid_values.append(f"{key}: Value '{value}' is not a boolean (true/false).")
-                                
-                    elif key == "i" and selected_agent_name == "ImageGenerationAgent":
-                         pass # Already validated if present in optional_keys
-                    elif key in ["prompt", "outer_prompt", "user_request", "keyword"] and not isinstance(value, str): # outer_prompt for ModelRender
-                         invalid_values.append(f"{key}: Value must be a string.")
-
-                # Consolidate errors
-                unique_invalid_paths = list(set(invalid_paths))
-                unique_invalid_values = list(set(invalid_values))
-
-                if missing_keys or unique_invalid_paths or unique_invalid_values:
-                    error_parts = []
-                    if missing_keys: error_parts.append(f"Missing/empty required keys: {', '.join(missing_keys)}")
-                    if unique_invalid_paths: error_parts.append(f"Invalid/missing paths: {', '.join(unique_invalid_paths)}")
-                    if unique_invalid_values: error_parts.append(f"Invalid values: {', '.join(unique_invalid_values)}")
-                    validation_err_msg = f"Input Validation Failed for {selected_agent_name}: {'. '.join(error_parts)}. LLM Output: {json.dumps(prepared_inputs, ensure_ascii=False)}"
-                    _set_task_failed(current_task, validation_err_msg, node_name)
-                else:
-                    print(f"{node_name}: Inputs prepared and validated successfully: {list(prepared_inputs.keys())}")
-                    current_task["task_inputs"] = prepared_inputs
-                    current_task["error_log"] = None; current_task["feedback_log"] = None
+                # Update status to "in_progress" if it wasn't failed, to allow routing
+                if current_task.get("status") != "failed":
                     current_task["status"] = "in_progress"
 
-        except json.JSONDecodeError:
-            err_msg = f"Input Prep Failed: Could not parse LLM JSON response. Raw content: '{prep_content}'"
+            else:
+                err_msg = f"LLM returned valid JSON, but not a dictionary (type: {type(prepared_tool_inputs_dict)}). Raw content: '{prep_content}'" # Use new variable name
+                print(f"Assign Subgraph Error ({node_name}): {err_msg}")
+                _set_task_failed(current_task, err_msg, node_name)
+                _append_feedback(current_task, f"Failed to parse LLM response as dictionary: {err_msg}", node_name)
+
+        except json.JSONDecodeError as json_e:
+            err_msg = f"Could not parse LLM JSON response: {json_e}. Raw content: '{prep_content}'"
+            print(f"Assign Subgraph Error ({node_name}): {err_msg}")
             _set_task_failed(current_task, err_msg, node_name)
+            _append_feedback(current_task, f"Failed to parse LLM response as JSON: {err_msg}", node_name)
+        except Exception as e_parse:
+             err_msg = f"Unexpected error parsing LLM response: {e_parse}. Raw content: '{prep_content}'"
+             print(f"Assign Subgraph Error ({node_name}): {err_msg}")
+             traceback.print_exc()
+             _set_task_failed(current_task, err_msg, node_name)
+             _append_feedback(current_task, f"Unexpected error parsing LLM response: {err_msg}", node_name)
 
-    except KeyError as ke:
-         err_msg = f"Input Prep Failed: Formatting error, missing key {ke}."
-         traceback.print_exc(); _set_task_failed(current_task, err_msg, node_name)
-    except Exception as prep_e:
-        err_msg = f"Input Prep Failed: Unexpected error: {prep_e}"
-        traceback.print_exc(); _set_task_failed(current_task, err_msg, node_name)
 
+    except Exception as e_llm:
+        err_msg = f"LLM call failed during tool input preparation: {e_llm}"
+        print(f"Assign Subgraph Error ({node_name}): {err_msg}")
+        traceback.print_exc()
+        _set_task_failed(current_task, err_msg, node_name)
+        _append_feedback(current_task, f"LLM call failed: {err_msg}", node_name)
+
+
+    # Update the task in the state dictionary
     tasks[current_idx] = current_task
+    # Return the updated state parts
     return {"tasks": tasks, "current_task": current_task.copy()}
 
 
@@ -746,43 +706,31 @@ def run_rag_tool_node(state: WorkflowState, config: RunnableConfig) -> Dict[str,
 
 # --- run_image_gen_tool_node ---
 def run_image_gen_tool_node(state: WorkflowState, config: RunnableConfig) -> Dict[str, Any]:
-    """Executes the Image Generation tool based on task inputs."""
-    node_name = "Image Gen Node" # Shorter name for clarity
+    node_name = "Image Generation Tool"
     print(f"--- Running {node_name} (Unified Subgraph) ---")
     current_idx = state.get("current_task_index", -1)
     tasks = [t.copy() for t in state.get("tasks", [])]
     if current_idx < 0 or current_idx >= len(tasks): return {"tasks": state.get("tasks", [])}
 
     current_task = tasks[current_idx]
-    inputs = current_task.get("task_inputs")
+    task_inputs = current_task.get("task_inputs", {})
+    prompt = task_inputs.get("prompt", "Null")
+    image_count = task_inputs.get("i", 1)
     error_to_report = None
     output_files_list = []
     final_outputs = {}
 
     try:
-        if not inputs or not isinstance(inputs, dict):
+        if not task_inputs or not isinstance(task_inputs, dict):
             raise ValueError("Invalid or missing 'task_inputs'")
 
-        prompt = inputs.get("prompt")
-        if not prompt:
-            raise ValueError("Missing 'prompt' in task_inputs")
-
-        image_inputs = inputs.get("image_inputs") # Optional
-
-        # --- MODIFIED: Read 'i' for image count, default to 1 ---
-        image_count = inputs.get("i", 1)
-        if not isinstance(image_count, int) or image_count < 1:
-             print(f"  - Warning: Invalid 'i' value ({image_count}) in inputs. Defaulting to 1.")
-             image_count = 1
-        # --- END MODIFIED ---
-
-        print(f"{node_name}: Using prompt='{prompt[:50]}...', image_inputs: {'Provided' if image_inputs else 'None'}. Requesting i={image_count} image(s).") # Updated log
+        print(f"{node_name}: Using prompt='{prompt[:50]}...', image_inputs: {'Provided' if task_inputs.get('image_inputs') else 'None'}. Requesting i={image_count} image(s).") # Updated log
 
         # --- Call the tool, passing 'i' ---
         # Assuming generate_gemini_image is synchronous based on previous code
         tool_result = generate_gemini_image({
             "prompt": prompt,
-            "image_inputs": image_inputs or [],
+            "image_inputs": task_inputs.get("image_inputs") or [],
             "i": image_count # Pass 'i' instead of 'n'
         })
         # --- End Tool Call ---
@@ -818,35 +766,47 @@ def run_image_gen_tool_node(state: WorkflowState, config: RunnableConfig) -> Dic
 
         if tool_generated_files and isinstance(tool_generated_files, list):
             print(f"{node_name}: Tool reported {len(tool_generated_files)} generated files. Processing...")
-            # --- File processing loop remains the same ---
-            for file_idx, file_info in enumerate(tool_generated_files):
-                if not isinstance(file_info, dict):
-                     print(f"  - Warning: Item {file_idx} in generated_files is not a dictionary: {file_info}. Skipping.")
-                     continue
+            # --- File processing loop ---
+            for idx, file_info in enumerate(tool_generated_files):
                 filename = file_info.get("filename")
-                expected_path = file_info.get("path") # Assuming tool returns absolute path
-                file_type = file_info.get("type", "image/png") # Default type
-                # Add description indicating which image this is, using 'i' from input
-                description = file_info.get("description", f"Generated image {file_idx+1} of {image_count} for: {prompt[:30]}...")
+                file_type = file_info.get("file_type", "image/png") # Default to png
+                # original_description_from_tool = file_info.get("description", "Generated by tool") # Optional: if you need to keep tool's own description
 
-                if not filename or not expected_path:
-                     print(f"  - Warning: Invalid or missing 'filename' or 'path': {file_info}. Skipping.")
-                     continue
+                if not filename:
+                    print(f"  - Warning: Tool output missing filename. Skipping file.")
+                    continue
 
-                print(f"  - Checking path from tool: {expected_path}")
+                # Ensure the filename is just the name, not a path
+                filename = os.path.basename(filename)
+                expected_path = os.path.join(RENDER_CACHE_DIR, filename) # All tool outputs go to RENDER_CACHE_DIR
+
                 if os.path.exists(expected_path):
-                     print(f"  - File FOUND at path: {expected_path}")
-                     processed_file_info = {"filename": filename, "path": expected_path, "type": file_type, "description": description}
-                     # Add base64 encoding (remains the same)
-                     if file_type.startswith("image/"):
-                         try:
-                             with open(expected_path, "rb") as image_file: encoded_string = base64.b64encode(image_file.read()).decode('utf-8')
-                             processed_file_info["base64_data"] = f"data:{file_type};base64,{encoded_string}"
-                             print(f"    - Added base64 data URI for image: {filename}")
-                         except Exception as e: print(f"    - Warning: Could not read/encode image {expected_path}: {e}")
-                     output_files_list.append(processed_file_info)
+                    print(f"  - File FOUND at path: {expected_path}")
+                    
+                    # --- MODIFIED: Construct structured description ---
+                    structured_description = (
+                        f"SourceAgent: {current_task.get('selected_agent', 'ImageGenerationAgent')}; "
+                        f"TaskDesc: {current_task.get('description', 'N/A')}; "
+                        f"ImageNum: {idx + 1}/{image_count}"
+
+                    )
+                    processed_file_info = {
+                        "filename": filename,
+                        "path": expected_path,
+                        "type": file_type,
+                        "description": structured_description # Use new structured description
+                    }
+                    # --- END MODIFICATION ---
+
+                    # Add base64 encoding (remains the same)
+                    try:
+                        with open(expected_path, "rb") as image_file: encoded_string = base64.b64encode(image_file.read()).decode('utf-8')
+                        processed_file_info["base64_data"] = f"data:{file_type};base64,{encoded_string}"
+                        print(f"    - Added base64 data URI for image: {filename}")
+                    except Exception as e: print(f"    - Warning: Could not read/encode image {expected_path}: {e}")
+                    output_files_list.append(processed_file_info)
                 else:
-                     print(f"  - Warning: File '{filename}' reported by tool not found at path '{expected_path}'. Skipping.")
+                    print(f"  - Warning: File '{filename}' reported by tool not found at path '{expected_path}'. Skipping.")
             # --- End File processing loop ---
 
         elif not tool_generated_files:
@@ -946,25 +906,25 @@ def run_web_search_tool_node(state: WorkflowState, config: RunnableConfig) -> Di
 
 # --- MODIFIED: run_model_render_tool_node (now handles both photorealism and future simulation) ---
 def run_model_render_tool_node(state: WorkflowState, config: RunnableConfig) -> Dict[str, Any]:
-    node_name = "Model Render Node"
+    node_name = "Model Render Tool"
     print(f"--- Running {node_name} (Handles Photorealism & Future Simulation) ---")
     current_idx = state.get("current_task_index", -1)
     tasks = [t.copy() for t in state.get("tasks", [])]
     if current_idx < 0 or current_idx >= len(tasks): return {"tasks": state.get("tasks", [])}
     current_task = tasks[current_idx]
-    inputs = current_task.get("task_inputs")
+    task_inputs = current_task.get("task_inputs", {})
     error_to_report = None
     aggregated_output_files_list = []
     aggregated_generated_filenames = []
     final_outputs = {}
 
     try:
-        if not inputs or not isinstance(inputs, dict):
+        if not task_inputs or not isinstance(task_inputs, dict):
             raise ValueError("Invalid or missing 'task_inputs'")
 
-        initial_outer_prompt_context = inputs.get("outer_prompt") # This is the contextual prompt from prepare_tool_inputs
-        image_inputs_paths = inputs.get("image_inputs") # List of image paths, RENAMED from render_image_input
-        is_future_scenario = inputs.get("is_future_scenario", False) # Boolean flag
+        initial_outer_prompt_context = task_inputs.get("outer_prompt") # This is the contextual prompt from prepare_tool_inputs
+        image_inputs_paths = task_inputs.get("image_inputs") # List of image paths, RENAMED from render_image_input
+        is_future_scenario = task_inputs.get("is_future_scenario", False) # Boolean flag
 
         if not initial_outer_prompt_context:
             raise ValueError("Missing required input 'outer_prompt' (contextual prompt)")
@@ -1037,7 +997,10 @@ def run_model_render_tool_node(state: WorkflowState, config: RunnableConfig) -> 
                     output_filename_from_tool,
                     RENDER_CACHE_DIR, 
                     "image/png",
-                    f"{'Future simulation' if is_future_scenario else 'Model render'} for {os.path.basename(image_full_path)}: {refined_prompt_text[:30]}..."
+                    # 修改為結構化描述
+                    f"SourceAgent: {current_task.get('selected_agent', 'ModelRenderingAgent')}; "
+                    f"TaskDesc: {current_task.get('description', 'N/A')}; "
+                    f"RenderedView: {idx + 1}/{len(image_inputs_paths)}" # Simplified
                 )
                 if file_info:
                     aggregated_output_files_list.append(file_info)
@@ -1075,63 +1038,179 @@ def run_model_render_tool_node(state: WorkflowState, config: RunnableConfig) -> 
 
 # --- run_generate_3d_tool_node ---
 def run_generate_3d_tool_node(state: WorkflowState, config: RunnableConfig) -> Dict[str, Any]:
-    print("--- Running Generate 3D Tool Node (Unified Subgraph) ---")
+    node_name = "3D Model Generation Tool"
+    print(f"--- Running Node: {node_name} ---")
     current_idx = state.get("current_task_index", -1)
     tasks = [t.copy() for t in state.get("tasks", [])]
     if current_idx < 0 or current_idx >= len(tasks): return {"tasks": state.get("tasks", [])}
     current_task = tasks[current_idx]
-    inputs = current_task.get("task_inputs")
+    task_inputs = current_task.get("task_inputs", {}) # Get task_inputs
+
     error_to_report = None
     output_files_list = []
-    final_outputs = {}
+    final_outputs = {} # Store overall results, e.g., a list of generated file names
+
+    processed_files_summary = [] # To store a summary of what was generated for final_outputs
 
     try:
-        if not inputs or not isinstance(inputs, dict): raise ValueError("Invalid or missing 'task_inputs'")
-        image_path = inputs.get("image_path")
-        if not image_path: raise ValueError("Missing 'image_path'")
-        print(f"Generate 3D Node: Using image_path='{image_path}'")
+        # --- MODIFIED: 直接從 task_inputs 獲取 image_paths 或 image_path ---
+        input_image_paths = []
+        if "image_paths" in task_inputs and isinstance(task_inputs["image_paths"], list):
+            input_image_paths = task_inputs["image_paths"]
+            print(f"{node_name}: Found {len(input_image_paths)} image paths directly in 'task_inputs.image_paths'.")
+        elif "image_path" in task_inputs and isinstance(task_inputs["image_path"], str):
+            input_image_paths = [task_inputs["image_path"]]
+            print(f"{node_name}: Found single image path directly in 'task_inputs.image_path'.")
 
-        # --- <<< MODIFICATION START >>> ---
-        # Determine the correct directory where the generate_3D tool actually saves files.
-        # Based on execution logs, it saves directly to 'output/model_cache' relative to project root.
-        # Construct this path robustly.
-        # Assuming the script runs from the project root (e.g., /d:/MA system/LangGraph/).
+        # --- Removed the check for tool_parameters dictionary ---
+        # if not tool_parameters or not isinstance(tool_parameters, dict):
+        #     raise ValueError("Invalid or missing 'tool_parameters' in task_inputs")
+        # --- END MODIFIED ---
+
+        if not input_image_paths:
+            raise ValueError("Missing 'image_path' or 'image_paths' in task_inputs for 3D model generation.")
+
         actual_3d_save_dir = os.path.abspath(os.path.join("output", "model_cache"))
-        print(f"  Verifying 3D files in expected directory: {actual_3d_save_dir}")
-        # Create the directory if it doesn't exist, just in case.
         os.makedirs(actual_3d_save_dir, exist_ok=True)
-        # --- <<< MODIFICATION END >>> ---
+        print(f"  Ensuring 3D files will be saved/checked in directory: {actual_3d_save_dir}")
+
+        for idx, current_image_path in enumerate(input_image_paths):
+            if not current_image_path or not isinstance(current_image_path, str):
+                print(f"  - Warning: Invalid image path at index {idx}: {current_image_path}. Skipping.")
+                processed_files_summary.append({
+                    "input_image": current_image_path or "N/A", "status": "skipped_invalid_path",
+                    "model": None, "video": None
+                })
+                continue
+
+            # Check if path is relative and make it absolute if needed (assuming relative to OUTPUT_DIR)
+            # This part depends on how image_path is typically provided from previous tasks.
+            # For now, let's assume it's either absolute or relative to a common base like OUTPUT_DIR.
+            if not os.path.isabs(current_image_path):
+                resolved_image_path = os.path.join(OUTPUT_DIR, current_image_path) # Check against OUTPUT_DIR
+                if not os.path.exists(resolved_image_path): # Fallback to check if it's already in a cache dir
+                    resolved_image_path = os.path.join(RENDER_CACHE_DIR, current_image_path)
+                    if not os.path.exists(resolved_image_path):
+                         resolved_image_path = os.path.join(MODEL_CACHE_DIR, current_image_path)
+                         if not os.path.exists(resolved_image_path):
+                            resolved_image_path = current_image_path # Use as is if not found in common locations
+                current_image_path = os.path.abspath(resolved_image_path)
 
 
-        # Use imported tool
-        result = generate_3D({"image_path": image_path})
-        if isinstance(result, dict) and "error" in result: raise ValueError(f"Tool Error: {result['error']}")
-        if not isinstance(result, dict): raise ValueError(f"Tool returned unexpected result type: {type(result)}")
+            if not os.path.exists(current_image_path):
+                print(f"  - Warning: Input image path does not exist: {current_image_path}. Skipping for 3D gen.")
+                processed_files_summary.append({
+                    "input_image": current_image_path, "status": "skipped_not_found",
+                    "model": None, "video": None
+                })
+                continue
 
-        model_filename = result.get("model")
-        video_filename = result.get("video")
-        # --- <<< MODIFICATION START >>> ---
-        # Use the *actual_3d_save_dir* when calling the helper function, NOT MODEL_CACHE_DIR
-        if model_filename:
-            # Pass the determined actual save directory
-            file_info = _save_tool_output_file(model_filename, actual_3d_save_dir, "model/gltf-binary", f"3D model from {os.path.basename(image_path)}")
-            if file_info: output_files_list.append(file_info)
-        if video_filename:
-            # Pass the determined actual save directory
-            file_info = _save_tool_output_file(video_filename, actual_3d_save_dir, "video/mp4", f"Preview video from {os.path.basename(image_path)}")
-            if file_info: output_files_list.append(file_info)
-        # --- <<< MODIFICATION END >>> ---
+            print(f"\n  Processing input image {idx + 1}/{len(input_image_paths)}: '{current_image_path}'")
 
-        if not output_files_list: raise ValueError("Tool ran but produced no model or video file.")
-        final_outputs = {"model_filename": model_filename, "video_filename": video_filename}
+            try:
+                # --- MODIFIED: Ensure the tool call uses the absolute path ---
+                result = generate_3D({"image_path": current_image_path}) # Call tool for current image with resolved path
+                # --- END MODIFIED ---
 
-    except Exception as e:
+                if isinstance(result, dict) and "error" in result:
+                    print(f"    - Tool Error for image {current_image_path}: {result['error']}")
+                    processed_files_summary.append({
+                        "input_image": current_image_path, "status": "tool_error",
+                        "error_detail": result['error'], "model": None, "video": None
+                    })
+                    # Continue to next image, don't let one failure stop all
+                    if error_to_report is None: # Store first error
+                        error_to_report = ValueError(f"Tool error on {os.path.basename(current_image_path)}: {result['error']}")
+                    else: # Append subsequent errors
+                        error_to_report = ValueError(f"{str(error_to_report)}; Tool error on {os.path.basename(current_image_path)}: {result['error']}")
+                    continue
+                if not isinstance(result, dict):
+                    print(f"    - Tool returned unexpected result type for image {current_image_path}: {type(result)}")
+                    processed_files_summary.append({
+                        "input_image": current_image_path, "status": "unexpected_tool_result",
+                        "model": None, "video": None
+                    })
+                    if error_to_report is None:
+                        error_to_report = TypeError(f"Unexpected tool result on {os.path.basename(current_image_path)}")
+                    else:
+                        error_to_report = TypeError(f"{str(error_to_report)}; Unexpected tool result on {os.path.basename(current_image_path)}")
+                    continue
+
+                model_filename = result.get("model")
+                video_filename = result.get("video")
+                current_input_summary = {"input_image": current_image_path, "status": "processed", "model": None, "video": None}
+
+                if model_filename:
+                    structured_description = (
+                        f"SourceAgent: {current_task.get('selected_agent', '3DGenerationAgent')}; "
+                        f"TaskDesc: {current_task.get('description', 'N/A')}; "
+                        f"InputNum: {idx + 1}/{len(input_image_paths)}; "
+                        f"FileType: 3DModel"
+                    )
+                    # Ensure we pass the correct expected save directory
+                    file_info = _save_tool_output_file(model_filename, actual_3d_save_dir, "model/gltf-binary", structured_description)
+                    if file_info:
+                        output_files_list.append(file_info)
+                        current_input_summary["model"] = model_filename
+                        print(f"    - Saved 3D Model: {model_filename}")
+                    else:
+                        print(f"    - Warning: Could not save/process model file: {model_filename}")
+
+                if video_filename:
+                    structured_description = (
+                        f"SourceAgent: {current_task.get('selected_agent', '3DGenerationAgent')}; "
+                        f"TaskDesc: {current_task.get('description', 'N/A')}; "
+                        f"InputNum: {idx + 1}/{len(input_image_paths)}; "
+                        f"FileType: AnimationVideo"
+                    )
+                     # Ensure we pass the correct expected save directory
+                    file_info = _save_tool_output_file(video_filename, actual_3d_save_dir, "video/mp4", structured_description)
+                    if file_info:
+                        output_files_list.append(file_info)
+                        current_input_summary["video"] = video_filename
+                        print(f"    - Saved Animation Video: {video_filename}")
+                    else:
+                        print(f"    - Warning: Could not save/process video file: {video_filename}")
+                processed_files_summary.append(current_input_summary)
+
+            except Exception as e_inner: # Catch error during a single image processing
+                print(f"    - Error processing image {current_image_path}: {e_inner}")
+                traceback.print_exc()
+                processed_files_summary.append({
+                    "input_image": current_image_path, "status": "processing_exception",
+                    "error_detail": str(e_inner), "model": None, "video": None
+                })
+                if error_to_report is None:
+                    error_to_report = e_inner
+                else: # Append to existing error
+                    error_to_report = type(e_inner)(f"{str(error_to_report)}; Error on {os.path.basename(current_image_path)}: {str(e_inner)}")
+
+
+        # If no files generated AND there were inputs to process, AND no specific error yet
+        if not output_files_list and not error_to_report and input_image_paths:
+             error_to_report = ValueError(f"Tool processed {len(input_image_paths)} input(s) but produced no valid output files (models or videos). Check logs for individual image processing details.")
+        elif not output_files_list and not error_to_report and not input_image_paths:
+            # This case should be caught by the "Missing image_path" check earlier, but good fallback
+             error_to_report = ValueError("No input images were provided to the 3D generation tool.")
+
+
+        final_outputs["processed_images_summary"] = processed_files_summary
+        if output_files_list:
+             final_outputs["generated_file_count"] = len(output_files_list)
+
+
+    except Exception as e: # Catch errors in the node's setup or general logic
         error_to_report = e
-        final_outputs = None
-        output_files_list = None
-        traceback.print_exc() # Print traceback for debugging
+        final_outputs = {"error_message": str(e)}
+        # output_files_list remains as is (might be partially populated if error occurred mid-loop)
+        traceback.print_exc()
 
-    tasks[current_idx] = _update_task_state_after_tool(current_task, outputs=final_outputs, output_files=output_files_list, error=error_to_report)
+    tasks[current_idx] = _update_task_state_after_tool(
+        current_task,
+        outputs=final_outputs,
+        output_files=output_files_list, # Contains all successfully processed files
+        error=error_to_report
+    )
     return {"tasks": tasks, "current_task": tasks[current_idx].copy()}
 
 # --- run_video_recognition_tool_node ---
@@ -1205,187 +1284,287 @@ def run_image_recognition_tool_node(state: WorkflowState, config: RunnableConfig
 
 # --- run_rhino_mcp_node ---
 async def run_rhino_mcp_node(state: WorkflowState, config: RunnableConfig) -> Dict[str, Any]:
-    """
-    Executes a Rhino task using the MCP agent logic within this node.
-    Uses TaskState inputs and updates TaskState outputs/status.
-    Returns MCP message history (raw objects) and necessary file info.
-    """
-    node_name = "Rhino MCP Node"
+    node_name = "Rhino MCP Tool"
     print(f"--- Running Node: {node_name} ---")
-    current_idx = state.get("current_task_index", -1)
-    tasks = [t.copy() for t in state.get("tasks", [])]
-
-    if current_idx < 0 or current_idx >= len(tasks):
-        print(f"{node_name} Error: Invalid task index {current_idx}.")
-        return {"tasks": [t.copy() for t in state.get("tasks", [])], "current_task": state.get("current_task").copy() if state.get("current_task") else None}
+    tasks = [t.copy() for t in state['tasks']]
+    current_idx = state['current_task_index']
+    if not (0 <= current_idx < len(tasks)):
+        print(f"{node_name} Error: Invalid current_task_index {current_idx}")
+        # No task update here as current_task is not well-defined
+        return {"tasks": tasks} # Return original tasks
 
     current_task = tasks[current_idx]
-    task_inputs = current_task.get("task_inputs")
+    task_inputs = current_task.get("task_inputs", {})
+    if not isinstance(task_inputs, dict): # Ensure task_inputs is a dict
+        task_inputs = {}
+        print(f"{node_name} Warning: task_inputs was not a dict, defaulting to empty dict.")
+
     outer_error_to_report = None
-    final_mcp_outcome = None
-    mcp_loop_messages: List[BaseMessage] = [] # Store raw messages from the loop
+    output_files_list = []
+    mcp_errors = [] # Collect errors from MCP steps
+
+    # --- MODIFIED: Initialize screenshot counter for renaming ---
+    rhino_screenshot_counter = 0
+    # --- END MODIFICATION ---
+
+    # This local_mcp_state is for the internal loop of this node.
+    # It's distinct from the MCPAgentState used by mcp_test.py's graph.
+    local_mcp_state: Dict[str, Any] = {
+        "messages": [], # Will be populated with initial HumanMessage
+        "initial_request": task_inputs.get("user_request"),
+        "initial_image_path": task_inputs.get("initial_image_path"),
+        "target_mcp": "rhino", # Explicitly set for this node's purpose
+        # Fields to store results from the MCP loop relevant to file outputs
+        "saved_image_path": None, # Path of the LATEST image saved in an MCP step
+        "saved_image_data_uri": None,
+        "rhino_screenshot_counter": 0 # Counter specifically for screenshots processed by this node
+    }
+
+    # --- Build initial HumanMessage for the MCP graph ---
+    initial_human_content_parts = []
+    if local_mcp_state["initial_request"]:
+        initial_human_content_parts.append({"type": "text", "text": local_mcp_state["initial_request"]})
+    if local_mcp_state["initial_image_path"] and os.path.exists(local_mcp_state["initial_image_path"]):
+        try:
+            with open(local_mcp_state["initial_image_path"], "rb") as img_file:
+                img_bytes = img_file.read()
+            img_base64 = base64.b64encode(img_bytes).decode('utf-8')
+            mime_type = "image/png" # Default or detect
+            ext = os.path.splitext(local_mcp_state["initial_image_path"])[1].lower()
+            if ext in [".jpg", ".jpeg"]: mime_type = "image/jpeg"
+            initial_human_content_parts.append({
+                "type": "image_url",
+                "image_url": {"url": f"data:{mime_type};base64,{img_base64}"}
+            })
+        except Exception as e_img:
+            print(f"  Warning: Could not encode initial image for Rhino MCP: {e_img}")
+    if not initial_human_content_parts: # Must have some content
+        err_msg = "Rhino MCP node requires 'user_request' in task_inputs."
+        _set_task_failed(current_task, err_msg, node_name)
+        tasks[current_idx] = current_task
+        return {"tasks": tasks, "current_task": current_task.copy()}
+    local_mcp_state["messages"] = [HumanMessage(content=initial_human_content_parts)]
+    # --- End initial HumanMessage build ---
+
+    # --- MCP Graph (from mcp_test) Invocation ---
+    # The MCP graph from mcp_test.py is now compiled as `graph`
+    # We need to simulate its execution loop here, passing the `local_mcp_state`
+    # and getting back updates.
+
+    max_mcp_steps = 1000 # Max iterations for the MCP agent
+    mcp_final_outcome_for_task_update = {} # Store the final result from the MCP loop
 
     try:
-        # 1. Extract inputs (remains the same)
-        if not task_inputs or not isinstance(task_inputs, dict):
-            raise ValueError("Invalid or missing 'task_inputs' in the current task.")
-        user_request = task_inputs.get("user_request")
-        initial_image_path = task_inputs.get("initial_image_path") # Optional
+        # --- Get the compiled MCP graph (assuming it's globally available or passed) ---
+        # This assumes `graph` is the compiled StateGraph from mcp_test.py
+        # For direct use here, you'd typically import `graph` from `mcp_test`
+        # from src.mcp_test import mcp_graph # Or whatever it's named
+        # For this example, let's assume `mcp_graph_instance` is available
+        # If mcp_test.py exposes `graph` directly:
+        from src.mcp_test import graph as rhino_mcp_instance, MCPAgentState as InternalMCPAgentState
 
-        if not user_request:
-            raise ValueError("Missing 'user_request' in task_inputs for RhinoMCPCoordinator")
-
-        print(f"{node_name}: Starting MCP task for request: '{user_request[:100]}...'")
-        if initial_image_path: print(f"  with initial image: {initial_image_path}")
-
-        # 2. Construct Initial *Local* MCP State (remains the same)
-        local_mcp_state: Dict[str, Any] = { # Use Dict for flexibility
-            "messages": [],
-            "initial_request": user_request,
-            "initial_image_path": initial_image_path,
-            "target_mcp": "rhino",
+        # The state for the internal MCP graph needs to be compatible with MCPAgentState
+        internal_mcp_graph_state: InternalMCPAgentState = {
+            "messages": local_mcp_state["messages"],
+            "initial_request": local_mcp_state["initial_request"],
+            "initial_image_path": local_mcp_state["initial_image_path"],
+            "target_mcp": "rhino", # Fixed for this context
             "task_complete": False,
             "saved_image_path": None,
-            "saved_image_data_uri": None
+            "saved_image_data_uri": None,
+            "consecutive_llm_text_responses": 0,
+            "rhino_screenshot_counter": 0, # Initialize counter for the internal graph
+            # {{ edit_1 }}
+            "last_executed_node": None
+            # {{ end_edit_1 }}
         }
-        initial_human_content = [{"type": "text", "text": user_request}]
-        if initial_image_path and os.path.exists(initial_image_path):
-            try:
-                with open(initial_image_path, "rb") as img_file: img_bytes = img_file.read()
-                img_base64 = base64.b64encode(img_bytes).decode('utf-8')
-                mime_type = "image/png" # Default
-                ext = os.path.splitext(initial_image_path)[1].lower()
-                if ext in [".jpg", ".jpeg"]: mime_type = "image/jpeg"
-                elif ext == ".gif": mime_type = "image/gif"
-                elif ext == ".webp": mime_type = "image/webp"
-                initial_human_content.append({
-                    "type": "image_url",
-                    "image_url": {"url": f"data:{mime_type};base64,{img_base64}"}
-                })
-                print(f"  Successfully encoded initial image ({mime_type}) for local MCP state.")
-            except Exception as img_err:
-                print(f"  Warning: Failed to read/encode initial image {initial_image_path} for local MCP state: {img_err}")
-        local_mcp_state["messages"] = [HumanMessage(content=initial_human_content)]
+        
+        print(f"  Starting Rhino MCP internal graph execution... Max steps: {max_mcp_steps}")
+        final_internal_mcp_state = None
 
-        # 3. Run Internal MCP Loop (logic remains mostly the same)
-        max_mcp_steps = 1000
-        step_count = 0
-        mcp_loop_error = None
-        while step_count < max_mcp_steps:
-            step_count += 1
-            print(f"\n{node_name}: --- MCP Internal Loop Step {step_count} ---")
-            # Add raw messages to history *before* the next step
-            mcp_loop_messages.extend(local_mcp_state.get("messages", [])) # Extend history with raw objects
-            local_mcp_state["messages"] = [] # Clear messages for the next step's output
+        # --- Main MCP Loop using the imported graph ---
+        for step_config in rhino_mcp_instance.stream(internal_mcp_graph_state, config=config, stream_mode="values"):
+            # step_config is a dictionary where keys are node names and values are their outputs
+            # We are interested in the full state after each step to extract output_definitions
+            # The 'values' stream_mode gives us the full state after each node that has executed.
+            
+            print(f"  Rhino MCP Internal Step Output Keys: {list(step_config.keys())}")
+            
+            # The complete state of the internal MCP graph is usually the value of the last executed node
+            # or a specific key if the graph is structured to output its full state under one key.
+            # For a standard StateGraph, the output of stream_mode="values" is a dict where each key
+            # is a node that ran in that step, and its value is that node's output.
+            # We need the *final state* of the internal graph after a node runs.
+            # LangGraph typically returns the full state if the stream outputs are iterated.
+            # The `step_config` here IS the full state if `stream_mode="values"` is used on the compiled graph.
+            
+            final_internal_mcp_state = step_config # The 'step_config' is the entire state dict
+            
+            # Extract messages for history
+            # local_mcp_state["messages"].extend(final_internal_mcp_state.get("messages", [])) # This appends to outer history
+            
+            # --- Process output definitions from current MCP step ---
+            # Output definitions are usually part of an AIMessage's tool_calls or a specific field
+            # in the agent's response. This needs to be consistent with how `call_rhino_agent` structures its output.
+            # Assuming output_definitions are in the AIMessage content or additional_kwargs:
+            last_ai_message = next((m for m in reversed(final_internal_mcp_state.get("messages",[])) if isinstance(m, AIMessage)), None)
+            mcp_step_config_from_ai = {}
+            if last_ai_message:
+                if isinstance(last_ai_message.content, str) and last_ai_message.content.startswith("{"): # JSON in content
+                    try: mcp_step_config_from_ai = json.loads(last_ai_message.content)
+                    except: pass
+                if not mcp_step_config_from_ai and last_ai_message.additional_kwargs: # Check kwargs
+                    mcp_step_config_from_ai = last_ai_message.additional_kwargs.get("configuration", {}) # Example key
 
-            # --- Routing logic (remains the same, including passing target_mcp) ---
-            if step_count == 1:
-                next_step = "rhino_agent"
-                print(f"  First step: Directly routing to {next_step}")
-            else:
-                temp_state_for_should_continue = {
-                    "messages": mcp_loop_messages,
-                    "target_mcp": "rhino"
-                }
-                next_step = mcp_should_continue(temp_state_for_should_continue)
-                print(f"  mcp_should_continue result: {next_step}")
+            current_step_output_defs = mcp_step_config_from_ai.get("output_definitions", [])
+            
+            # --- MODIFICATION: Renaming and processing output files ---
+            if current_step_output_defs:
+                print(f"  - Rhino MCP Step Output Definitions: {len(current_step_output_defs)}")
+                for idx, output_def in enumerate(current_step_output_defs):
+                    is_image_output = output_def.get("mime_type", "").startswith("image/")
+                    
+                    # Path handling:
+                    # For images from capture_focused_view, the actual path comes from internal_mcp_graph_state["saved_image_path"]
+                    # which would have been renamed by mcp_test.py's agent_node_logic.
+                    # For other files, it's from output_def.get("file_path")
+                    
+                    path_for_entry = None
+                    filename_for_entry = None
+                    current_file_description_parts = [
+                        f"SourceAgent: {current_task.get('selected_agent', 'RhinoMCPAgent')}",
+                        f"TaskDesc: {current_task.get('description', 'N/A')}"
+                    ]
+                    planned_name_from_def = output_def.get('name', f"Output{idx+1}")
 
+                    if is_image_output:
+                        # This image was presumably saved by a tool like capture_focused_view,
+                        # and its path (already renamed with a counter from mcp_test.py) is in final_internal_mcp_state.
+                        img_path_from_internal_state = final_internal_mcp_state.get("saved_image_path")
+                        internal_counter_val = final_internal_mcp_state.get("rhino_screenshot_counter", 0)
 
-            if next_step == END:
-                print(f"{node_name}: MCP loop finished based on should_continue.")
+                        if img_path_from_internal_state and os.path.exists(img_path_from_internal_state):
+                            path_for_entry = img_path_from_internal_state
+                            filename_for_entry = os.path.basename(img_path_from_internal_state)
+                            # The filename already includes the counter from mcp_test.py
+                            current_file_description_parts.append(f"ScreenshotNumFromTool: {internal_counter_val}")
+                            current_file_description_parts.append(f"FileName: {filename_for_entry}")
+                            current_file_description_parts.append(f"PlannedName: {planned_name_from_def}")
+                            print(f"    - Processing Screenshot (from internal state): {filename_for_entry}, Path: {path_for_entry}")
+                        else:
+                            # Fallback if saved_image_path from internal state is missing/invalid
+                            mcp_errors.append(f"Rhino Agent planned image output '{planned_name_from_def}' but actual file from internal state ('{img_path_from_internal_state}') not found.")
+                            print(f"    - Warning: Planned image output '{planned_name_from_def}' but file from internal state ('{img_path_from_internal_state}') not found.")
+                            # Optionally, try to use planned_file_output_path if it exists, but it's unlikely for screenshots
+                            planned_file_output_path = output_def.get("file_path")
+                            if planned_file_output_path:
+                                 abs_planned_path = os.path.join(OUTPUT_DIR, planned_file_output_path) # Adjust base dir as needed
+                                 if os.path.exists(abs_planned_path):
+                                     path_for_entry = abs_planned_path
+                                     filename_for_entry = os.path.basename(abs_planned_path)
+                                     current_file_description_parts.append(f"File: {filename_for_entry} (from planned path)")
+                                 else:
+                                     continue # Skip if no actual file found
+                            else:
+                                continue # Skip if no actual file found
+                    else: # Non-image file definition
+                        file_output_path = output_def.get("file_path")
+                        if file_output_path:
+                            abs_file_output_path = os.path.join(OUTPUT_DIR, file_output_path) # Adjust base dir
+                            if not os.path.isabs(file_output_path):
+                                if not os.path.exists(abs_file_output_path) and os.path.exists(os.path.join(RENDER_CACHE_DIR, file_output_path)):
+                                    abs_file_output_path = os.path.join(RENDER_CACHE_DIR, file_output_path)
+                                elif not os.path.exists(abs_file_output_path) and os.path.exists(os.path.join(MODEL_CACHE_DIR, file_output_path)):
+                                    abs_file_output_path = os.path.join(MODEL_CACHE_DIR, file_output_path)
+                            else:
+                                abs_file_output_path = file_output_path
+                            
+                            if os.path.exists(abs_file_output_path):
+                                path_for_entry = abs_file_output_path
+                                filename_for_entry = os.path.basename(abs_file_output_path)
+                                file_type_simple = output_def.get('type', 'File').capitalize()
+                                current_file_description_parts.append(f"OutputType: {file_type_simple}_{planned_name_from_def}")
+                                print(f"    - Processing Other File: {filename_for_entry}, Path: {path_for_entry}")
+                            else:
+                                mcp_errors.append(f"Rhino Agent planned output file '{file_output_path}' not found at '{abs_file_output_path}'.")
+                                print(f"    - Warning: Planned output file '{file_output_path}' not found at '{abs_file_output_path}'.")
+                                continue # Skip if no actual file found
+                        else:
+                            print(f"    - Info: Output definition {idx+1} did not specify a 'file_path'.")
+                            continue # Skip if no path
+
+                    if path_for_entry and filename_for_entry:
+                        file_type = output_def.get("mime_type", "application/octet-stream")
+                        add_base64 = output_def.get("encode_base64", False)
+                        
+                        structured_description = "; ".join(current_file_description_parts)
+                        file_entry = {
+                            "filename": filename_for_entry,
+                            "path": path_for_entry,
+                            "type": file_type,
+                            "description": structured_description
+                        }
+                        if add_base64:
+                            try:
+                                with open(path_for_entry, "rb") as f_content:
+                                    encoded_string = base64.b64encode(f_content.read()).decode('utf-8')
+                                file_entry["base64_data"] = f"data:{file_type};base64,{encoded_string}"
+                            except Exception as e_b64:
+                                print(f"      - Warning: Could not read/encode Rhino output file {path_for_entry} for base64: {e_b64}")
+                        output_files_list.append(file_entry)
+            # --- END MODIFICATION for renaming and processing ---
+
+            if final_internal_mcp_state.get("task_complete") or \
+               (isinstance(final_internal_mcp_state.get("messages", [])[-1] if final_internal_mcp_state.get("messages") else None, AIMessage) and \
+                any(kw in str(final_internal_mcp_state.get("messages", [])[-1].content).lower() for kw in ["全部任務已完成", "[fallback_confirmed_completion]"])):
+                print(f"  Rhino MCP internal graph indicated task completion.")
                 break
-            elif next_step == "rhino_agent":
-                print(f"  Calling call_rhino_agent...")
-                agent_output = await call_rhino_agent({"messages": mcp_loop_messages}, config) # Pass raw history
-                local_mcp_state["messages"].extend(agent_output.get("messages", [])) # Add raw new messages
-                if "saved_image_path" in agent_output: local_mcp_state["saved_image_path"] = agent_output["saved_image_path"]
-                if "saved_image_data_uri" in agent_output: local_mcp_state["saved_image_data_uri"] = agent_output["saved_image_data_uri"]
-            elif next_step == "agent_tool_executor":
-                print(f"  Calling agent_tool_executor...")
-                last_ai_message = next( (msg for msg in reversed(mcp_loop_messages) if isinstance(msg, AIMessage)), None )
-                if last_ai_message and last_ai_message.tool_calls:
-                     executor_input_state = {"messages": [last_ai_message], "target_mcp": "rhino"}
-                     executor_output = await agent_tool_executor(executor_input_state, config)
-                     local_mcp_state["messages"].extend(executor_output.get("messages", [])) # Add raw tool results
-                     # --- Update local state with path/uri from tool result ---
-                     last_tool_msg = local_mcp_state["messages"][-1] if local_mcp_state["messages"] and isinstance(local_mcp_state["messages"][-1], ToolMessage) else None
-                     if last_tool_msg and last_tool_msg.name == "capture_viewport":
-                          content = last_tool_msg.content
-                          prefix = "[IMAGE_FILE_PATH]:"
-                          error_prefix = "[Error:"
-                          if content.startswith(prefix):
-                              path_from_tool = content[len(prefix):]
-                              local_mcp_state["saved_image_path"] = path_from_tool
-                              print(f"  Tool executor updated saved_image_path: {path_from_tool}")
-                              # Attempt to generate URI here if path exists
-                              if path_from_tool and os.path.exists(path_from_tool):
-                                  try:
-                                      with open(path_from_tool, "rb") as img_file: img_bytes = img_file.read()
-                                      base64_data = base64.b64encode(img_bytes).decode('utf-8')
-                                      mime_type = "image/png"
-                                      ext = os.path.splitext(path_from_tool)[1].lower()
-                                      if ext in [".jpg", ".jpeg"]: mime_type = "image/jpeg"
-                                      local_mcp_state["saved_image_data_uri"] = f"data:{mime_type};base64,{base64_data}"
-                                      print(f"  Generated data URI for screenshot: {local_mcp_state['saved_image_data_uri'][:60]}...")
-                                  except Exception as uri_gen_err:
-                                      print(f"  Warning: Could not generate data URI for screenshot {path_from_tool}: {uri_gen_err}")
-                                      local_mcp_state["saved_image_data_uri"] = None # Reset if generation failed
-                          elif content.startswith(error_prefix):
-                               print(f"  Tool executor received error from capture_viewport: {content}")
-                               if not mcp_loop_error: mcp_loop_error = ValueError(f"MCP Screenshot Error: {content}")
-                else:
-                     print(f"  Warning: Expected AIMessage with tool_calls before agent_tool_executor, but not found.")
-                     local_mcp_state["messages"].append(ToolMessage(content="[Error: No tool calls found in previous AI message]", tool_call_id="internal_error"))
-            else:
-                mcp_loop_error = ValueError(f"MCP loop error: Unknown step '{next_step}'")
-                print(f"{node_name} Error: {mcp_loop_error}")
-                break
+            
+            # Check for max steps for the *outer* loop controlling the internal graph
+            if len(local_mcp_state["messages"]) // 2 > max_mcp_steps : # Approximation of steps
+                 print(f"  {node_name} Warning: Reached max MCP orchestrating steps ({max_mcp_steps}). Ending loop.")
+                 mcp_errors.append("MCP task exceeded maximum orchestration steps.")
+                 break
+        
+        # After loop, populate mcp_final_outcome_for_task_update
+        if final_internal_mcp_state:
+            mcp_final_outcome_for_task_update = {
+                "mcp_message_history": final_internal_mcp_state.get("messages", []),
+                # saved_image_path and data_uri are for the *overall task output if a primary one exists*
+                # For Rhino, multiple files are handled via output_files_list
+            }
+            if mcp_errors:
+                 mcp_final_outcome_for_task_update["mcp_execution_errors"] = mcp_errors
+        else:
+            mcp_errors.append("Rhino MCP internal graph did not yield a final state.")
 
-            await asyncio.sleep(1)
-
-        # Add the very last raw messages from the final step/break
-        mcp_loop_messages.extend(local_mcp_state.get("messages", []))
-
-        if step_count >= max_mcp_steps:
-            print(f"{node_name} Warning: Reached max MCP steps ({max_mcp_steps}). Ending loop.")
-            mcp_loop_error = TimeoutError("MCP task exceeded maximum steps.")
-
-        # --- <<< MODIFIED: Create final outcome dict (No 'message', raw history) >>> ---
-        final_mcp_outcome = {
-            # "message": ..., # REMOVED - Let history speak for itself
-            "saved_image_path": local_mcp_state.get("saved_image_path"),
-            "saved_image_data_uri": local_mcp_state.get("saved_image_data_uri"),
-            "mcp_message_history": mcp_loop_messages # Store raw BaseMessage list
-        }
-        print(f"  Stored {len(final_mcp_outcome['mcp_message_history'])} raw MCP messages for history.")
-
-        # Store loop error if it occurred
-        if mcp_loop_error:
-            outer_error_to_report = mcp_loop_error
-            # Optionally add error info to history if needed, though it should be in the messages already
-            print(f"  MCP loop terminated with error: {mcp_loop_error}")
-        # --- <<< END MODIFIED >>> ---
-
-    except Exception as e:
-        error_msg = f"Error during {node_name} execution: {e}"
-        print(error_msg)
+    except ImportError:
+        err_msg = "Failed to import Rhino MCP graph instance. Ensure mcp_test.py is correctly structured."
+        print(f"{node_name} Error: {err_msg}")
         traceback.print_exc()
-        outer_error_to_report = e
-        # Ensure history is still included (raw) in case of outer error
-        final_mcp_outcome = {
-             # "message": f"MCP coordination failed: {e}", # REMOVED
-             "saved_image_path": None,
-             "saved_image_data_uri": None,
-             "mcp_message_history": mcp_loop_messages # Include whatever history was gathered
-         }
+        outer_error_to_report = ImportError(err_msg)
+    except Exception as mcp_e:
+        err_msg = f"Error during Rhino MCP graph execution: {mcp_e}"
+        print(f"{node_name} Error: {err_msg}")
+        traceback.print_exc()
+        outer_error_to_report = mcp_e
+        if not mcp_final_outcome_for_task_update.get("mcp_message_history"): # Ensure history is included
+            mcp_final_outcome_for_task_update["mcp_message_history"] = local_mcp_state["messages"] # Fallback to outer history
 
-    # 5. Update the main WorkflowState Task using the helper
+    # --- Consolidate MCP errors into outer_error_to_report if not already set ---
+    if mcp_errors and not outer_error_to_report:
+        outer_error_to_report = ValueError("Rhino MCP processing encountered errors: " + "; ".join(mcp_errors))
+    elif mcp_errors and outer_error_to_report: # Append if outer error already exists
+        outer_error_to_report = type(outer_error_to_report)(str(outer_error_to_report) + "; Rhino MCP internal errors: " + "; ".join(mcp_errors))
+
+
+    # Update the main WorkflowState Task using the helper
     tasks[current_idx] = _update_task_state_after_tool(
         current_task,
-        outputs=None,
-        output_files=None,
+        outputs={}, # Rhino outputs are primarily files
+        output_files=output_files_list,
         error=outer_error_to_report,
-        mcp_result=final_mcp_outcome # Pass dict with history and file info
+        mcp_result=mcp_final_outcome_for_task_update
     )
 
     return {"tasks": tasks, "current_task": tasks[current_idx].copy()}
