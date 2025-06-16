@@ -1,4 +1,4 @@
- # LangGraph 智慧建築設計流程框架
+ # LangGraph 自動化建築設計系統
 
 這是一個基於 LangGraph 開發的智慧多代理 (Multi-Agent) 建築設計框架。系統旨在模擬一個由 AI 組成的建築設計團隊，自動化地執行從概念發想、資料搜集、方案設計、多方案比較、視覺化到最終評估的完整流程。
 
@@ -8,7 +8,7 @@
 
 ## 核心功能
 
--   **動態工作流**：透過 `ProcessManagement` 代理，能根據使用者初始輸入，動態生成、規劃、並調整任務序列。
+-   **動態工作流**：透過 `ProcessManagement` 代理，能根據使用者初始輸入，動態生成、規劃、並調整任務序列，透過HIL(interrupt功能)用戶可切換全自動與半自動模式。
 -   **多代理協作**：內建多個職能各異的 AI 代理，包括：
     -   `ArchRAGAgent`/`WebSearchAgent`: 建築法規、案例分析檢索。
     -   `ImageGenerationAgent`/`ModelRenderAgent`: 2D 概念圖、渲染圖生成。
