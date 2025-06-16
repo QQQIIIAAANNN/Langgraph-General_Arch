@@ -58,11 +58,12 @@
     -   選擇一個 Graph (例如 `General_Arch_graph`)，並提供您的初始設計需求（`user_input`）來開始一個新的流程。
 
 4.  **其他安裝**:
-    -   如果要完整啟用多代理的服務，建議還需額外安裝ComfyUI、Rhino mcp、Pinterest mcp、OSM mcp等工具。MCP等工具包已經在src/mcp內。
-        ComfyUI: https://github.com/comfyanonymous/ComfyUI
-        Rhino mcp: https://github.com/SerjoschDuering/rhino-mcp
-        OSM mcp: https://github.com/jagan-shanmugam/open-streetmap-mcp
-        Pinterest mcp: https://github.com/terryso/mcp-pinterest  
+    -   如果要完整啟用多代理的服務，建議還需額外安裝ComfyUI、Rhino mcp、Pinterest mcp、OSM mcp等工具。
+    -   MCP等工具包已經在src/mcp內。安裝與啟動建議按照相關教學進行。
+    -   ComfyUI: https://github.com/comfyanonymous/ComfyUI
+    -   Rhino mcp: https://github.com/SerjoschDuering/rhino-mcp
+    -   OSM mcp: https://github.com/jagan-shanmugam/open-streetmap-mcp
+    -   Pinterest mcp: https://github.com/terryso/mcp-pinterest  
 
 ## 設定說明
 
