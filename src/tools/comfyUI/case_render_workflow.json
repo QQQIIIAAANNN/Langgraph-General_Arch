@@ -1,5 +1,57 @@
 {
-  "1": {
+  "51": {
+    "inputs": {
+      "samples": [
+        "60",
+        0
+      ],
+      "vae": [
+        "54",
+        0
+      ]
+    },
+    "class_type": "VAEDecode",
+    "_meta": {
+      "title": "VAE解码"
+    }
+  },
+  "52": {
+    "inputs": {
+      "width": 1024,
+      "height": 768,
+      "batch_size": 1
+    },
+    "class_type": "EmptyLatentImage",
+    "_meta": {
+      "title": "空Latent图像"
+    }
+  },
+  "54": {
+    "inputs": {
+      "vae_name": "ae.safetensors"
+    },
+    "class_type": "VAELoader",
+    "_meta": {
+      "title": "加载VAE"
+    }
+  },
+  "58": {
+    "inputs": {
+      "model": [
+        "63",
+        0
+      ],
+      "conditioning": [
+        "82",
+        0
+      ]
+    },
+    "class_type": "BasicGuider",
+    "_meta": {
+      "title": "基本引导器"
+    }
+  },
+  "59": {
     "inputs": {
       "clip_name1": "t5xxl_fp16.safetensors",
       "clip_name2": "clip_l.safetensors",
@@ -11,9 +63,37 @@
       "title": "双CLIP加载器"
     }
   },
-  "2": {
+  "60": {
     "inputs": {
-      "unet_name": "flux1-dev.sft",
+      "noise": [
+        "69",
+        0
+      ],
+      "guider": [
+        "58",
+        0
+      ],
+      "sampler": [
+        "64",
+        0
+      ],
+      "sigmas": [
+        "66",
+        0
+      ],
+      "latent_image": [
+        "52",
+        0
+      ]
+    },
+    "class_type": "SamplerCustomAdvanced",
+    "_meta": {
+      "title": "自定义采样器（高级）"
+    }
+  },
+  "63": {
+    "inputs": {
+      "unet_name": "flux1-dev.safetensors",
       "weight_dtype": "fp8_e4m3fn"
     },
     "class_type": "UNETLoader",
@@ -21,110 +101,63 @@
       "title": "UNet加载器"
     }
   },
-  "3": {
+  "64": {
     "inputs": {
-      "prompt1": "timbercurve,1 building, overall building, nobody",
-      "prompt2": "A sleek, streamlined hyperbolic shell pavilion with a captivating timber grid structure, showcasing precision-crafted wooden components. The design emphasizes geometric elegance, enhancing stability while allowing abundant natural light through strategically placed skylights. The overall aesthetic exudes modernity and sustainability, harmonizing with the environment.",
-      "separator": ","
+      "sampler_name": "euler_ancestral"
     },
-    "class_type": "easy promptConcat",
+    "class_type": "KSamplerSelect",
     "_meta": {
-      "title": "提示词联结"
+      "title": "K采样器选择"
     }
   },
-  "4": {
+  "65": {
     "inputs": {
-      "seed": "-1",
-      "sampler": "euler_a",
-      "scheduler": "beta",
-      "steps": "20",
-      "guidance": "3",
-      "max_shift": "",
-      "base_shift": "",
-      "denoise": "1.0",
+      "filename_prefix": "ComfyUI",
+      "images": [
+        "51",
+        0
+      ]
+    },
+    "class_type": "SaveImage",
+    "_meta": {
+      "title": "保存图像"
+    }
+  },
+  "66": {
+    "inputs": {
+      "scheduler": "normal",
+      "steps": 25,
+      "denoise": 1,
       "model": [
-        "49",
-        0
-      ],
-      "conditioning": [
-        "9",
-        0
-      ],
-      "latent_image": [
-        "11",
+        "63",
         0
       ]
     },
-    "class_type": "FluxSamplerParams+",
+    "class_type": "BasicScheduler",
     "_meta": {
-      "title": "🔧 Flux Sampler Parameters"
+      "title": "基本调度器"
     }
   },
-  "5": {
+  "69": {
     "inputs": {
-      "vae_name": "ae.safetensors"
+      "noise_seed": 302671778507907
     },
-    "class_type": "VAELoader",
+    "class_type": "RandomNoise",
     "_meta": {
-      "title": "加载VAE"
+      "title": "随机噪波"
     }
   },
-  "6": {
-    "inputs": {
-      "samples": [
-        "4",
-        0
-      ],
-      "vae": [
-        "5",
-        0
-      ]
-    },
-    "class_type": "VAEDecode",
-    "_meta": {
-      "title": "VAE解码"
-    }
-  },
-  "9": {
-    "inputs": {
-      "clip_l": "",
-      "t5xxl": [
-        "3",
-        0
-      ],
-      "guidance": 3,
-      "clip": [
-        "1",
-        0
-      ]
-    },
-    "class_type": "CLIPTextEncodeFlux",
-    "_meta": {
-      "title": "CLIP文本编码Flux"
-    }
-  },
-  "11": {
-    "inputs": {
-      "width": 1024,
-      "height": 768,
-      "batch_size": 1
-    },
-    "class_type": "EmptyLatentImage",
-    "_meta": {
-      "title": "空Latent图像"
-    }
-  },
-  "49": {
+  "80": {
     "inputs": {
       "lora_name": "FLUX\\timber-pavilion-000012.safetensors",
-      "strength_model": 0.5,
-      "strength_clip": 0.5,
+      "strength_model": 0,
+      "strength_clip": 1.0000000000000002,
       "model": [
-        "2",
+        "63",
         0
       ],
       "clip": [
-        "1",
+        "59",
         0
       ]
     },
@@ -133,17 +166,55 @@
       "title": "加载LoRA"
     }
   },
-  "50": {
+  "82": {
     "inputs": {
-      "filename_prefix": "ComfyUI",
-      "images": [
-        "6",
+      "text": [
+        "89",
+        0
+      ],
+      "clip": [
+        "80",
+        1
+      ]
+    },
+    "class_type": "CLIPTextEncode",
+    "_meta": {
+      "title": "CLIP文本编码"
+    }
+  },
+  "86": {
+    "inputs": {
+      "value": "exterior, 1 building, overall building, "
+    },
+    "class_type": "easy string",
+    "_meta": {
+      "title": "fixed text"
+    }
+  },
+  "87": {
+    "inputs": {
+      "value": "Futuristic elderly care center, modular circular forms, seamless integration of natural light and greenery, curved surfaces from sustainable wood, dual-curved facade enhancing stability, efficient ventilation, open courtyards, translucent materials creating soft night glow, harmonious outdoor spaces, accessible pathways, promoting community interaction."
+    },
+    "class_type": "easy string",
+    "_meta": {
+      "title": "input text"
+    }
+  },
+  "89": {
+    "inputs": {
+      "separator": "",
+      "prompt1": [
+        "86",
+        0
+      ],
+      "prompt2": [
+        "87",
         0
       ]
     },
-    "class_type": "SaveImage",
+    "class_type": "easy promptConcat",
     "_meta": {
-      "title": "保存图像"
+      "title": "提示词联结"
     }
   }
 }

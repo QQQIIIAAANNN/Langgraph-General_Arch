@@ -91,10 +91,11 @@ def case_render_image(outer_prompt: str, i: int, strength:str) -> str:
     saved_filenames = []
     base_uuid = uuid.uuid4() # 為這一批生成創建一個基礎 UUID
     for iteration in range(1, i + 1):
-        prompt["3"]["inputs"]["prompt2"] = outer_prompt
-        prompt["4"]["inputs"]["seed"] = random.randint(1, 1000000000)
-        prompt["49"]["inputs"]["strength_model"] = strength if strength else 0
-        
+        prompt["87"]["inputs"]["value"] = outer_prompt
+        prompt["69"]["inputs"]["noise_seed"] = random.randint(1, 1000000000)
+        # prompt["80"]["inputs"]["strength_model"] = strength if strength else 0
+        prompt["80"]["inputs"]["strength_model"] = 0
+
         ws = websocket.WebSocket()
         ws.connect(f"ws://{server_address}/ws?clientId={client_id}")
         print(f"WebSocket 連接成功，開始第 {iteration} 次生成")

@@ -3,49 +3,103 @@ import re
 import ast
 import json
 import base64
+import time # 新增導入
 from dotenv import load_dotenv
 from langgraph.graph.state import StateGraph, START, END
 from typing import List
 from langgraph.graph import add_messages
-from langchain_core.messages import BaseMessage
+from langchain_core.messages import BaseMessage, SystemMessage, HumanMessage
 from typing import TypedDict, Annotated, Sequence
 from typing_extensions import TypedDict
-from langchain_openai import ChatOpenAI
-from langchain.schema import HumanMessage, SystemMessage
 from src.memory import get_long_term_store, get_short_term_memory
 from src.tools.img_recognition import img_recognition
-# from src.tools.IMG_rag_tool import IMG_rag_tool
 from src.tools.prompt_generation import prompt_generation
 from src.tools.case_render_image import case_render_image
 from src.tools.simulate_future_image import simulate_future_image
 from src.tools.ARCH_rag_tool import ARCH_rag_tool
 from src.tools.video_recognition import video_recognition
 from src.tools.generate_3D import generate_3D
-
+from src.tools.gemini_search_tool import perform_grounded_search
+from src.tools.gemini_image_generation_tool import generate_gemini_image
+from src.T_config import GraphOverallConfig # LLM_INSTANCE 和 PROMPTS_INSTANCE 仍然可以導入，但節點內主要用 config
 
 # 載入 .env 設定
 load_dotenv()
 
-# 使用 tools_memory 提供的短期記憶與長期記憶存儲
-short_term = get_short_term_memory()
-long_term = get_long_term_store()
+# 全局的 LLM_INSTANCE 和 PROMPTS_INSTANCE 主要作為後備或用於非節點上下文
+# 節點內部應使用從 config 傳入的實例
+# default_llm = LLM_INSTANCE # 可以保留，但節點內不直接用
+# default_prompts = PROMPTS_INSTANCE # 可以保留，但節點內不直接用
+
+
+# =============================================================================
+# 輔助函數，用於確保配置是 GraphOverallConfig 的實例
+# =============================================================================
+def ensure_graph_overall_config(config_input: any) -> GraphOverallConfig: # 接受更通用的類型
+    if isinstance(config_input, GraphOverallConfig):
+        print("DEBUG ensure_graph_overall_config: Input is already GraphOverallConfig instance.")
+        return config_input
+
+    actual_config_dict = None
+    print(f"DEBUG ensure_graph_overall_config: Received config_input type: {type(config_input)}, value: {repr(config_input)}")
+
+    if hasattr(config_input, 'get') and callable(getattr(config_input, 'get')): # 檢查是否像字典一樣操作
+        # 標準的 LangGraph RunnableConfig 將配置放在 'configurable' 鍵下
+        # 我們也處理直接傳遞普通字典的情況
+        if 'configurable' in config_input and isinstance(config_input['configurable'], dict):
+            print("DEBUG ensure_graph_overall_config: Detected RunnableConfig-like structure, using config_input['configurable']")
+            actual_config_dict = config_input['configurable']
+        elif all(isinstance(k, str) for k in config_input.keys()): # 粗略檢查是否為普通字典
+            print("DEBUG ensure_graph_overall_config: Assuming config_input is the plain config dictionary.")
+            actual_config_dict = dict(config_input) # 確保是普通字典
+        else:
+            print(f"DEBUG ensure_graph_overall_config: config_input is dict-like but not recognized structure: {repr(config_input)}")
+            # 如果不是期望的結構，但仍然是 dict-like，嘗試直接使用它
+            # 這可能在某些情況下有效，但在其他情況下可能導致 Pydantic 錯誤
+            actual_config_dict = dict(config_input)
+
+
+    if actual_config_dict is None:
+        raise TypeError(f"Could not extract a valid configuration dictionary from input type {type(config_input)}. Value: {repr(config_input)}")
+
+    print(f"DEBUG ensure_graph_overall_config: Final dictionary for Pydantic instantiation: {repr(actual_config_dict)}")
+    print(f"DEBUG ensure_graph_overall_config: Value of 'run_site_analysis' in final dict for Pydantic: {actual_config_dict.get('run_site_analysis')}")
+    
+    try:
+        # 在實例化前打印 GraphOverallConfig 中 run_site_analysis_raw_value 字段的預設值和別名
+        field_info_raw = GraphOverallConfig.model_fields.get("run_site_analysis_raw_value")
+        if field_info_raw:
+            print(f"DEBUG ensure_graph_overall_config: Model field 'run_site_analysis_raw_value' - default: {field_info_raw.default}, alias: {field_info_raw.alias}")
+        else:
+            print("DEBUG ensure_graph_overall_config: Could not get field_info for 'run_site_analysis_raw_value'")
+
+        instance = GraphOverallConfig(**actual_config_dict)
+        
+        # 打印實例化後的值
+        print(f"DEBUG ensure_graph_overall_config: Instance created. instance.run_site_analysis_raw_value = {getattr(instance, 'run_site_analysis_raw_value', 'N/A')}, instance.run_site_analysis = {instance.run_site_analysis}")
+        return instance
+    except Exception as e:
+        print(f"DEBUG ensure_graph_overall_config: Error during GraphOverallConfig instantiation: {e}")
+        print(f"DEBUG ensure_graph_overall_config: Failing dictionary was: {repr(actual_config_dict)}")
+        raise e
+
 
 # =============================================================================
 # 建立 LLM 實例（不再設定 system_message 屬性）
 # =============================================================================
-llm = ChatOpenAI(
-    model_name="gpt-4o-mini",
-    openai_api_key=os.getenv("OPENAI_API_KEY"),
-    temperature=0.7
-    )
+# 這部分綁定工具的 LLM 實例，如果工具調用也需要配置化，則需要更複雜的處理
+# 目前假設工具綁定的 LLM 可以使用預設配置的 LLM
+# 或者，這些綁定可以在 invoke 時動態創建，基於傳入的 config.llm_config
+# 為簡化，暫時保留全局 llm 的用法進行工具綁定
 
-# 依需求產生不同用途的 LLM 實例
-llm_with_img = llm.bind_tools([img_recognition])
-# llm_with_3d = llm.bind_tools({"3D_recognition": tools["3D_recognition"]})
-# llm_with_IMGrag = llm.bind_tools([IMG_rag_tool])
-llm_with_ARCHrag = llm.bind_tools([ARCH_rag_tool])
-llm_with_prompt = llm.bind_tools([prompt_generation])
-llm_with_gen2 = llm.bind_tools([simulate_future_image])
+# 使用 T_config 中的預設配置來初始化一個 LLM 實例，主要用於工具綁定
+_temp_default_config_for_tools = GraphOverallConfig()
+_tool_binding_llm = _temp_default_config_for_tools.llm_config.get_llm()
+
+llm_with_img = _tool_binding_llm.bind_tools([img_recognition])
+llm_with_ARCHrag = _tool_binding_llm.bind_tools([ARCH_rag_tool])
+llm_with_prompt_gen = _tool_binding_llm.bind_tools([prompt_generation])
+llm_with_gen2 = _tool_binding_llm.bind_tools([simulate_future_image])
 
 
 # =============================================================================
@@ -60,7 +114,7 @@ class GlobalState(TypedDict, total=False):
     outer_prompt: list
     case_image: list
     future_image: list
-    perspective_3D: list 
+    perspective_3D: list
     model_3D: list
     GATE1: str
     GATE2: str 
@@ -94,43 +148,95 @@ class QuestionTask:
     def __init__(self, state: GlobalState):
         self.state = state
     
-    def run(self, state=None):
+    def run(self, state: GlobalState, config: GraphOverallConfig | dict):
         if state is not None:
             self.state = state
+        
+        active_config = ensure_graph_overall_config(config)
+
+        current_llm = active_config.llm_config.get_llm()
+        active_language = active_config.llm_output_language
+
         user_input = self.state["設計目標x設計需求x方案偏好"][0].content
         print("✅ 用戶的設計需求已記錄：", user_input)
 
-        # Step 1: LLM 查看用戶輸入，生成關鍵詞
-        keyword_prompt = (
-            "請從用戶輸入文本生成中英文關鍵詞以便於檢索建築設計目標、設計需求、方案偏好等相關資訊。"
-            "需要特別關注木構造、數位製造工法、傳統製造工法、木結構等項目。"
-            "請使用用戶的輸入語言來回答"
-            f"{user_input}"
+        # 生成用於檢索的查詢，現在會更通用，不僅限於 ARCH_rag_tool
+        # 原來的 keyword_prompt_content 可以繼續使用或微調
+        keyword_prompt_content = active_config.question_task_keyword_prompt_template.format(
+            user_input=user_input,
+            llm_output_language=active_language
         )
-        keywords_msg = llm.invoke([SystemMessage(content=keyword_prompt)])
-        keywords = keywords_msg.content.strip()
-        print("生成的關鍵詞：", keywords)
+        keywords_msg = current_llm.invoke([SystemMessage(content=keyword_prompt_content)])
+        # keywords_text 現在作為一個通用的搜索查詢
+        search_query_text = keywords_msg.content.strip()
+        print("生成的通用搜索查詢：", search_query_text)
 
-        # Step 2: 根據用戶輸入和關鍵詞構建 RAG prompt
-        rag_prompt = (f"{keywords}")
+        # 1. 使用 ARCH_rag_tool
+        arch_rag_results = ""
+        try:
+            arch_rag_msg_content = ARCH_rag_tool.invoke(search_query_text) # 或者使用更精確的查詢
+            if isinstance(arch_rag_msg_content, str):
+                arch_rag_results = arch_rag_msg_content
+            print("ARCH_rag_tool 檢索結果：", arch_rag_results)
+        except Exception as e:
+            print(f"⚠️ ARCH_rag_tool 調用失敗: {e}")
+            arch_rag_results = "ARCH RAG 工具檢索失敗。"
 
-        # 使用綁定工具的 llm_with_ARCHrag 進行 RAG 檢索
-        RAG_msg = ARCH_rag_tool.invoke(rag_prompt)
-        print("RAG檢索結果：", RAG_msg)
+        # 2. 使用 perform_grounded_search
+        grounded_search_results_text = ""
+        # grounded_search_files = [] # 如果需要處理圖片等文件
+        try:
+            # 假設 perform_grounded_search 返回一個字典，包含 text_content 和 images
+            # 我們主要關心 text_content
+            # 查詢的 prompt 可以與 ARCH_rag_tool 的查詢相同，或者針對性調整
+            # 這裡我們使用相同的 search_query_text
+            # 提示：perform_grounded_search 的查詢可以更自然語言化
+            # 例如："查詢關於 {木構造} {數位製造} 的 {pavilion 設計案例} 和 {構造細節}"
+            # 這裡的 search_query_text 已經是 LLM 生成的關鍵詞，可能需要包裝一下
+            
+            # 建立一個更適合 perform_grounded_search 的查詢
+            # 可以直接用用戶輸入，或者結合 LLM 生成的關鍵詞
+            grounded_search_query = (
+                f"針對用戶的建築設計需求 '{user_input}'，"
+                f"尋找相關的案例、構造細節、製造工法（特別是木構造、數位製造、傳統製造工法、木結構）、"
+                f"減碳與循環永續性策略、技術細節及研究理論。"
+                f"生成的關鍵詞參考：{search_query_text}"
+            )
+            print(f"Grounded Search 查詢: {grounded_search_query}")
 
-        # Step 3: 將 RAG 補充資訊與原始用戶輸入結合，生成最終總結報告
-        summary_input = (
-            "建築類型是Timber Curve Pavilion，以用戶的設計目標為主，根據補充資訊，"
-            "說明設計方案可能要達成甚麼樣的設計決策方向以滿足用戶的設計目標。"
-            "請使用用戶的輸入語言來回答"
-            f"建築設計目標:{user_input}/n補充資訊:{RAG_msg}"
+            search_tool_output = perform_grounded_search({"query": grounded_search_query})
+            
+            if isinstance(search_tool_output, dict):
+                grounded_search_results_text = search_tool_output.get("text_content", "")
+                # 如果需要處理圖片:
+                # returned_images = search_tool_output.get("images", [])
+                # for img_info in returned_images:
+                #     # 處理圖片邏輯...
+                #     pass
+            elif isinstance(search_tool_output, str): # 向下兼容，如果工具直接返回字符串
+                grounded_search_results_text = search_tool_output
+            
+            print("perform_grounded_search 檢索結果 (文本部分)：", grounded_search_results_text)
+        except Exception as e:
+            print(f"⚠️ perform_grounded_search 調用失敗: {e}")
+            grounded_search_results_text = "Grounded Search 工具檢索失敗。"
+
+        # 合併兩個 RAG 工具的結果
+        # 可以簡單拼接，或者讓 LLM 稍後在總結時自行判斷重要性
+        combined_rag_info = f"傳統知識庫檢索結果:\n{arch_rag_results}\n\n網路與文獻搜索結果:\n{grounded_search_results_text}"
+        
+        # 更新 summary prompt 以包含合併後的 RAG 信息
+        summary_input_content = active_config.question_task_summary_prompt_template.format(
+            user_input=user_input,
+            rag_msg=combined_rag_info, # 使用合併後的資訊
+            llm_output_language=active_language
         )
-        summary_msg = llm.invoke([SystemMessage(content=summary_input)])
-        self.state["design_summary"] = f"用戶需求:{user_input}/n{summary_msg.content}"
+        summary_msg = current_llm.invoke([SystemMessage(content=summary_input_content)])
+        self.state["design_summary"] = f"用戶需求:\n{user_input}\n\n設計目標初步總結與分析 (基於檢索資訊):\n{summary_msg.content}"
         print("✅ 設計目標總結完成！")
-        print(summary_msg.content)
+        print(self.state["design_summary"])
         return {          
-            "設計目標x設計需求x方案偏好": user_input,
+            "設計目標x設計需求x方案偏好": self.state["設計目標x設計需求x方案偏好"], 
             "design_summary": self.state["design_summary"]
             }
 
@@ -139,67 +245,185 @@ class SiteAnalysisTask:
     def __init__(self, state: GlobalState):
         self.state = state
 
-    def run(self, state=None):
+    def run(self, state: GlobalState, config: GraphOverallConfig | dict):
+        print("DEBUG: SiteAnalysisTask.run CALLED")
         if state is not None:
             self.state = state
-
-        base_map_path = "./input/2D/base_map.png"
-        project_data_path = "./input/project_data.json"
-
-        if not os.path.exists(base_map_path) or not os.path.exists(project_data_path):
-            print("❌ 缺少場地分析所需的文件！")
-            return {
-                "site_analysis": self.state.get("site_analysis"),
-                "design_advice": self.state.get("design_advice")
-            }
-
-        with open(project_data_path, "r", encoding="utf-8") as f:
-            project_data = json.load(f)
-
-        geo_location = project_data.get("geoLocation", "未知地點")
-        region = project_data.get("region", "未知區域")
-        # north_direction = project_data.get("northDirection", "未知方位")
-
-        # img_recognition的prompt
-        prompt = f"""
-        你是一個專業的都市視覺資訊分析工具，你的任務是分析使用者提供的基地圖片，辨識並標註都市環境物件，描述重要特徵，並生成視覺摘要。
-        輸出結構化資料，包含物件標註 (類型、位置)、特徵描述 (建築、道路、綠地、水體、環境脈絡特徵) 。
-        以圖片的上方為北方，初步推理基於方位來說，日照、熱環境、風環境、噪音、景觀、交通對於基地的影響。
-        設計位置:{region}，經緯度:{geo_location}
-        """
-
-        # 調用工具進行場地分析
-        analysis_img = img_recognition.invoke({
-            "image_paths": base_map_path,
-            "prompt": prompt,
-        })
-
-        # llm_with_ARCHrag的prompt
-        LLMprompt = f"""
-        作為建築師及空間分析專家，你擅長整合提供的資訊進行基地分析，基於圖片的辨識結果。
-        查詢並整合地點、都市計畫規範、建築法規、氣候資料、人文歷史特色、其他特殊地質或都市情形、特殊氣候情形等背景資料。並整理為更深入的基地分析報告。
-        設計位置:{region}，經緯度:{geo_location}。
-        圖片辨識結果:{analysis_img}。
-        """
-
-        analysis_result = llm.invoke([SystemMessage(content=LLMprompt)])
-
-        self.state["analysis_img"] = analysis_img
-        self.state["site_analysis"] = analysis_result.content
-
-        # 確保場地圖像存在
-        if not os.path.exists(base_map_path):
-            print(f"❌ 缺少基地圖像: {base_map_path}")
-            return {
-                "analysis_img": self.state.get("analysis_img"),
-                "site_analysis": self.state.get("site_analysis"),
-            }
         
-        print("✅ 場地分析完成！")
-        print(analysis_result.content)
+        active_config = ensure_graph_overall_config(config)
+        print(f"DEBUG SiteAnalysisTask: Processed active_config.run_site_analysis: {active_config.run_site_analysis}")
+
+        if not active_config.run_site_analysis:
+            skip_message = "用戶配置要求跳過基地分析 (run_site_analysis=False)。"
+            print(f"ℹ️ {skip_message}")
+            self.state["site_analysis"] = skip_message
+            self.state["analysis_img"] = "無圖片 (基地分析已跳過)"
+            return {
+                "site_analysis": self.state["site_analysis"],
+                "analysis_img": self.state["analysis_img"],
+            }
+
+        current_llm = active_config.llm_config.get_llm()
+        active_language = active_config.llm_output_language
+        
+        # --- 步驟 1: 分析 user input 的內容獲取經緯度和地點 ---
+        user_design_input = ""
+        if self.state.get("設計目標x設計需求x方案偏好") and isinstance(self.state["設計目標x設計需求x方案偏好"], Sequence) and len(self.state["設計目標x設計需求x方案偏好"]) > 0:
+            user_design_input = self.state["設計目標x設計需求x方案偏好"][0].content
+            print(f"ℹ️ SiteAnalysisTask [Step 1]: 取得用戶設計需求內容: '{user_design_input[:100]}...'")
+        else:
+            error_message = "⚠️ SiteAnalysisTask [Step 1]: 未能在狀態中找到有效的用戶設計需求輸入。無法提取基地資訊。"
+            print(error_message)
+            self.state["site_analysis"] = error_message
+            self.state["analysis_img"] = "無圖片 (缺少用戶設計需求)"
+            return {"site_analysis": self.state["site_analysis"], "analysis_img": self.state["analysis_img"]}
+
+        region = "未知"
+        geo_location = "未知"
+        try:
+            extract_prompt_content = active_config.site_analysis_extract_site_info_prompt_template.format(
+                user_design_input=user_design_input,
+                llm_output_language=active_language
+            )
+            print(f"DEBUG SiteAnalysisTask [Step 1]: Prompt for extracting site info: {extract_prompt_content}")
+            site_info_msg = current_llm.invoke([SystemMessage(content=extract_prompt_content)])
+            site_info_json_str = site_info_msg.content.strip()
+            print(f"ℹ️ SiteAnalysisTask [Step 1]: LLM 提取的基地資訊 (原始字串): {site_info_json_str}")
+            
+            if site_info_json_str.startswith("```json"):
+                site_info_json_str = site_info_json_str[7:]
+            if site_info_json_str.endswith("```"):
+                site_info_json_str = site_info_json_str[:-3]
+            site_info_json_str = site_info_json_str.strip()
+
+            parsed_site_info = json.loads(site_info_json_str)
+            region = parsed_site_info.get("region", "未知")
+            geo_location = parsed_site_info.get("geo_location", "未知")
+            print(f"✅ SiteAnalysisTask [Step 1]: 解析後的 Region: {region}, GeoLocation: {geo_location}")
+
+        except AttributeError as e:
+            # 捕獲 active_config.site_analysis_extract_site_info_prompt_template 不存在的錯誤
+            error_message = f"⚠️ SiteAnalysisTask [Step 1]: 提取基地資訊時發生 AttributeError (可能 Prompt 模板未在 T_config.py 中正確定義或加載): {e}"
+            print(error_message)
+            self.state["site_analysis"] = error_message
+            self.state["analysis_img"] = "無圖片 (配置錯誤)"
+            return {"site_analysis": self.state["site_analysis"], "analysis_img": self.state["analysis_img"]}
+        except json.JSONDecodeError as e:
+            print(f"⚠️ SiteAnalysisTask [Step 1]: 解析LLM提取的基地資訊JSON失敗: {e}. 原始字串: '{site_info_json_str}'")
+        except Exception as e:
+            print(f"⚠️ SiteAnalysisTask [Step 1]: 提取基地資訊時發生其他錯誤: {e}")
+
+        if region == "未知" and geo_location == "未知":
+            print("⚠️ SiteAnalysisTask [Step 1]: 未能從用戶輸入中明確提取有效的地區或地理位置資訊。後續分析可能受影響，但將繼續嘗試。")
+
+        # --- 步驟 2: 使用以上資訊及圖片 "D:/MA system/LangGraph/input/2D/map.png" 進行圖片辨識分析 ---
+        # 注意：檔名已從 base_map.png 改為 map.png
+        base_map_path_str = "./input/2D/map.png" 
+        
+        print(f"DEBUG SiteAnalysisTask [Step 2]: Checking for image file at: '{base_map_path_str}'")
+        if not os.path.exists(base_map_path_str):
+            error_message = f"❌ SiteAnalysisTask [Step 2]: 圖片文件未找到於 '{base_map_path_str}'。無法進行圖片辨識。"
+            print(error_message)
+            self.state["site_analysis"] = self.state.get("site_analysis", "") + " " + error_message # 附加錯誤
+            self.state["analysis_img"] = "缺少圖片文件 (map.png)，無法進行辨識。"
+            # 即使圖片缺失，我們仍然可以嘗試基於文本的RAG和分析，所以不一定立即返回
+            # 但如果圖片是核心，則應該返回
+            # 為了符合流程，如果圖片辨識是必要的，這裡應該返回
+            return {"site_analysis": self.state["site_analysis"], "analysis_img": self.state["analysis_img"]}
+        
+        print(f"✅ SiteAnalysisTask [Step 2]: 圖片文件 '{base_map_path_str}' 已找到。")
+        
+        initial_img_analysis_content = "圖片辨識失敗或未執行。" # 預設值
+        try:
+            img_rec_prompt_content = active_config.site_analysis_img_recognition_prompt_template.format(
+                region=region, 
+                geo_location=geo_location, 
+                llm_output_language=active_language
+            )
+            print(f"DEBUG SiteAnalysisTask [Step 2]: Prompt for image recognition: {img_rec_prompt_content}")
+            initial_img_analysis_content = img_recognition.invoke({ 
+                "image_paths": base_map_path_str, # 使用絕對路徑
+                "prompt": img_rec_prompt_content,
+            })
+            self.state["analysis_img"] = initial_img_analysis_content 
+            print(f"✅ SiteAnalysisTask [Step 2]: 初步圖片辨識結果: '{str(initial_img_analysis_content)[:200]}...'")
+        except Exception as e:
+            print(f"⚠️ SiteAnalysisTask [Step 2]: 執行圖片辨識時發生錯誤: {e}")
+            self.state["analysis_img"] = f"圖片辨識失敗: {e}"
+            # 根據需求決定是否在此處返回
+
+        # --- 步驟 3: 根據辨識結果生成關鍵字 ---
+        site_rag_keywords = "未知關鍵字" # 預設值
+        try:
+            rag_keywords_gen_prompt = active_config.site_analysis_rag_keywords_prompt_template.format(
+                region=region,
+                geo_location=geo_location,
+                initial_img_analysis_summary=str(initial_img_analysis_content), #確保是字符串 
+                llm_output_language=active_language
+            )
+            print(f"DEBUG SiteAnalysisTask [Step 3]: Prompt for RAG keyword generation: {rag_keywords_gen_prompt}")
+            keywords_msg = current_llm.invoke([SystemMessage(content=rag_keywords_gen_prompt)])
+            site_rag_keywords = keywords_msg.content.strip()
+            print(f"✅ SiteAnalysisTask [Step 3]: 生成的基地分析RAG關鍵字: {site_rag_keywords}")
+        except Exception as e:
+            print(f"⚠️ SiteAnalysisTask [Step 3]: 生成RAG關鍵字時發生錯誤: {e}")
+
+        # --- 步驟 4: 進行ARCH_rag_tool以及perform_grounded_search ---
+        arch_rag_site_results = "ARCH RAG 工具檢索無結果或失敗。"
+        try:
+            print(f"DEBUG SiteAnalysisTask [Step 4]: Invoking ARCH_rag_tool with keywords: {site_rag_keywords}")
+            arch_rag_msg_content = ARCH_rag_tool.invoke(site_rag_keywords)
+            if isinstance(arch_rag_msg_content, str):
+                arch_rag_site_results = arch_rag_msg_content
+            print(f"✅ SiteAnalysisTask [Step 4]: ARCH_rag_tool 基地資訊檢索結果: '{arch_rag_site_results[:200]}...'")
+        except Exception as e:
+            print(f"⚠️ SiteAnalysisTask [Step 4]: ARCH_rag_tool 調用失敗: {e}")
+
+        grounded_search_site_results_text = "Grounded Search 工具檢索無結果或失敗。"
+        try:
+            grounded_search_site_query = (
+                f"查詢關於地點 '{region}' (經緯度: {geo_location}) 的詳細背景資料，"
+                f"包括都市計畫規範、建築法規、氣候資料、日照、人文歷史、水文地質、周邊環境等。"
+                f"參考關鍵字：{site_rag_keywords}"
+            )
+            print(f"DEBUG SiteAnalysisTask [Step 4]: Invoking perform_grounded_search with query: {grounded_search_site_query}")
+            search_tool_output = perform_grounded_search({"query": grounded_search_site_query})
+            if isinstance(search_tool_output, dict):
+                grounded_search_site_results_text = search_tool_output.get("text_content", "")
+            elif isinstance(search_tool_output, str):
+                grounded_search_site_results_text = search_tool_output
+            print(f"✅ SiteAnalysisTask [Step 4]: perform_grounded_search 檢索結果 (文本部分): '{grounded_search_site_results_text[:200]}...'")
+        except Exception as e:
+            print(f"⚠️ SiteAnalysisTask [Step 4]: perform_grounded_search 調用失敗: {e}")
+
+        combined_site_rag_info = (
+            f"內部知識庫檢索 (ARCH_rag_tool):\n{arch_rag_site_results}\n\n"
+            f"網路與文獻搜索 (perform_grounded_search):\n{grounded_search_site_results_text}"
+        )
+
+        # --- 步驟 5: 執行最終的 LLM 分析，整合圖片辨識和所有 RAG 資訊 ---
+        final_analysis_result_content = "最終基地分析報告生成失敗。"
+        try:
+            llm_analysis_prompt_content = active_config.site_analysis_llm_prompt_template.format(
+                region=region,
+                geo_location=geo_location,
+                analysis_img=str(initial_img_analysis_content), # 確保是字符串
+                rag_supplementary_info=combined_site_rag_info,
+                llm_output_language=active_language
+            )
+            print(f"DEBUG SiteAnalysisTask [Step 5]: Prompt for final LLM analysis: {llm_analysis_prompt_content}")
+            analysis_result_msg = current_llm.invoke([SystemMessage(content=llm_analysis_prompt_content)])
+            final_analysis_result_content = analysis_result_msg.content
+            self.state["site_analysis"] = final_analysis_result_content
+            print(f"✅ SiteAnalysisTask [Step 5]: 最終的、整合了RAG的分析報告: '{final_analysis_result_content[:200]}...'")
+        except Exception as e:
+            print(f"⚠️ SiteAnalysisTask [Step 5]: 生成最終分析報告時發生錯誤: {e}")
+            self.state["site_analysis"] = f"最終基地分析報告生成失敗: {e}"
+
+        print("✅ SiteAnalysisTask.run COMPLETED")
         return {
-            "analysis_img": self.state["analysis_img"],
-            "site_analysis": self.state["site_analysis"],
+            "analysis_img": self.state["analysis_img"], # 保持為初步圖片辨識結果
+            "site_analysis": self.state["site_analysis"], # 更新為最終分析報告
         }
 
 # 設計方案任務 OK
@@ -207,60 +431,61 @@ class RAGdesignThinking:
     def __init__(self, state: GlobalState):
         self.state = state
 
-    def run(self, state=None):
+    def run(self, state: GlobalState, config: GraphOverallConfig | dict):
         if state is not None:
             self.state = state        
-
-        # 讀取設計參數
-        design_goal = self.state.get("design_summary", "無目標")
-        analysis_result = self.state.get("site_analysis", "無基地條件")
-        current_round = self.state.get("current_round", 0)
-        improvement = self.state.get("GATE_REASON1", "")
-
-        # llm1 prompt
-        prompt_keywords_preliminary = f"""
-        你是一位經驗豐富的資深建築設計顧問，
-        基於以下資料：
-        設計目標：{design_goal}
-        基地分析報告：{analysis_result}
         
-        請為 Timber pavilion 設計提供具體且細緻的參考資料關鍵詞。
-        **請列出RAG中英文關鍵字，格式為:中文(英文)**。描述相關案例、構造細節及製造工法。
-        """
-        response_kp = llm.invoke([SystemMessage(content=prompt_keywords_preliminary)])
-        response_text = response_kp.content
+        active_config = ensure_graph_overall_config(config)
+        current_llm = active_config.llm_config.get_llm()
+        active_language = active_config.llm_output_language
 
-        print("生成的關鍵詞：", response_text)
+        design_goal_summary = self.state.get("design_summary", "無設計目標總結") # 從 QuestionTask 獲取的總結
+        analysis_result = self.state.get("site_analysis", "無基地分析結果")
+        current_round = self.state.get("current_round", 0)
+        improvement = self.state.get("GATE_REASON1", "") 
 
-        # Step 2: 使用關鍵字進行 RAG 檢索以獲取參考資料
-        rag_prompt = f"請根據關鍵字查詢相關案例、構造細節及製造工法、減碳及循環永續性、技術細節及研究理論：{response_text}。"
-        RAG_msg = ARCH_rag_tool.invoke({"query": rag_prompt})
-        print("RAG 檢索結果：", RAG_msg)
+        # 新的 "keywords_prompt_content" - 現在是引導設計方向，而不是生成 RAG 關鍵詞
+        # 它會參考 design_goal_summary 和 analysis_result
+        # rag_design_thinking_keywords_prompt_template 在 T_config.py 中也需要更新
+        design_directions_prompt_content = active_config.rag_design_thinking_keywords_prompt_template.format(
+            design_goal_summary=design_goal_summary, # 更新變數名
+            analysis_result=analysis_result,
+            llm_output_language=active_language
+        )
+        response_design_directions_msg = current_llm.invoke([SystemMessage(content=design_directions_prompt_content)])
+        # design_directions_text 現在是設計方向的文本描述
+        design_directions_text = response_design_directions_msg.content.strip()
+        print("生成的設計方向指引：", design_directions_text)
 
-        # Step 3: 利用初步方案與 RAG 參考資料生成完整方案
-        prompt_complete = f"""
-        你是一位經驗豐富的資深建築設計顧問，根據以下方面生成完整的設計方案：
-        主要設計決策針對**幾何形狀(比如方、圓、三角、錐型、塔型等)、外殼形式(比如平面、單曲面、雙曲面、自由曲面等)、木構造細節**。
-        及次要設計決策針對日照、熱環境、風環境、噪音、景觀、基地周遭紋理等。專注於外殼設計，需要具有參數式設計的美感、高度創意性及前衛性。
-        請綜合以下內容，以設計目標及改進建議為重點，提出一個完整、具備細節且具創新性、可行性的設計方案。
-        **設計目標**：{design_goal}
-        **改進建議**: {improvement}
-        基地分析報告：{analysis_result}
-        參考資料：{RAG_msg}
-        """
-        complete_response = llm.invoke([SystemMessage(content=prompt_complete)])
-        complete_scheme = complete_response.content
+        # 不再調用 ARCH_rag_tool
+        # RAG_msg_content 現在可以直接使用 design_directions_text 或其他相關內容
+        # 如果 complete_scheme_prompt_template 仍然需要 rag_msg 變數，
+        # 我們可以將 design_directions_text 作為 rag_msg 傳入，
+        # 或者修改 complete_scheme_prompt_template 以接受 design_directions
+        
+        # 假設 complete_scheme_prompt_template 中的 rag_msg 現在代表更廣泛的參考資料或設計指引
+        # 我們將 design_directions_text 用於此處，或者您可以選擇其他更有意義的內容
+        # T_config.py 中的 rag_design_thinking_complete_scheme_prompt_template 的描述也應該更新
+        complete_scheme_prompt_content = active_config.rag_design_thinking_complete_scheme_prompt_template.format(
+            design_goal_summary=design_goal_summary, # 更新變數名
+            improvement=improvement,
+            analysis_result=analysis_result,
+            # rag_msg=RAG_msg_content, # 原來的 RAG 結果
+            design_directions=design_directions_text, # 新的設計方向指引
+            llm_output_language=active_language
+        )
+        complete_response_msg = current_llm.invoke([SystemMessage(content=complete_scheme_prompt_content)])
+        complete_scheme_content = complete_response_msg.content
 
-        new_scheme_entry = {"round":int(current_round),"proposal":str(complete_scheme)}
-
-        # 使用 custom_add_messages 累加存入 state (design_advice 也使用累加功能)
+        new_scheme_entry = {"round": int(current_round), "proposal": str(complete_scheme_content)}
         existing_advice = self.state.get("design_advice", [])
+        if not isinstance(existing_advice, list): 
+            existing_advice = []
         updated_advice = custom_add_messages(existing_advice, [new_scheme_entry])
         self.state["design_advice"] = updated_advice
 
         print("✅ 設計建議已完成！")
         print(f"最終設計建議：{self.state['design_advice']}")
-
         return {"design_advice": self.state["design_advice"]}
 
 # GATE 檢查方案（請回答：有/沒有） OK
@@ -268,79 +493,81 @@ class GateCheck1:
     def __init__(self, state: GlobalState):
         self.state = state
 
-    def run(self, state=None):
+    def run(self, state: GlobalState, config: GraphOverallConfig | dict):
         if state is not None:
             self.state = state
+        
+        active_config = ensure_graph_overall_config(config)
+        current_llm = active_config.llm_config.get_llm()
+        active_language = active_config.llm_output_language
 
         design_advice_raw = self.state.get("design_advice", [])
-        site_analysis = self.state.get("site_analysis", "無基地條件")
         design_summary = self.state.get("design_summary", "無目標")
 
         def ensure_dict(item):
             if isinstance(item, dict):
                 return item
-            try:
-                return json.loads(item)
-            except Exception as e:
-                print(f"⚠️ 無法解析項目: {item}，錯誤：{e}")
-                return None
+            if isinstance(item, str):
+                try:
+                    # Try to parse if it's a JSON string representing a dict
+                    parsed_item = json.loads(item)
+                    if isinstance(parsed_item, dict):
+                        return parsed_item
+                except json.JSONDecodeError:
+                    # If it's not a JSON string, and we expect dicts, this might be an issue.
+                    # For now, we'll assume items are either dicts or JSON strings of dicts.
+                    print(f"⚠️ 無法解析項目為字典: {item}")
+                    return None # Or handle as per logic, e.g., wrap in a default dict structure
+            print(f"⚠️ 項目不是字典或JSON字串: {item}")
+            return None
 
-        # - formatted_current: 沒有 state 鍵的對象
-        # - formatted_previous: 已包含 state 鍵的對象
         design_advice_list = []
-        for item in design_advice_raw:
-            d = ensure_dict(item)
-            if d is not None:
-                design_advice_list.append(d)
+        if isinstance(design_advice_raw, list):
+            for item in design_advice_raw:
+                d = ensure_dict(item)
+                if d is not None:
+                    design_advice_list.append(d)
+        else:
+             # Handle case where design_advice_raw is not a list (e.g. initial empty string)
+            print(f"⚠️ design_advice_raw 不是列表: {design_advice_raw}")
 
         # 使用新條件：沒有 "state" 鍵的對象作為 current proposals
         current_proposals = [
-            advice for advice in design_advice_list if "state" not in advice
+            advice for advice in design_advice_list if isinstance(advice, dict) and "state" not in advice
         ]
         historical_proposals = [
-            advice for advice in design_advice_list if "state" in advice
+            advice for advice in design_advice_list if isinstance(advice, dict) and "state" in advice
         ]
 
         if not current_proposals:
             print("⚠️ 當前無符合條件的設計建議方案（未找到不含 state 鍵的對象）。")
             self.state["GATE1"] = "沒有"
             self.state["GATE_REASON1"] = "當前無符合條件的設計建議方案（未找到不含 state 鍵的對象）"
-            return {"GATE1": self.state["GATE1"], "GATE_REASON1": self.state["GATE_REASON1"]}
+            # Ensure design_advice remains a list
+            if not isinstance(self.state.get("design_advice"), list):
+                self.state["design_advice"] = []
+            return {"GATE1": self.state["GATE1"], "GATE_REASON1": self.state["GATE_REASON1"], "design_advice": self.state["design_advice"]}
 
         # 格式化輸出以供 prompt 使用
         formatted_current = json.dumps(current_proposals, ensure_ascii=False, indent=2)
         formatted_previous = json.dumps(historical_proposals, ensure_ascii=False, indent=2)
 
-        prompt = f"""
-        你是一位專業的建築方案評審員。
-        請根據以下設計建議提供判斷及評比，須對於設計需求具有回應性，且與之前輪次的方案不過於接近。
+        gate1_prompt_content = active_config.gate_check1_prompt_template.format(
+            design_summary=design_summary,
+            formatted_current=formatted_current,
+            formatted_previous=formatted_previous,
+            llm_output_language=active_language
+        )
 
-        1.循環經濟潛力 (Circular Economy Potential): 方案是否展現朝向材料循環利用、永續木材來源的潛力？
-        判斷點: 方案是否具有發展材料再利用、回收、模組化或組裝效率等處理計畫的機會 (即使沒有詳細計畫)？
-        2.材料效率潛力 (Material Efficiency Potential): 方案是否展現減少材料浪費、提升材料利用率的潛力？
-        判斷點: 方案是否具有發展規劃優化設計、數位製造、集成木材等方法的機會 (即使沒有具體數據)？
-        3.製造效率潛力 (Manufacturing Efficiency Potential): 方案是否展現提升製造與施工效率的潛力？
-        判斷點: 方案是否具有發展規劃預製化、模組化、自動化生產、簡化施工等策略的機會 (即使沒有詳細流程)？
-        4.永續環保潛力 (Environmental Sustainability Potential): 方案是否展現降低環境足跡、符合永續環保原則的潛力？
-        判斷點: 方案是否具有發展規劃木材的減少浪費、環境友善、減少污染的製造策略的機會 (即使沒有量化數據)？
-        5.減碳潛力 (Carbon Reduction Potential): 方案是否展現碳封存、減少碳排放的潛力？
-        判斷點: 方案是否具有發展規劃木構造的在地性、減碳效益、碳封存等策略的機會 (即使沒有碳排計算)？
+        llm_response_msg = current_llm.invoke([SystemMessage(content=gate1_prompt_content)])
+        response_content = llm_response_msg.content
+        response_lines = [line.strip() for line in response_content.splitlines() if line.strip()]
         
-        只有在符合設計需求的前提下，其他方面都具備潛力，才是"有"。反之就是"沒有。
-        **請回覆兩行：第一行僅包含判斷後的"有"或"沒有"；第二行請說明改進的建議。**
-        **設計需求**：{design_summary}
-        當前輪次方案：{formatted_current}
-        之前輪次方案：{formatted_previous}
-        """.strip()
-#        基地分析：{site_analysis}
+        evaluation_result = "沒有" # Default
+        reason = "LLM 回覆格式不符或為空" # Default
 
-        # 調用 LLM 並取得回覆
-        llm_response = llm.invoke([SystemMessage(content=prompt)])
-        response_lines = [line.strip() for line in llm_response.content.splitlines() if line.strip()]
         if not response_lines:
             print("⚠️ LLM 回覆為空，請檢查提示格式。")
-            evaluation_result = "沒有"
-            reason = "LLM 回覆為空，請檢查提示格式"
         else:
             evaluation_result = response_lines[0]
             reason = response_lines[1] if len(response_lines) > 1 else "空"
@@ -349,19 +576,15 @@ class GateCheck1:
         state_value = True if evaluation_result == "有" else False
 
         # 為每個當前方案字典新增 state 鍵
-        for advice in current_proposals:
-            advice["state"] = state_value
+        for advice_dict_item in current_proposals: # Renamed to avoid conflict
+            if isinstance(advice_dict_item, dict): # Ensure it's a dict before assigning
+                 advice_dict_item["state"] = state_value
 
-        # 覆蓋 design_advice[-1]：若存在則移除最後一個，再新增 current_proposals
-        existing_advice = self.state.get("design_advice", [])
-        if existing_advice:
-            # 移除最後一個設計建議
-            existing_advice.pop()
-            updated_advice = existing_advice + current_proposals
-        else:
-            updated_advice = current_proposals
-
-        self.state["design_advice"] = updated_advice
+        # 覆蓋 design_advice: 將 historical_proposals 與更新後的 current_proposals 合併
+        # existing_advice was already processed into design_advice_list.
+        # We need to reconstruct design_advice based on historical and updated current.
+        updated_design_advice_list = historical_proposals + current_proposals
+        self.state["design_advice"] = updated_design_advice_list
 
         # 最後 self.state["GATE1"] 僅返回評判結果（"有" 或 "没有"）
         self.state["GATE1"] = evaluation_result
@@ -371,286 +594,1018 @@ class GateCheck1:
         return {"GATE1": self.state["GATE1"], "GATE_REASON1": self.state["GATE_REASON1"], "design_advice": self.state["design_advice"]}
         
 
-# 外殼 Prompt 生成：呼叫 LLM（使用 prompt 生成工具）根據基地資訊與融合圖生成設計 prompt OK
-class OuterShellPromptTask:
+# # 外殼 Prompt 生成：呼叫 LLM（使用 prompt 生成工具）根據基地資訊與融合圖生成設計 prompt OK
+# class OuterShellPromptTask:
+#     def __init__(self, state: GlobalState):
+#         self.state = state
+
+#     def run(self, state: GlobalState, config: GraphOverallConfig | dict):
+#         if state is not None:
+#             self.state = state
+
+#         active_config = ensure_graph_overall_config(config)
+#         current_llm = active_config.llm_config.get_llm()
+#         active_language = active_config.llm_output_language
+
+#         current_round = self.state.get("current_round", 0)
+#         design_advice_list_raw = self.state.get("design_advice", [])
+#         improvement = self.state.get("GATE_REASON1", "")
+        
+#         design_advice_list = []
+#         if isinstance(design_advice_list_raw, list):
+#             design_advice_list = [item for item in design_advice_list_raw if isinstance(item, dict)]
+
+
+#         # 過濾出當前輪次且 state 為 True 的設計方案（必須是字典格式）
+#         valid_advices = [
+#             advice for advice in design_advice_list
+#             if advice.get("round") == current_round and advice.get("state") == True
+#         ]
+        
+#         advice_text = "無目標"
+#         if valid_advices:
+#             selected_advice = valid_advices[0]
+#             advice_text = selected_advice.get("proposal", "無目標")
+#         else:
+#             print(f"⚠️ OuterShellPromptTask: 未找到輪次 {current_round} 且 state 為 True 的有效設計建議。")
+
+
+#         gpt_prompt_content = active_config.outer_shell_gpt_prompt_template.format(
+#             advice_text=advice_text,
+#             improvement=improvement,
+#             llm_output_language=active_language
+#         )
+
+#         gpt_output_msg = current_llm.invoke([SystemMessage(content=gpt_prompt_content)])
+#         final_prompt_text = gpt_output_msg.content if hasattr(gpt_output_msg, "content") else "❌ GPT 生成失敗"
+
+#         lora_guidance_prompt_content = active_config.outer_shell_lora_prompt_template.format(
+#             final_prompt=final_prompt_text,
+#             llm_output_language=active_language
+#         )
+
+#         gpt_output2_msg = current_llm.invoke([SystemMessage(content=lora_guidance_prompt_content)])
+#         lora_value_str = gpt_output2_msg.content.strip() if hasattr(gpt_output2_msg, "content") else "0.5"
+        
+#         try:
+#             # Attempt to convert to float, ensure it's a number
+#             float(lora_value_str)
+#         except ValueError:
+#             print(f"⚠️ LoRA權重生成非數字 '{lora_value_str}', 使用預設值 0.5")
+#             lora_value_str = "0.5"
+
+
+#         new_prompt_entry = {"round":int(current_round),"prompt": str(final_prompt_text),"lora":str(lora_value_str)}
+        
+#         existing_prompts_list = self.state.get("outer_prompt", [])
+#         if not isinstance(existing_prompts_list, list):
+#             existing_prompts_list = []
+        
+#         updated_prompts = existing_prompts_list + [new_prompt_entry]
+#         self.state["outer_prompt"] = updated_prompts
+
+
+#         print("✅ 生成外殼 Prompt 完成！")
+#         print(f"📌 外殼 Prompt: {final_prompt_text}, LoRA: {lora_value_str}")
+#         return {"outer_prompt": self.state["outer_prompt"]}
+
+# # 方案情境生成：呼叫 LLM（使用圖片生成工具）根據外殼 prompt 與融合圖生成未來情境圖 OK
+# class CaseScenarioGenerationTask:
+#     def __init__(self, state: GlobalState):
+#         self.state = state
+
+#     def run(self, state: GlobalState, config: GraphOverallConfig | dict):
+#         if state is not None:
+#             self.state = state
+
+#         active_config = ensure_graph_overall_config(config)
+#         current_round = self.state.get("current_round", 0)
+#         outer_prompt_list_raw = self.state.get("outer_prompt", [])
+        
+#         # 從配置中讀取要生成的圖片數量
+#         num_images_to_generate = active_config.case_scenario_image_count
+
+#         outer_prompt_list = []
+#         if isinstance(outer_prompt_list_raw, list):
+#             outer_prompt_list = [item for item in outer_prompt_list_raw if isinstance(item, dict)]
+
+#         # 篩選出當前輪次且不含 "state" 鍵的字典 (i.e., the latest one for this round)
+#         current_round_prompts = [
+#             item for item in outer_prompt_list 
+#             if item.get("round") == current_round and "state" not in item
+#         ]
+
+#         prompt_to_use = ""
+#         lora_to_use = "0.5" # Default
+
+#         if current_round_prompts:
+#             latest_prompt_entry = current_round_prompts[-1] # Get the last one for the current round
+#             prompt_to_use = latest_prompt_entry.get("prompt", "")
+#             lora_to_use = latest_prompt_entry.get("lora", "0.5")
+#         else:
+#             print(f"⚠️ CaseScenarioGenerationTask: 未找到輪次 {current_round} 的外殼 prompt。")
+#             if outer_prompt_list:
+#                 latest_prompt_entry = outer_prompt_list[-1]
+#                 prompt_to_use = latest_prompt_entry.get("prompt", "")
+#                 lora_to_use = latest_prompt_entry.get("lora", "0.5")
+#                 print(f"↪️  使用最後一個可用的 prompt: {prompt_to_use}")
+
+
+#         if not prompt_to_use:
+#             print("❌ CaseScenarioGenerationTask: 無可用 prompt 生成圖片。")
+#             if not isinstance(self.state.get("case_image"), list):
+#                 self.state["case_image"] = []
+#             # 返回一個表示失敗的條目或保持為空列表
+#             self.state["case_image"] = custom_add_messages(
+#                 self.state.get("case_image", []), 
+#                 [{"round": current_round, "id_in_round": 1, "filename": "無Prompt生成失敗", "image_url": "未生成"}]
+#             )
+#             return {"case_image": self.state["case_image"]}
+
+#         generated_image_infos = []
+#         render_cache_dir = os.path.join(os.getcwd(), "output", "render_cache")
+#         os.makedirs(render_cache_dir, exist_ok=True)
+
+#         # 調用一次 case_render_image 工具，讓它根據 num_images_to_generate 生成所有圖片
+#         all_generated_filenames_str = case_render_image.invoke({
+#             "current_round": current_round,
+#             "outer_prompt": prompt_to_use,
+#             "i": num_images_to_generate, # 將要生成的總數傳給工具
+#             "strength": lora_to_use
+#         })
+
+#         generated_filenames_list = []
+#         if all_generated_filenames_str and isinstance(all_generated_filenames_str, str):
+#             # 工具返回逗號分隔的檔名
+#             generated_filenames_list = [fn.strip() for fn in all_generated_filenames_str.split(',') if fn.strip()]
+        
+#         if not generated_filenames_list:
+#             print(f"⚠️ 圖片生成工具未返回任何有效文件名 (工具返回: {all_generated_filenames_str})。")
+#             generated_image_infos.append({
+#                 "round": current_round,
+#                 "id_in_round": 1, # 標記一個錯誤條目
+#                 "filename": "工具未返回文件名",
+#                 "image_url": "未生成"
+#             })
+#         else:
+#             print(f"🖼️ 工具返回了 {len(generated_filenames_list)} 個文件名: {generated_filenames_list}")
+#             for idx, generated_filename in enumerate(generated_filenames_list):
+#                 image_url = "未生成"
+#                 # 確保文件名是有效的字符串且不是錯誤標記
+#                 if generated_filename and isinstance(generated_filename, str) and \
+#                    generated_filename not in ["生成失敗", "文件未找到", "工具未返回文件名"]: # 添加更多可能的錯誤標記
+                    
+#                     image_path_in_cache = os.path.join(render_cache_dir, generated_filename)
+#                     if os.path.exists(image_path_in_cache):
+#                         try:
+#                             with open(image_path_in_cache, "rb") as image_file:
+#                                 encoded_image = base64.b64encode(image_file.read()).decode('utf-8')
+#                             image_url = f"data:image/png;base64,{encoded_image}" # 假設總是PNG，或從文件名推斷
+#                             print(f"✅ 成功處理圖片: {generated_filename}")
+#                         except Exception as e:
+#                             print(f"⚠️ 無法讀取或編碼圖片文件 {generated_filename}: {e}")
+#                             image_url = "讀取或編碼失敗"
+#                     else:
+#                         print(f"⚠️ 工具聲稱生成了圖片 '{generated_filename}' 但在路徑 '{image_path_in_cache}' 未找到。")
+#                         image_url = "文件於快取未找到"
+#                 else:
+#                     print(f"⚠️ 工具返回了無效或錯誤標記的檔名: '{generated_filename}'")
+#                     image_url = "生成失敗（工具報告）"
+
+#                 generated_image_infos.append({
+#                     "round": current_round,
+#                     "id_in_round": idx + 1, # 使用列表索引+1作為輪次內ID，與工具內部迭代對應
+#                     "filename": generated_filename,
+#                     "image_url": image_url
+#                 })
+
+#         existing_images_list = self.state.get("case_image", [])
+#         if not isinstance(existing_images_list, list):
+#             existing_images_list = []
+        
+#         updated_images_list = existing_images_list + generated_image_infos # 直接添加列表
+#         self.state["case_image"] = updated_images_list
+
+#         print(f"✅ 方案情境圖處理完成，共處理 {len(generated_image_infos)} 條圖片資訊。")
+#         print(f"詳細圖片資訊: {generated_image_infos}")
+#         return {"case_image": self.state["case_image"]}    
+
+class UnifiedImageGenerationTask:
     def __init__(self, state: GlobalState):
         self.state = state
 
-    def run(self, state=None):
+    def run(self, state: GlobalState, config: GraphOverallConfig | dict):
         if state is not None:
             self.state = state
 
-        # 取得累積的設計建議
-        current_round = self.state.get("current_round", 0)
-        design_advice_list = self.state.get("design_advice", [])
-        improvement = self.state.get("GATE_REASON1", "")
+        active_config = ensure_graph_overall_config(config)
+        current_llm = active_config.llm_config.get_llm() # 用於格式化 prompt
+        active_language = active_config.llm_output_language
         
-        # 過濾出當前輪次且 state 為 True 的設計方案（必須是字典格式）
+        current_round = self.state.get("current_round", 0)
+        design_advice_list_raw = self.state.get("design_advice", [])
+        improvement = self.state.get("GATE_REASON1", "") 
+        num_tool_calls = active_config.case_scenario_image_count 
+
+        design_advice_list = []
+        if isinstance(design_advice_list_raw, list):
+            design_advice_list = [item for item in design_advice_list_raw if isinstance(item, dict)]
+
         valid_advices = [
             advice for advice in design_advice_list
-            if isinstance(advice, dict) and advice.get("round") == current_round and advice.get("state") == True
+            if advice.get("round") == current_round and advice.get("state") == True
         ]
         
-        # 從有效的設計方案中取出 "proposal" 作為 advice_text
+        advice_text = "A creative timber pavilion." 
         if valid_advices:
-            selected_advice = valid_advices[0]
-            advice_text = selected_advice.get("proposal", "無目標")
+            selected_advice = valid_advices[0] 
+            advice_text = selected_advice.get("proposal", advice_text)
         else:
-            advice_text = "無目標"
+            print(f"⚠️ UnifiedImageGenerationTask: 未找到輪次 {current_round} 且 state 為 True 的有效設計建議。將使用預設提案。")
+
+        image_gen_prompt_text_template = active_config.outer_shell_gpt_prompt_template.format(
+            advice_text=advice_text,
+            improvement=improvement,
+            llm_output_language=active_language 
+        )
         
-        gpt_prompt = (
-            f"作為建築師與Prompt engineering，請參考以下設計參考建議來推測未來此小型pavilion的樣貌。"
-            f"使用英文 prompt，只需 positive prompt，要仔細、具體、使用專業的建築木構造設計語法，**最大token不可超過77**。"
-            f"Prompt 主要根據設計提案描述此建築設計外觀、造型曲面型式、木構造細部設計及網格分割形式、整體風格與氛圍。"      
-            f"**在具有細節且構造合理的情況下，需要避免木構造曲面、網格分割過度複雜**。"
-            f"視角必須要看到建築整體，高質感，透視圖。**不生成內部隔間、家具、玻璃、人**。"
-            f"設計提案: {advice_text}"
-            f"改進建議:{improvement}"
-        )
+        final_image_prompt_msg = current_llm.invoke([SystemMessage(content=image_gen_prompt_text_template)])
+        final_image_prompt = final_image_prompt_msg.content.strip() if hasattr(final_image_prompt_msg, "content") else "Error generating image prompt."
+        
+        if "Error generating image prompt" in final_image_prompt:
+             print(f"❌ UnifiedImageGenerationTask: LLM 生成圖像 Prompt 失敗。")
+        else:
+            print(f"✅ UnifiedImageGenerationTask: 生成的最終圖像 Prompt (用於所有調用): '{final_image_prompt[:200]}...'")
 
-        gpt_output = llm.invoke([SystemMessage(content=gpt_prompt)])
-        final_prompt = gpt_output.content if hasattr(gpt_output, "content") else "❌ GPT 生成失敗"
+        existing_outer_prompts = self.state.get("outer_prompt", [])
+        if not isinstance(existing_outer_prompts, list):
+            existing_outer_prompts = []
+        
+        prompts_from_other_rounds = [
+            p for p in existing_outer_prompts if isinstance(p, dict) and p.get("round") != current_round
+        ]
+        new_prompt_entry = {"round": current_round, "prompt": final_image_prompt}
+        self.state["outer_prompt"] = prompts_from_other_rounds + [new_prompt_entry]
+        print(f"ℹ️ UnifiedImageGenerationTask: outer_prompt 已更新，當前輪次 {current_round} 的 prompt: '{final_image_prompt[:100]}...'")
 
-        lora_prompt = (
-            f"請生成一個適合的 LoRA 權重數值，其數值必須在 0.3 到 0.7 之間。"
-            f"權重越重（接近 0.7）表示生成結果會更趨於形式固定沒有創意性的曲面，但木網格構造清晰適合生成具有簍空木網格的構造；"
-            f"權重越輕（接近 0.3）則生成結果會更具設計發散性但失去網格構造或網格不清晰，整體適合生成較為簡約的造型。"
-            f"請根據設計提案動態生成適合的 LoRA 權重。**僅回答權重的數字**"
-            f"設計提案: {final_prompt}"
-        )
+        generated_image_infos = []
+        
+        base_render_cache_dir = os.path.join(os.getcwd(), "output", "cache", "render_cache")
+        os.makedirs(base_render_cache_dir, exist_ok=True) 
 
-        gpt_output2 = llm.invoke([SystemMessage(content=lora_prompt)])
-        lora_prompt = gpt_output2.content
 
-        new_prompt_entry = {"round":int(current_round),"prompt": str(final_prompt),"lora":str(lora_prompt)}
-        existing_prompts = self.state.get("outer_prompt", [])
-        if not isinstance(existing_prompts, list):
-            existing_prompts = []
-        self.state["outer_prompt"] = custom_add_messages(existing_prompts, [new_prompt_entry])
+        if "Error generating image prompt" in final_image_prompt or not final_image_prompt:
+            print(f"❌ UnifiedImageGenerationTask: 因 Prompt 生成失敗，跳過所有圖像生成調用。")
+            existing_case_images = self.state.get("case_image", [])
+            if not isinstance(existing_case_images, list): existing_case_images = []
+            error_entry = {
+                "round": current_round,
+                "id_in_round": 1, 
+                "filename": "Prompt生成失敗", # Basename
+                "image_url": "未生成",
+                "description": "LLM failed to generate a valid image prompt.",
+                "path": "無" 
+            }
+            images_from_other_rounds_img = [img for img in existing_case_images if isinstance(img, dict) and img.get("round") != current_round]
+            self.state["case_image"] = images_from_other_rounds_img + [error_entry]
+            return {
+                "case_image": self.state["case_image"],
+                "outer_prompt": self.state["outer_prompt"]
+            }
 
-        print("✅ 生成外殼 Prompt 完成！")
-        print(f"📌 外殼 Prompt: {final_prompt}")
-        return {"outer_prompt": self.state["outer_prompt"]}
+        for call_idx in range(num_tool_calls):
+            print(f"ℹ️ UnifiedImageGenerationTask: 開始第 {call_idx + 1}/{num_tool_calls} 次圖像生成調用...")
+            
+            image_path_to_store = f"處理錯誤_{call_idx + 1}.png" 
+            image_url = "未生成"
+            full_description = ""
+            tool_error_desc = None
+            current_call_tool_text_response = None
+            file_type_for_url = "image/png" 
 
-# 方案情境生成：呼叫 LLM（使用圖片生成工具）根據外殼 prompt 與融合圖生成未來情境圖 OK
-class CaseScenarioGenerationTask:
-    def __init__(self, state: GlobalState):
-        self.state = state
+            try:
+                tool_output = generate_gemini_image.invoke({
+                    "prompt": final_image_prompt, 
+                    "image_inputs": [], 
+                    "i": 1
+                })
 
-    def run(self, state=None):
-        if state is not None:
-            self.state = state
+                current_call_tool_generated_files = []
+                current_call_tool_image_bytes_list = [] 
+                
+                if isinstance(tool_output, dict):
+                    current_call_tool_generated_files = tool_output.get("generated_files", [])
+                    current_call_tool_image_bytes_list = tool_output.get("image_bytes", []) 
+                    current_call_tool_text_response = tool_output.get("text_response")
+                    tool_error_desc = tool_output.get("error")
 
-        current_round = self.state.get("current_round", 0)
-        outer_prompt = self.state.get("outer_prompt", [])
+                    if current_call_tool_text_response:
+                        print(f"  ↪️ 調用 {call_idx + 1}: 工具文字回饋: '{current_call_tool_text_response[:100]}...'")
 
-        # 篩選出不含 "state" 鍵的字典，並提取它們的 "prompt" 值
-        prompt_values = [item["prompt"] for item in outer_prompt
-                        if isinstance(item, dict) and "state" not in item]
+                    if tool_error_desc:
+                        print(f"  ⚠️ 調用 {call_idx + 1}: 圖像生成工具報告錯誤: {tool_error_desc}")
+                        image_path_to_store = f"工具錯誤_調用{call_idx + 1}.png" # This will become a basename later
+                    elif not current_call_tool_generated_files:
+                        print(f"  ⚠️ 調用 {call_idx + 1}: 工具未返回任何文件資訊。 Files: {current_call_tool_generated_files}")
+                        tool_error_desc = "Tool did not return any file information."
+                        image_path_to_store = f"無文件資訊_調用{call_idx + 1}.png" # Basename
+                    else:
+                        file_info = current_call_tool_generated_files[0]
+                        file_type_for_url = file_info.get("file_type", "image/png") 
+                        
+                        path_from_file_info = file_info.get("path")
+                        filename_from_file_info = file_info.get("filename") 
 
-        lora_values = [item["lora"] for item in outer_prompt
-                        if isinstance(item, dict) and "state" not in item]
+                        resolved_image_path = None
+                        if isinstance(path_from_file_info, str) and os.path.isabs(path_from_file_info):
+                            resolved_image_path = path_from_file_info
+                            print(f"  DEBUG UnifiedImageGenerationTask: 使用工具提供的絕對路徑 'path': '{resolved_image_path}'")
+                        elif isinstance(filename_from_file_info, str):
+                            resolved_image_path = os.path.join(base_render_cache_dir, os.path.basename(filename_from_file_info))
+                            print(f"  DEBUG UnifiedImageGenerationTask: 從 'filename' ('{filename_from_file_info}') 和 cache_dir 構造路徑: '{resolved_image_path}'")
+                        else:
+                            tool_error_desc = "Tool returned invalid 'path' or 'filename' in file_info."
+                            image_path_to_store = f"路徑無效_調用{call_idx + 1}.png" # Basename
+                            print(f"  ⚠️ 調用 {call_idx + 1}: 工具返回的文件資訊中 'path' 和 'filename' 均無效。 Path: {path_from_file_info}, Filename: {filename_from_file_info}")
+                        
+                        if resolved_image_path:
+                            image_path_to_store = resolved_image_path 
+                            print(f"  DEBUG UnifiedImageGenerationTask: 解析得到的待檢查路徑: '{image_path_to_store}' (類型: {type(image_path_to_store)}) for call {call_idx + 1}")
 
-        prompt_str = " ".join(prompt_values)
-        lora_str = " ".join(lora_values)
+                            img_bytes_data_for_url = None
+                            if current_call_tool_image_bytes_list and isinstance(current_call_tool_image_bytes_list[0].get("data"), bytes):
+                                img_bytes_data_for_url = current_call_tool_image_bytes_list[0].get("data")
+                                print(f"  ℹ️ 調用 {call_idx + 1}: 工具直接返回了圖片字節數據。")
+                            
+                            if not os.path.exists(image_path_to_store):
+                                 print(f"  ⚠️ 調用 {call_idx + 1}: 解析後的圖片路徑 '{image_path_to_store}' 文件不存在。")
+                                 tool_error_desc = tool_error_desc or f"Resolved image file does not exist: {os.path.basename(image_path_to_store)}"
+                            else:
+                                if not img_bytes_data_for_url:
+                                    print(f"  ℹ️ 調用 {call_idx + 1}: 文件 '{os.path.basename(image_path_to_store)}' 存在，但工具未直接返回字節。嘗試從文件讀取以生成URL...")
+                                    try:
+                                        with open(image_path_to_store, "rb") as f_read:
+                                            img_bytes_data_for_url = f_read.read()
+                                        print(f"    ✅ 成功從文件讀取字節數據: {os.path.basename(image_path_to_store)}")
+                                    except Exception as e_read_file:
+                                        print(f"    ⚠️ 從文件讀取字節數據失敗: {os.path.basename(image_path_to_store)}, Error: {e_read_file}")
+                                        tool_error_desc = tool_error_desc or f"Failed to read file bytes: {e_read_file}"
+                                
+                                if img_bytes_data_for_url:
+                                    try:
+                                        encoded_image = base64.b64encode(img_bytes_data_for_url).decode('utf-8')
+                                        image_url = f"data:{file_type_for_url};base64,{encoded_image}" 
+                                        print(f"  ✅ 調用 {call_idx + 1}: 成功處理圖片並生成URL: {os.path.basename(image_path_to_store)}")
+                                    except Exception as e_encode:
+                                        print(f"  ⚠️ 調用 {call_idx + 1}: 無法編碼圖片數據 for {os.path.basename(image_path_to_store)}: {e_encode}")
+                                        image_url = "編碼失敗"
+                                        tool_error_desc = tool_error_desc or f"Encoding failed: {e_encode}"
+                                elif not tool_error_desc : 
+                                     image_url = "讀取字節失敗"
+                else: 
+                    print(f"  ⚠️ 調用 {call_idx + 1}: 工具返回了意外的輸出格式: {type(tool_output)}")
+                    tool_error_desc = "Unexpected tool output format."
+                    image_path_to_store = f"格式錯誤_調用{call_idx + 1}.png" # Basename
 
-        # 循環四次生成圖片，並將返回的檔名以字典格式存放，格式例如：{1: "shell_result_{current_round}_1.png"}
-        combined_images = []
-        render_cache_dir = os.path.join(os.getcwd(), "output", "render_cache")
-        for i in range(1, 5):  # 循環 1~4 次
-            # 呼叫圖片生成工具，傳入當前輪次、outer_prompt 以及當前生成次數 i
-            case_image_path = case_render_image.invoke({
-                "current_round": current_round,
-                "outer_prompt": prompt_str,
-                "i": i,
-                "strength":lora_str
+            except Exception as e_invoke:
+                print(f"  💥 調用 {call_idx + 1} 期間調用工具時發生意外錯誤: {e_invoke}")
+                tool_error_desc = f"Exception during tool call: {e_invoke}"
+                image_path_to_store = f"調用異常_{call_idx+1}.png" # Basename
+            
+            base_description = (
+                f"Agent: UnifiedImageGeneration; Round: {current_round}; "
+                f"CallNum: {call_idx + 1}/{num_tool_calls}; " 
+                f"Prompt: {final_image_prompt[:50]}..."
+            )
+            full_description = base_description
+            if current_call_tool_text_response: 
+                full_description += f" | ToolTextResponse: {current_call_tool_text_response}"
+            if tool_error_desc:
+                full_description += f" | Error: {tool_error_desc}"
+                if "處理錯誤" in image_path_to_store and not os.path.isabs(image_path_to_store): 
+                    image_path_to_store = f"具體錯誤_{call_idx + 1}_{tool_error_desc[:20].replace(' ','_')}.png" # Basename
+
+            # 準備存儲到 state 的數據
+            # final_path_for_state 應該是絕對路徑或標準化的錯誤標記
+            # final_filename_for_state 應該是 basename 或標準化的錯誤標記
+            
+            final_path_for_state = "路徑錯誤或生成失敗" # Default error path
+            final_filename_for_state = f"處理錯誤_{call_idx + 1}.png" # Default error filename (basename)
+
+            if os.path.isabs(image_path_to_store): # 如果 image_path_to_store 已經是絕對路徑
+                if os.path.exists(image_path_to_store):
+                    final_path_for_state = image_path_to_store
+                    final_filename_for_state = os.path.basename(image_path_to_store)
+                else: # 絕對路徑但文件不存在
+                    final_path_for_state = image_path_to_store # 存儲嘗試的路徑
+                    final_filename_for_state = os.path.basename(image_path_to_store) + "_文件不存在"
+                    # image_url 應已是 "未生成" 或錯誤狀態
+            elif not any(err_tag in image_path_to_store for err_tag in ["錯誤", "無效", "異常"]):
+                # 如果 image_path_to_store 不是絕對路徑且不是已知錯誤標記 (例如，它是從工具返回的 basename)
+                potential_abs_path = os.path.join(base_render_cache_dir, os.path.basename(image_path_to_store))
+                if os.path.exists(potential_abs_path):
+                    final_path_for_state = potential_abs_path
+                    final_filename_for_state = os.path.basename(potential_abs_path)
+                else:
+                    final_path_for_state = potential_abs_path # 存儲嘗試的路徑
+                    final_filename_for_state = os.path.basename(image_path_to_store) + "_文件不存在"
+            else: # image_path_to_store 本身就是一個錯誤標記 (例如 "工具錯誤_...")
+                final_filename_for_state = image_path_to_store # 使用這個錯誤標記作為檔名
+                # final_path_for_state 保持為 "路徑錯誤或生成失敗"
+
+            generated_image_infos.append({
+                "round": current_round,
+                "id_in_round": call_idx + 1, 
+                "filename": final_filename_for_state, # 存儲 basename 或錯誤標記
+                "image_url": image_url,
+                "description": full_description,
+                "path": final_path_for_state # 存儲絕對路徑或標準化錯誤標記
             })
             
-            # 從 render_cache 目錄中取得圖片檔案
-            image_path = os.path.join(render_cache_dir, case_image_path)
-            if os.path.exists(image_path):
-                with open(image_path, "rb") as image_file:
-                    encoded_image = base64.b64encode(image_file.read()).decode('utf-8')
-                image_url = f"data:image/png;base64,{encoded_image}"
-            else:
-                image_url = "未生成"
+            if call_idx < num_tool_calls - 1:
+                print(f"  ℹ️ 調用 {call_idx + 1} 完成後延遲 5 秒...") 
+                time.sleep(5)
 
-            # 將每個生成結果以字典形式存放，key 為生成次數，值為包含檔名與 URL 的字典
-            combined_images.append({i: case_image_path, "output": image_url})
+        existing_images_list = self.state.get("case_image", [])
+        if not isinstance(existing_images_list, list):
+            existing_images_list = []
+        
+        images_from_other_rounds_img_final = [img for img in existing_images_list if isinstance(img, dict) and img.get("round") != current_round]
+        updated_images_list = images_from_other_rounds_img_final + generated_image_infos
+        self.state["case_image"] = updated_images_list
 
-        # 使用 custom_add_messages 累加存入 state["case_image"]
-        existing_images = self.state.get("case_image", [])
-        updated_images = custom_add_messages(existing_images, combined_images)
-        self.state["case_image"] = updated_images
+        print(f"✅ UnifiedImageGenerationTask: 所有圖像生成調用完成，共處理 {len(generated_image_infos)} 條圖片資訊。")
+        if generated_image_infos:
+            for idx, info in enumerate(generated_image_infos):
+                 # 在最終日誌中，filename 應該只顯示檔名部分
+                 display_filename = info.get('filename', '未知檔名')
+                 if isinstance(display_filename, str) and os.path.isabs(display_filename) and not any(err_tag in display_filename for err_tag in ["錯誤", "無效", "異常", "失敗"]):
+                     display_filename = os.path.basename(display_filename)
 
-        print(f"✅ 未來情境圖生成完成，圖片資訊: {combined_images}")
-        return {"case_image": self.state["case_image"]}    
+                 print(f"  詳細圖片資訊 ({idx+1}): Filename='{display_filename}', Path='{info.get('path')}', URL: {'有內容' if info.get('image_url') and info.get('image_url').startswith('data:image') else info.get('image_url', '未定義')}")
+        
+        return {
+            "case_image": self.state["case_image"],
+            "outer_prompt": self.state["outer_prompt"] 
+        }
 
 # GATE 檢查方案（請回答：有/沒有） OK
 class GateCheck2:
     def __init__(self, state: GlobalState):
         self.state = state
 
-    def run(self, state=None):
+    def run(self, state: GlobalState, config: GraphOverallConfig | dict):
         if state is not None:
             self.state = state
 
-        # 获取当前轮次与生成的图片列表
-        current_round = self.state.get("current_round", 0)
-        case_images = self.state.get("case_image", [])
-        design_advice_list = self.state.get("design_advice", [])
+        active_config = ensure_graph_overall_config(config)
+        current_llm = active_config.llm_config.get_llm() # 雖然 img_recognition 主要使用，但 prompt 模板可能需要語言
+        active_language = active_config.llm_output_language
+
+        current_round = self.state.get("current_round", 0) 
+        case_images_raw = self.state.get("case_image", [])
+        design_advice_list_raw = self.state.get("design_advice", [])
         
+        case_images_list = []
+        if isinstance(case_images_raw, list):
+            case_images_list = [item for item in case_images_raw if isinstance(item, dict)]
+
+        design_advice_list = []
+        if isinstance(design_advice_list_raw, list):
+            design_advice_list = [item for item in design_advice_list_raw if isinstance(item, dict)]
+
+
         # 過濾出當前輪次且 state 為 True 的設計方案（必須是字典格式）
         valid_advices = [
             advice for advice in design_advice_list
-            if isinstance(advice, dict) and advice.get("round") == current_round and advice.get("state") == True
+            if advice.get("round") == current_round and advice.get("state") == True
         ]
         
-        # 從有效的設計方案中取出 "proposal" 作為 advice_text
+        advice_text = "無目標"
         if valid_advices:
             selected_advice = valid_advices[0]
             advice_text = selected_advice.get("proposal", "無目標")
         else:
-            advice_text = "無目標"
+            print(f"⚠️ GateCheck2: 未找到輪次 {current_round} 且 state 為 True 的有效設計建議。")
 
-        # 提取每个字典中整数键对应的图片文件名
-        image_dict = {}
-        for item in case_images:
-            if isinstance(item, dict):
-                for key, value in item.items():
-                    if isinstance(key, int):
-                        image_dict[key] = value
 
-        # 检查是否有符合条件的图片
-        if not image_dict:
-            print("⚠️ 当前轮次无符合条件的生成图")
+        # Filter images for the current round from self.state["case_image"]
+        current_round_image_infos = [
+            img_info for img_info in case_images_list
+            if img_info.get("round") == current_round and 
+               isinstance(img_info.get("filename"), str) and # Ensure filename is a string
+               img_info.get("filename") not in ["未生成", "文件未找到", "生成失敗", "工具報告錯誤", "工具未返回文件名", "Prompt生成失敗", "無效文件名"] # 更多可能的錯誤標記
+        ]
+
+        if not current_round_image_infos:
+            print(f"⚠️ GateCheck2: 當前輪次 {current_round} 無符合條件的生成圖。篩選後的列表: {current_round_image_infos}")
             self.state["GATE2"] = "没有"
-            self.state["GATE_REASON2"] = "当前轮次无符合条件的生成图"
+            self.state["GATE_REASON2"] = f"當前輪次 {current_round} 無符合條件的生成圖。"
+            # outer_prompt 是舊的邏輯，這裡應該不需要再處理它，因為 UnifiedImageGenerationTask 不依賴 outer_prompt
+            # if not isinstance(self.state.get("outer_prompt"), list):
+            #     self.state["outer_prompt"] = []
+            # return {"GATE2": self.state["GATE2"], "GATE_REASON2": self.state["GATE_REASON2"], "outer_prompt": self.state["outer_prompt"]}
             return {"GATE2": self.state["GATE2"], "GATE_REASON2": self.state["GATE_REASON2"]}
 
-        # 为每个图片文件名添加完整路径
-        OUTPUT_SHELL_CACHE_DIR = "./output/render_cache"
-        full_paths = {key: os.path.join(OUTPUT_SHELL_CACHE_DIR, filename) for key, filename in image_dict.items()}
 
-        # 将图片文件名整理成多行字符串供 prompt 使用（只显示文件名，不含路径）
-        image_list_str = "\n".join(image_dict.values())
+        # 統一圖片緩存目錄的路徑
+        IMAGE_CACHE_DIR = os.path.join(os.getcwd(), "output", "cache", "render_cache")
+        image_paths_for_tool = []
+        image_filenames_for_prompt_list = []
 
-        # 准备 prompt，要求 LLM 根据设计要求评估并选出最佳生成图
-        prompt = f"""
-        你是一位專業的建築圖像評審員，專精於從圖片評估建築構造與製造的可能性。
-        **請根據以下條件進行嚴格評估。
+        current_round_image_infos.sort(key=lambda x: x.get("id_in_round", 0))
 
-        **優先項目**
-        設計符合性與合理性： **需嚴格確保圖片符合設計提案所述外觀**。結構與造型需合理且符合預期，展現良好的建築設計邏輯。
-        **圖片優劣評比項目**
-        圖片品質與細節： 圖片必須清晰，細節表現良好沒有扭曲或透視錯誤。
-        曲面簡潔度： 曲面線條是否簡潔流暢，避免過於複雜破碎。以有效率的使用材料和簡化製造流程。
-        接合構造簡潔性： 木構件接合方式是否簡潔明瞭，避免過於複雜繁瑣。以提高循環使用潛力、降低組裝難度，並減少潛在的結構風險。
-        表面處理完整性： 木材表面是否有塗層、封邊或其他保護處理，處理是否均勻完整，是否能看出針對基地環境氣候的防護考量。
-        結構系統效率性： 結構系統設計是否有效利用材料特性，以較少材料達成所需效能。材料的使用邏輯是否能避免製造上的浪費。
-        造型美觀協調性： 整體造型是否美觀，與周圍環境是否協調。
+        for img_info in current_round_image_infos:
+            filename = img_info.get("filename")
+            if filename and isinstance(filename, str): # 再次確認 filename 是有效字串
+                # 確保 filename 只是文件名，以防萬一
+                base_filename = os.path.basename(filename)
+                full_path = os.path.join(IMAGE_CACHE_DIR, base_filename)
+                if os.path.exists(full_path):
+                    image_paths_for_tool.append(full_path)
+                    image_filenames_for_prompt_list.append(f"{base_filename} (ID: {img_info.get('id_in_round')})")
+                else:
+                    print(f"⚠️ GateCheck2: 圖片文件 {base_filename} 在路徑 {full_path} 中未找到。ImgInfo: {img_info}")
+            else:
+                print(f"⚠️ GateCheck2: 發現無效的圖片文件名或條目: {img_info}")
 
-        **生成圖名順序： {image_list_str}
-        **請回復兩行，優先檢查如果沒有任何圖片符合設計提案所述外觀，請僅回復「沒有」：
-        第一行：僅回復最佳圖片文件名中的 id 數字部分 (整數)。（例如："shell_result_{current_round}_id.png"，則回覆 id）。
-        第二行：回復「有」時綜合說明所有方案的優劣，並詳細解釋選擇此最佳方案的原因。如果回復「沒有」則說明改進建議。
 
-        **設計提案：{advice_text} 
-        """.strip()
+        if not image_paths_for_tool:
+            print(f"⚠️ GateCheck2: 當前輪次 {current_round} 所有圖片文件均未找到或路徑無效。")
+            self.state["GATE2"] = "没有"
+            self.state["GATE_REASON2"] = f"當前輪次 {current_round} 所有圖片文件均未找到或路徑無效。"
+            # outer_prompt 處理同上
+            # if not isinstance(self.state.get("outer_prompt"), list):
+            #     self.state["outer_prompt"] = []
+            # return {"GATE2": self.state["GATE2"], "GATE_REASON2": self.state["GATE_REASON2"], "outer_prompt": self.state["outer_prompt"]}
+            return {"GATE2": self.state["GATE2"], "GATE_REASON2": self.state["GATE_REASON2"]}
 
-        # 调用 img_recognition.invoke 处理所有图片
-        analysis_result = img_recognition.invoke({
-            "image_paths": list(full_paths.values()),
-            "prompt": prompt,
+        image_list_str_for_prompt = "\n".join(image_filenames_for_prompt_list)
+
+        gate2_prompt_content = active_config.gate_check2_img_recognition_prompt_template.format(
+            image_list_str=image_list_str_for_prompt,
+            advice_text=advice_text,
+            llm_output_language=active_language,
+            current_round=current_round 
+        )
+
+        analysis_result_str = img_recognition.invoke({
+            "image_paths": image_paths_for_tool,
+            "prompt": gate2_prompt_content,
         })
 
-        result = analysis_result.strip() if isinstance(analysis_result, str) else ""
-        # 将回复按行分割，解析第一行作为最佳图片 id，第二行作为选择原因
-        lines = [line.strip() for line in result.splitlines() if line.strip()]
+        result_content = analysis_result_str.strip() if isinstance(analysis_result_str, str) else ""
+        lines = [line.strip() for line in result_content.splitlines() if line.strip()]
+        
+        best_id_from_llm = "没有"
+        reason_from_llm = ""
+
         if lines:
             first_line = lines[0]
-            # 尝试解析第一行数字
-            if first_line.isdigit():
-                best_id = int(first_line)
-                self.state["GATE2"] = best_id
-            elif "没有" in first_line or "no" in first_line.lower():
-                self.state["GATE2"] = "没有"
+            if "没有" in first_line or "no" in first_line.lower():
+                best_id_from_llm = "没有"
             else:
-                digit_matches = re.findall(r'\d+', first_line)
-                if digit_matches:
-                    best_id = int(digit_matches[0])
-                    self.state["GATE2"] = best_id
-                else:
-                    print("⚠️ 无法解析 LLM 回复中的最佳方案 id。")
-                    self.state["GATE2"] = "没有"
+                # 從 filename (ID: X) 中提取 ID
+                # 例如 "gemini_gen_xxxx.png (ID: 1)" -> 提取 1
+                id_matches = re.findall(r'\(ID:\s*(\d+)\)', first_line)
+                if id_matches: # 如果是直接提供ID
+                    try:
+                        best_id_from_llm = int(id_matches[0])
+                    except ValueError:
+                         print(f"⚠️ GateCheck2: 無法從LLM回覆的第一行解析ID (格式不符): '{first_line}'")
+                         best_id_from_llm = "没有"
+                else: # 嘗試從純數字中提取
+                    digit_matches = re.findall(r'\b\d+\b', first_line)
+                    if digit_matches:
+                        try:
+                            best_id_from_llm = int(digit_matches[0])
+                        except ValueError:
+                            print(f"⚠️ GateCheck2: 無法從LLM回覆的第一行解析數字ID: '{first_line}'")
+                            best_id_from_llm = "没有"
+                    else:
+                        print(f"⚠️ GateCheck2: LLM 回覆的第一行未找到數字ID: '{first_line}'")
+                        best_id_from_llm = "没有"
             
-            # 解析第二行作为选择原因，若有提供则存入 GATE_REASON2
             if len(lines) >= 2:
-                self.state["GATE_REASON2"] = lines[1]
-            else:
-                self.state["GATE_REASON2"] = ""
-        else:
-            print("⚠️ LLM 回复为空，请检查 prompt 格式。")
-            self.state["GATE2"] = "没有"
-            self.state["GATE_REASON2"] = ""
+                reason_from_llm = lines[1]
+            elif best_id_from_llm != "没有":
+                 reason_from_llm = "LLM 未提供選擇原因。"
+            else: # best_id_from_llm 是 "没有"
+                 reason_from_llm = lines[1] if len(lines) >= 2 else "LLM 未提供改進建議。"
 
-        # 根據 GATE2 判斷評估結果：若為 "没有"，則 state_value 為 False，否則為 True
-        state_value = False if self.state["GATE2"] == "没有" else True
 
-        # 僅為 outer_prompt 列表中的最後一個對象新增 state 鍵
-        outer_prompt = self.state.get("outer_prompt", [])
-        if outer_prompt and isinstance(outer_prompt[-1], dict):
-            outer_prompt[-1]["state"] = state_value
-        # 將更新後的 outer_prompt 回寫回 state
-        self.state["outer_prompt"] = outer_prompt
+        self.state["GATE2"] = best_id_from_llm
+        self.state["GATE_REASON2"] = reason_from_llm
 
-        # 將更新後的 outer_prompt 存回 state
-        self.state["outer_prompt"] = outer_prompt                
+        # 舊的 outer_prompt 狀態更新邏輯已不再需要，因為 UnifiedImageGenerationTask 不依賴 outer_prompt
+        # prompt_state_value = False if self.state["GATE2"] == "没有" else True
+        # outer_prompt_list_for_state = self.state.get("outer_prompt", [])
+        # if not isinstance(outer_prompt_list_for_state, list):
+        #     outer_prompt_list_for_state = []
+        # updated_outer_prompt = False
+        # for prompt_entry in reversed(outer_prompt_list_for_state):
+        #     if isinstance(prompt_entry, dict) and prompt_entry.get("round") == current_round:
+        #         if "state" not in prompt_entry:
+        #             prompt_entry["state"] = prompt_state_value
+        #             updated_outer_prompt = True
+        #             break 
+        # if not updated_outer_prompt and outer_prompt_list_for_state:
+        #     print(f"⚠️ GateCheck2: 未找到輪次 {current_round} 的外殼 prompt 來更新狀態。")
+        # self.state["outer_prompt"] = outer_prompt_list_for_state
 
-        print(f"【GateCheckCaseImage】以收到最佳評估結果：{self.state.get('GATE2')}，原因：{self.state.get('GATE_REASON2')} 😊")
-        return {"GATE2": self.state["GATE2"], "GATE_REASON2": self.state["GATE_REASON2"], "outer_prompt": self.state["outer_prompt"]}
+        print(f"【GateCheckCaseImage】已收到最佳評估結果：{self.state.get('GATE2')}，原因：{self.state.get('GATE_REASON2')} 😊")
+        # return {"GATE2": self.state["GATE2"], "GATE_REASON2": self.state["GATE_REASON2"], "outer_prompt": self.state["outer_prompt"]}
+        return {"GATE2": self.state["GATE2"], "GATE_REASON2": self.state["GATE_REASON2"]}
 
-# 未來情境生成：呼叫 LLM（使用圖片生成工具）根據外殼 prompt 與融合圖生成未來情境圖 OK
+# 未來情境生成：使用 generate_gemini_image 生成方案細節和未來變化圖
 class FutureScenarioGenerationTask:
     def __init__(self, state: GlobalState):
         self.state = state
 
-    def run(self, state=None):
+    def _save_and_encode_image(self, image_bytes: bytes, absolute_filepath: str, extension: str, description: str, current_round: int, sub_id: str) -> dict:
+        """輔助函數：處理工具返回的單個圖片字節和文件名，進行編碼並構建標準圖片資訊字典。
+        absolute_filepath 應為圖片的絕對路徑。
+        """
+        try:
+            encoded_image = base64.b64encode(image_bytes).decode('utf-8')
+            image_url = f"data:image/{extension};base64,{encoded_image}"
+            
+            return {
+                "round": current_round,
+                "id_in_round": sub_id, 
+                "filename": os.path.basename(absolute_filepath), # 儲存純檔案名稱
+                "image_url": image_url,
+                "description": description,
+                "path": absolute_filepath # 儲存絕對路徑
+            }
+        except Exception as e:
+            print(f"⚠️ FutureScenario (_save_and_encode_image): 無法編碼圖片數據 for {absolute_filepath}: {e}")
+            return {
+                "round": current_round,
+                "id_in_round": sub_id,
+                "filename": os.path.basename(absolute_filepath) if absolute_filepath else "編碼失敗.png",
+                "image_url": "無",
+                "description": f"圖片數據編碼失敗: {description}",
+                "error": str(e),
+                "path": absolute_filepath if absolute_filepath else "編碼失敗路徑" 
+            }
+
+    def run(self, state: GlobalState, config: GraphOverallConfig | dict):
         if state is not None:
             self.state = state
 
-        # 1️⃣ 獲取當前輪次、圖片列表與最佳方案 ID (gate2)
+        active_config = ensure_graph_overall_config(config)
+        active_language = active_config.llm_output_language
+        
         current_round = self.state.get("current_round", 0)
-        case_images = self.state.get("case_image", [])
-        gate2 = self.state.get("GATE2", None)
+        design_advice_list_raw = self.state.get("design_advice", [])
+        outer_prompt_list_raw = self.state.get("outer_prompt", [])
+        case_images_list_raw = self.state.get("case_image", [])
+        gate2_result_id = self.state.get("GATE2") 
 
-        # 確保 gate2 為整數型態
-        if not isinstance(gate2, int):
-            print("⚠️ GATE2 的值無效或未找到")
-            self.state["future_image"] = [{"future_image": "没有"}]
-            return {"future_image": self.state["future_image"]}
+        generated_future_images = []
+        
+        base_render_cache_dir = os.path.join(os.getcwd(), "output", "cache", "render_cache")
+        os.makedirs(base_render_cache_dir, exist_ok=True)
 
-        best_id = gate2
+        base_design_text_for_prompt = "一個具有創新性的木構造亭子。"
+        design_advice_list = [item for item in design_advice_list_raw if isinstance(item, dict)]
+        valid_current_round_advice = [
+            adv for adv in design_advice_list 
+            if adv.get("round") == current_round and adv.get("state") == True
+        ]
+        if valid_current_round_advice:
+            base_design_text_for_prompt = valid_current_round_advice[0].get("proposal", base_design_text_for_prompt)
+            print(f"FutureScenario: 使用來自 design_advice 的基礎設計文本: {base_design_text_for_prompt[:100]}...")
+        else:
+            outer_prompt_list = [item for item in outer_prompt_list_raw if isinstance(item, dict)]
+            current_round_outer_prompts = [p for p in outer_prompt_list if p.get("round") == current_round]
+            if current_round_outer_prompts:
+                base_design_text_for_prompt = current_round_outer_prompts[-1].get("prompt", base_design_text_for_prompt)
+                print(f"FutureScenario: 使用來自 outer_prompt (輪次 {current_round}) 的基礎設計文本: {base_design_text_for_prompt[:100]}...")
+            else:
+                print(f"FutureScenario: 未找到當前輪次有效的 design_advice 或 outer_prompt，使用預設設計文本。")
+        
+        base_image_bytes_for_input = None
+        base_image_mime_type_for_input = "image/png" 
+        base_image_filename_for_desc = "無基礎圖"
+        image_inputs_for_tool = []
 
-        # 2️⃣ 過濾符合條件的圖片：找到 key 為 best_id，且 value 以 "shell_result_{current_round}_" 為前綴的項目
-        expected_prefix = f"shell_result_{current_round}_"
-        result = None
-        for item in case_images:
-            if isinstance(item, dict) and best_id in item:
-                case_image_path = item[best_id]
-                if isinstance(case_image_path, str) and case_image_path.startswith(expected_prefix):
-                    result = item
-                    break
+        print(f"FutureScenario: 嘗試查找 GATE2 ID: {gate2_result_id} (類型: {type(gate2_result_id)}) 在輪次 {current_round} 的基礎圖片。")
+        if isinstance(gate2_result_id, int) and case_images_list_raw:
+            case_images_list = [item for item in case_images_list_raw if isinstance(item, dict)]
+            found_base_image = False
+            for img_info in case_images_list:
+                img_id_in_round = img_info.get("id_in_round")
+                img_round = img_info.get("round")
+                
+                if img_round == current_round and img_id_in_round == gate2_result_id:
+                    selected_path_from_case_image = img_info.get("path")
+                    print(f"  FutureScenario: 找到候選圖片資訊: ID={img_id_in_round}, Round={img_round}, Path='{selected_path_from_case_image}'")
 
-        # 3️⃣ 若未找到符合條件的圖片，則返回提示
-        if not result:
-            print(f"⚠️ 未找到符合条件的生成图，轮次：{current_round}，方案 ID：{best_id}")
-            self.state["future_image"] = [{"future_image": "没有"}]
-            return {"future_image": self.state["future_image"]}
+                    if isinstance(selected_path_from_case_image, str) and \
+                       selected_path_from_case_image.strip() and \
+                       selected_path_from_case_image.lower() not in ["無", "路徑錯誤或生成失敗", "none", "編碼失敗"] and \
+                       not any(err_tag in selected_path_from_case_image.lower() for err_tag in ["失敗", "異常", "無效", "错误"]) and \
+                       os.path.exists(selected_path_from_case_image):
+                        try:
+                            with open(selected_path_from_case_image, "rb") as f_img:
+                                base_image_bytes_for_input = f_img.read()
+                            
+                            image_url_from_case = img_info.get("image_url")
+                            if isinstance(image_url_from_case, str) and image_url_from_case.startswith("data:image/"):
+                                base_image_mime_type_for_input = image_url_from_case.split(';')[0].split(':')[1]
+                            elif selected_path_from_case_image.lower().endswith((".jpg", ".jpeg")):
+                                base_image_mime_type_for_input = "image/jpeg"
+                            elif selected_path_from_case_image.lower().endswith(".png"):
+                                base_image_mime_type_for_input = "image/png"
+                            
+                            base_image_filename_for_desc = os.path.basename(selected_path_from_case_image)
+                            image_inputs_for_tool = [{"data": base_image_bytes_for_input, "mime_type": base_image_mime_type_for_input}]
+                            print(f"FutureScenario: ✅ 成功找到並加載基礎圖片: '{base_image_filename_for_desc}' (type: {base_image_mime_type_for_input}) 使用路徑: {selected_path_from_case_image}")
+                            found_base_image = True
+                            break 
+                        except Exception as e_read:
+                            print(f"FutureScenario: ⚠️ 嘗試讀取基礎圖片 '{selected_path_from_case_image}' 失敗: {e_read}")
+                            base_image_bytes_for_input = None 
+                            base_image_filename_for_desc = "讀取失敗"
+                            image_inputs_for_tool = []
+                    else:
+                        print(f"  FutureScenario: 候選圖片路徑 '{selected_path_from_case_image}' 無效或文件不存在。")
+            
+            if not found_base_image:
+                 print(f"FutureScenario: ℹ️ 在 case_image 輪次 {current_round} 中未找到 ID 為 {gate2_result_id} 的有效基礎圖片條目。")
+        else:
+            if not isinstance(gate2_result_id, int):
+                 print(f"FutureScenario: Gate2 結果 '{gate2_result_id}' 不是有效的整數 ID。")
+            if not case_images_list_raw:
+                 print("FutureScenario: case_image 列表為空。")
+        
+        if not image_inputs_for_tool: 
+            print(f"FutureScenario: ⚠️ 未找到或無法讀取有效的基礎圖片 (GATE2 ID: {gate2_result_id})，或基礎圖片列表為空。Phase 1 和 Phase 2 將不使用基礎圖片。")
+            
+        # --- Phase 1: Facade Detail and Construction Method Generation (Realigned with Phase 2 Logic) ---
+        num_detail_images_to_generate = active_config.future_scenario_detail_image_count
+        print(f"\n--- FutureScenario: Phase 1 - 生成立面細節與構造工法圖 (請求 {num_detail_images_to_generate} 張) ---")
+        
+        detail_prompt_template = active_config.future_scenario_detail_generation_prompt_template # Use the new unified template
+        facade_detail_prompt_text = detail_prompt_template.format(
+            base_design_description=base_design_text_for_prompt, # Always provide base text
+            num_images=num_detail_images_to_generate,
+            llm_output_language=active_language
+        )
+        
+        if image_inputs_for_tool:
+            facade_detail_prompt_text += "\nA base image has been provided; please show detail modifications on it or generate details inspired by it."
+            print(f"  立面細節 Prompt (含基礎圖提示): {facade_detail_prompt_text[:200]}...")
+        else:
+            facade_detail_prompt_text += "\nNo base image was provided; generate details based on the text description."
+            print(f"  立面細節 Prompt (純文字提示): {facade_detail_prompt_text[:200]}...")
 
-        # 4️⃣ 更新狀態並返回結果：將結果包裝在列表中
-        self.state["future_image"] = [result]
-        print(f"✅ 未来情境图生成完成，图片保存为: {result}")
+        try:
+            tool_result_details = generate_gemini_image.invoke({
+                "prompt": facade_detail_prompt_text,
+                "image_inputs": image_inputs_for_tool, 
+                "i": num_detail_images_to_generate 
+            })
+
+            if tool_result_details.get("error"):
+                print(f"  ⚠️ Phase 1 圖像生成失敗: {tool_result_details.get('error')}")
+                for i_err in range(num_detail_images_to_generate):
+                    generated_future_images.append({
+                        "round": current_round, "id_in_round": f"detail_err_batch_img{i_err+1}",
+                        "filename": f"細節生成失敗_img{i_err+1}.png", "image_url": "無", "path": "無",
+                        "description": f"立面細節圖批次生成失敗: {tool_result_details.get('error')}",
+                        "error": tool_result_details.get('error')
+                    })
+            else:
+                returned_files_info_detail = tool_result_details.get("generated_files", [])
+                returned_bytes_info_detail = tool_result_details.get("image_bytes", []) 
+                
+                print(f"  DEBUG Phase 1: 工具返回 {len(returned_files_info_detail)} 個文件資訊, {len(returned_bytes_info_detail)} 個字節項目。預期 {num_detail_images_to_generate} 個。")
+
+                if returned_files_info_detail : 
+                    print(f"  Phase 1 工具返回 {len(returned_files_info_detail)} 個文件資訊。")
+                    if len(returned_files_info_detail) != num_detail_images_to_generate:
+                        print(f"  ⚠️ Phase 1 警告: 工具返回的文件數量 ({len(returned_files_info_detail)}) 與預期 ({num_detail_images_to_generate}) 不符。")
+
+                    for idx, file_info in enumerate(returned_files_info_detail):
+                        filename_from_tool = file_info.get("filename") 
+                        img_mime = file_info.get("file_type", "image/png") 
+                        img_bytes = None
+                        img_abs_path = None
+
+                        if isinstance(filename_from_tool, str) and filename_from_tool.strip():
+                            img_abs_path = os.path.join(base_render_cache_dir, os.path.basename(filename_from_tool))
+                        else:
+                            print(f"    ⚠️ Phase 1: 工具返回的第 {idx+1} 個文件資訊中檔名無效: '{filename_from_tool}'")
+                            generated_future_images.append({
+                                "round": current_round, "id_in_round": f"detail_badfilename_img{idx+1}", 
+                                "filename": f"細節檔名無效{idx+1}.png", "image_url":"無", "path": "無", 
+                                "description": f"細節圖 {idx+1} 檔名無效"
+                            })
+                            continue 
+
+                        if returned_bytes_info_detail and idx < len(returned_bytes_info_detail) and isinstance(returned_bytes_info_detail[idx], dict):
+                            img_bytes = returned_bytes_info_detail[idx].get("data")
+                        
+                        if not img_bytes and os.path.exists(img_abs_path):
+                            print(f"    Phase 1: 字節數據未由工具直接提供，嘗試從路徑讀取: {img_abs_path}")
+                            try:
+                                with open(img_abs_path, "rb") as f_read_bytes:
+                                    img_bytes = f_read_bytes.read()
+                                print(f"      ✅ 成功從文件讀取字節: {os.path.basename(img_abs_path)}")
+                            except Exception as e_read_manual:
+                                print(f"      ⚠️ 從文件讀取字節失敗: {os.path.basename(img_abs_path)}, 錯誤: {e_read_manual}")
+                                img_bytes = None 
+
+                        if img_bytes: 
+                            extension = img_mime.split('/')[-1] if '/' in img_mime else 'png'
+                            desc_detail = (f"立面/構造細節圖 {idx+1}/{len(returned_files_info_detail)} "
+                                           f"(基於: {base_image_filename_for_desc}, "
+                                           f"Prompt類型: {'圖生文+圖調整' if image_inputs_for_tool else '純文生圖'}, " # Adjusted description
+                                           f"原始描述: {base_design_text_for_prompt[:30]}...)")
+                            
+                            saved_image_info_detail = self._save_and_encode_image(
+                                image_bytes=img_bytes, absolute_filepath=img_abs_path, extension=extension,
+                                description=desc_detail, current_round=current_round,
+                                sub_id=f"detail_img{idx+1}" # Consistent sub_id
+                            )
+                            generated_future_images.append(saved_image_info_detail)
+                            print(f"    ✅ 成功處理細節圖: {saved_image_info_detail.get('filename')}") 
+                        else:
+                            err_reason = "無有效字節數據 (工具未提供且無法從文件讀取)"
+                            if not os.path.exists(img_abs_path): 
+                                err_reason = f"文件於路徑 {img_abs_path} 未找到或無法讀取"
+                            print(f"    ⚠️ Phase 1 無法處理第 {idx+1} 個細節圖片 (檔名: {os.path.basename(filename_from_tool if filename_from_tool else '未知')}, 原因: {err_reason})。")
+                            generated_future_images.append({
+                                "round": current_round, "id_in_round": f"detail_nodata_img{idx+1}", 
+                                "filename": os.path.basename(filename_from_tool) if filename_from_tool else f"細節數據無效{idx+1}.png", 
+                                "image_url":"無", 
+                                "path": img_abs_path if img_abs_path else "無效路徑", 
+                                "description": f"細節圖 {idx+1} 數據無效或文件缺失 ({err_reason})"
+                            })
+                else: 
+                    print(f"  ⚠️ Phase 1 圖像生成工具未返回任何文件資訊。")
+                    for i_miss in range(num_detail_images_to_generate):
+                         generated_future_images.append({"round": current_round, "id_in_round": f"detail_missing_all_files_img{i_miss+1}", "filename": f"細節文件資訊缺失{i_miss+1}.png", "image_url":"無", "path": "無", "description": f"細節圖 {i_miss+1} 所有文件資訊缺失"})
+        except Exception as e:
+            print(f"  💥 Phase 1 調用 generate_gemini_image 批處理異常: {e}")
+            for i_exc in range(num_detail_images_to_generate):
+                generated_future_images.append({
+                    "round": current_round, "id_in_round": f"detail_exc_batch_img{i_exc+1}",
+                    "filename": f"細節生成異常_img{i_exc+1}.png", "image_url": "無", "path": "無",
+                    "description": f"立面細節圖批次生成異常: {e}", "error": str(e)
+                })
+        
+        print(f"    ℹ️ Phase 1 細節圖像生成完成，延遲 3 秒...")
+        time.sleep(5)
+
+        # --- Phase 2: Aging Scenario Generation (10, 20, 30 years) - BATCH MODE ---
+        print(f"\n--- FutureScenario: Phase 2 - 生成未來10、20、30年變化圖 (批次請求 3 張) ---")
+        years_to_simulate = [10, 20, 30]
+        num_aging_images_to_generate = len(years_to_simulate)
+        
+        aging_prompt_template_text = active_config.future_scenario_aging_generation_prompt_template
+        
+        final_aging_prompt_for_tool = aging_prompt_template_text.format(
+            base_design_description=base_design_text_for_prompt, 
+            num_images=num_aging_images_to_generate, 
+            llm_output_language=active_language
+        )
+        final_aging_prompt_for_tool += (
+            f"\nImportant: Generate exactly {num_aging_images_to_generate} images, "
+            "representing the aging at 10, 20, and 30 years respectively. "
+            "Maintain consistency in the base structure across the aging sequence. "
+            "The images should be returned in the order of 10 years, then 20 years, then 30 years."
+        )
+        if image_inputs_for_tool:
+            final_aging_prompt_for_tool += "\nA base image has been provided; please show aging modifications on it."
+        else:
+            final_aging_prompt_for_tool += "\nNo base image was provided; generate based on the text description."
+
+        print(f"    未來老化場景 (批次) Prompt: {final_aging_prompt_for_tool[:300]}...")
+
+
+        try:
+            tool_result_aging_batch = generate_gemini_image.invoke({
+                "prompt": final_aging_prompt_for_tool,
+                "image_inputs": image_inputs_for_tool, 
+                "i": num_aging_images_to_generate 
+            })
+
+            if tool_result_aging_batch.get("error"):
+                print(f"    ⚠️ Phase 2 批次圖像生成失敗: {tool_result_aging_batch.get('error')}")
+                for i_err_aging in range(num_aging_images_to_generate):
+                    year_val_err = years_to_simulate[i_err_aging] if i_err_aging < len(years_to_simulate) else "unknown"
+                    generated_future_images.append({
+                        "round": current_round, "id_in_round": f"aging_batch_err_img{i_err_aging+1}_{year_val_err}yr",
+                        "filename": f"老化批次失敗_img{i_err_aging+1}_{year_val_err}yr.png", "image_url": "無", "path": "無",
+                        "description": f"老化圖批次生成失敗 ({year_val_err} yr): {tool_result_aging_batch.get('error')}",
+                        "error": tool_result_aging_batch.get('error')
+                    })
+            else:
+                returned_files_info_aging = tool_result_aging_batch.get("generated_files", [])
+                returned_bytes_info_aging = tool_result_aging_batch.get("image_bytes", [])
+
+                print(f"  DEBUG Phase 2: 工具返回 {len(returned_files_info_aging)} 個老化文件資訊, {len(returned_bytes_info_aging)} 個老化字節項目。預期 {num_aging_images_to_generate} 個。")
+
+                if returned_files_info_aging: 
+                    print(f"  Phase 2 工具返回 {len(returned_files_info_aging)} 個老化圖片文件資訊。")
+                    if len(returned_files_info_aging) != num_aging_images_to_generate:
+                         print(f"  ⚠️ Phase 2 警告: 工具返回的文件數量 ({len(returned_files_info_aging)}) 與預期 ({num_aging_images_to_generate}) 不符。")
+
+                    for idx, file_info_aging in enumerate(returned_files_info_aging):
+                        filename_from_tool_aging = file_info_aging.get("filename")
+                        img_mime_aging = file_info_aging.get("file_type", "image/png")
+                        img_bytes_aging = None
+                        img_abs_path_aging = None
+                        current_year_for_desc = years_to_simulate[idx] if idx < len(years_to_simulate) else f"batch_idx{idx+1}"
+
+
+                        if isinstance(filename_from_tool_aging, str) and filename_from_tool_aging.strip():
+                            img_abs_path_aging = os.path.join(base_render_cache_dir, os.path.basename(filename_from_tool_aging))
+                        else:
+                            print(f"    ⚠️ Phase 2: 工具返回的第 {idx+1} 個老化文件資訊中檔名無效: '{filename_from_tool_aging}'")
+                            generated_future_images.append({
+                                "round": current_round, "id_in_round": f"aging_badfilename_img{idx+1}_{current_year_for_desc}yr",
+                                "filename": f"老化檔名無效{idx+1}_{current_year_for_desc}yr.png", "image_url": "無", "path": "無",
+                                "description": f"{current_year_for_desc}年後變化圖檔名無效"
+                            })
+                            continue
+
+                        if returned_bytes_info_aging and idx < len(returned_bytes_info_aging) and isinstance(returned_bytes_info_aging[idx], dict):
+                            img_bytes_aging = returned_bytes_info_aging[idx].get("data")
+                        
+                        if not img_bytes_aging and os.path.exists(img_abs_path_aging):
+                            print(f"    Phase 2: 字節數據未由工具直接提供 ({current_year_for_desc}yr)，嘗試從路徑讀取: {img_abs_path_aging}")
+                            try:
+                                with open(img_abs_path_aging, "rb") as f_read_bytes_aging:
+                                    img_bytes_aging = f_read_bytes_aging.read()
+                                print(f"      ✅ 成功從文件讀取字節 ({current_year_for_desc}yr): {os.path.basename(img_abs_path_aging)}")
+                            except Exception as e_read_manual_aging:
+                                print(f"      ⚠️ 從文件讀取字節失敗 ({current_year_for_desc}yr): {os.path.basename(img_abs_path_aging)}, 錯誤: {e_read_manual_aging}")
+                                img_bytes_aging = None
+
+                        if img_bytes_aging: 
+                            extension_aging = img_mime_aging.split('/')[-1] if '/' in img_mime_aging else 'png'
+                            desc_aging = (f"方案 {current_year_for_desc} 年後變化圖 "
+                                          f"(基於: {base_image_filename_for_desc}, "
+                                          f"Prompt類型: {'圖生圖' if image_inputs_for_tool else '文生圖'}, "
+                                          f"原始描述: {base_design_text_for_prompt[:30]}...)")
+                            
+                            saved_image_info_aging = self._save_and_encode_image(
+                                image_bytes=img_bytes_aging, absolute_filepath=img_abs_path_aging, extension=extension_aging,
+                                description=desc_aging, current_round=current_round,
+                                sub_id=f"aging_{current_year_for_desc}yr_img{idx+1}" 
+                            )
+                            generated_future_images.append(saved_image_info_aging)
+                            print(f"    ✅ 成功處理 {current_year_for_desc} 年後變化圖: {saved_image_info_aging.get('filename')}")
+                        else:
+                            err_reason_aging = "無有效字節數據 (工具未提供且無法從文件讀取)"
+                            if not os.path.exists(img_abs_path_aging): # Check again
+                                err_reason_aging = f"文件於路徑 {img_abs_path_aging} 未找到或無法讀取"
+                            print(f"    ⚠️ Phase 2 無法處理第 {idx+1} 個老化圖片 ({current_year_for_desc}yr, 檔名: {os.path.basename(filename_from_tool_aging if filename_from_tool_aging else '未知')}, 原因: {err_reason_aging})。")
+                            generated_future_images.append({
+                                "round": current_round, "id_in_round": f"aging_nodata_batch_img{idx+1}_{current_year_for_desc}yr", 
+                                "filename": os.path.basename(filename_from_tool_aging) if filename_from_tool_aging else f"老化數據無效{idx+1}.png", 
+                                "image_url":"無", 
+                                "path": img_abs_path_aging if img_abs_path_aging else "無效路徑", 
+                                "description": f"{current_year_for_desc}年後變化圖數據無效或文件缺失 ({err_reason_aging})"
+                            })
+                else: 
+                    print(f"  ⚠️ Phase 2 圖像生成工具未返回任何老化圖片文件資訊。")
+                    for i_miss_aging in range(num_aging_images_to_generate):
+                        year_val_miss = years_to_simulate[i_miss_aging] if i_miss_aging < len(years_to_simulate) else f"batch_idx{i_miss_aging+1}"
+                        generated_future_images.append({
+                            "round": current_round, "id_in_round": f"aging_missing_all_files_img{i_miss_aging+1}_{year_val_miss}yr", 
+                            "filename": f"老化文件資訊缺失{i_miss_aging+1}.png", "image_url":"無", "path": "無", 
+                            "description": f"老化圖 {year_val_miss}yr 所有文件資訊缺失"
+                        })
+        except Exception as e_batch_aging:
+            print(f"  💥 Phase 2 調用 generate_gemini_image 批處理老化場景異常: {e_batch_aging}")
+            for i_exc_aging in range(num_aging_images_to_generate):
+                year_val_exc = years_to_simulate[i_exc_aging] if i_exc_aging < len(years_to_simulate) else f"batch_idx{i_exc_aging+1}"
+                generated_future_images.append({
+                    "round": current_round, "id_in_round": f"aging_exc_batch_img{i_exc_aging+1}_{year_val_exc}yr",
+                    "filename": f"老化生成異常_img{i_exc_aging+1}.png", "image_url": "無", "path": "無",
+                    "description": f"老化圖批次生成異常 ({year_val_exc}yr): {e_batch_aging}", "error": str(e_batch_aging)
+                })
+
+        existing_future_images = self.state.get("future_image", [])
+        if not isinstance(existing_future_images, list):
+            existing_future_images = []
+        
+        images_from_other_rounds_future = [
+            img for img in existing_future_images if isinstance(img, dict) and img.get("round") != current_round
+        ]
+        self.state["future_image"] = images_from_other_rounds_future + generated_future_images
+
+        print(f"\n✅ FutureScenarioGenerationTask 完成，總共處理 {len(generated_future_images)} 張圖片資訊 (包含細節圖與老化圖)。")
+        if generated_future_images:
+            for idx, info in enumerate(generated_future_images):
+                 print(f"  詳細圖片資訊 ({idx+1}): ID='{info.get('id_in_round')}', Filename='{info.get('filename')}', Path='{info.get('path')}', URL: {'有內容' if info.get('image_url') and info.get('image_url').startswith('data:image/') else info.get('image_url', '未定義')}")
+
         return {"future_image": self.state["future_image"]}
 
 # 生成 3D =：根據 Glb 檔呼叫 LLM（使用圖片生成工具）生成 3D 
@@ -658,318 +1613,329 @@ class Generate3DPerspective:
     def __init__(self, state: GlobalState):
         self.state = state
 
-    def run(self, state=None):
+    def run(self, state: GlobalState, config: GraphOverallConfig | dict): 
         if state is not None:
             self.state = state        
+        
+        active_config = ensure_graph_overall_config(config) 
 
-        # 1️⃣ 獲取當前輪次、圖片列表與最佳方案 ID (gate2)
         current_round = self.state.get("current_round", 0)
-        case_images = self.state.get("case_image", [])
-        gate2 = self.state.get("GATE2", None)
+        case_images_raw = self.state.get("case_image", [])
+        selected_image_id_from_gate2 = self.state.get("GATE2") 
+        
+        selected_image_full_path_for_3d = None
 
-        # 確保 gate2 為整數型態
-        if not isinstance(gate2, int):
-            print("⚠️ GATE2 的值無效或未找到")
-            self.state["perspective_3D"] = "没有"
-            return {"perspective_3D": self.state["perspective_3D"]}
-        best_id = gate2
+        print(f"Generate3DPerspective: 嘗試查找 GATE2 ID: {selected_image_id_from_gate2} (類型: {type(selected_image_id_from_gate2)}) 在輪次 {current_round} 的基礎圖片。")
+        if isinstance(selected_image_id_from_gate2, int) and case_images_raw:
+            case_images_list = [item for item in case_images_raw if isinstance(item, dict)]
+            found_base_image_3d = False
+            for img_info in case_images_list:
+                img_id_in_round = img_info.get("id_in_round")
+                img_round = img_info.get("round")
+                # UnifiedImageGenerationTask 應該在 "path" 中存儲有效路徑
+                raw_filename_path = img_info.get("path") 
+                
+                print(f"  檢查 case_image 項目: id_in_round={img_id_in_round}, round={img_round}, path='{raw_filename_path}' (類型: {type(raw_filename_path)})")
 
-        # 2️⃣ 過濾符合條件的圖片：找到 key 為 best_id，且 value 以 "shell_result_{current_round}_" 為前綴的項目
-        expected_prefix = f"shell_result_{current_round}"
-        selected_image = None
-        for item in case_images:
-            if isinstance(item, dict) and best_id in item:
-                value = item[best_id]
-                if isinstance(value, str) and value.startswith(expected_prefix):
-                    selected_image = value
+                if (img_round == current_round and
+                    img_id_in_round == selected_image_id_from_gate2 and
+                    isinstance(raw_filename_path, str) and
+                    raw_filename_path not in ["無效路徑或錯誤", "無"] and # 排除佔位符
+                    not any(err_placeholder in raw_filename_path.lower() for err_placeholder in 
+                             ["prompt生成失敗", "工具錯誤_", "無文件_", "格式錯誤_", "調用異常_", "處理錯誤_"]) and
+                    os.path.exists(raw_filename_path)): 
+                    
+                    selected_image_full_path_for_3d = raw_filename_path
+                    print(f"ℹ️ Generate3DPerspective: ✅ 成功選中圖片 (來自GateCheck2 ID {selected_image_id_from_gate2}), "
+                          f"絕對路徑 '{selected_image_full_path_for_3d}' 用於3D生成。")
+                    found_base_image_3d = True
                     break
+            if not found_base_image_3d:
+                 print(f"⚠️ Generate3DPerspective: 雖然 GateCheck2 選擇了 ID {selected_image_id_from_gate2}, "
+                       f"但在 case_image 輪次 {current_round} 中未找到對應的有效圖片文件路徑。")
+        else:
+            print(f"⚠️ Generate3DPerspective: GateCheck2 未提供有效的圖片 ID (GATE2: {selected_image_id_from_gate2}) "
+                  f"或 case_image 為空，無法選擇用於3D生成的圖片。")
 
-        # 若未找到符合條件的圖片，則返回提示
-        if not selected_image:
-            print(f"⚠️ 未找到符合条件的生成图，轮次：{current_round}，方案 ID：{best_id}")
-            self.state["perspective_3D"] = "未找到符合条件的生成图"
-            return {"perspective_3D": self.state["perspective_3D"]}
 
-        # 3️⃣ 若選中的圖片路徑不是完整路徑，則補上目錄 "./output/render_cache"
-        OUTPUT_SHELL_CACHE_DIR = "./output/render_cache"
-        if not os.path.isabs(selected_image):
-            selected_image = os.path.join(OUTPUT_SHELL_CACHE_DIR, selected_image)
+        if not selected_image_full_path_for_3d:
+            print(f"⚠️ Generate3DPerspective: 未找到輪次 {current_round} 的有效渲染圖文件路徑用於3D生成。")
+            if not isinstance(self.state.get("perspective_3D"), list): self.state["perspective_3D"] = []
+            if not isinstance(self.state.get("model_3D"), list): self.state["model_3D"] = []
+            no_result_entry = {"round": current_round, "status": "无有效渲染图片进行3D生成", "filename":"无", "path":"无"}
+            self.state["perspective_3D"] = custom_add_messages(self.state.get("perspective_3D", []), [no_result_entry])
+            self.state["model_3D"] = custom_add_messages(self.state.get("model_3D", []), [no_result_entry])
+            return {"perspective_3D": self.state["perspective_3D"], "model_3D": self.state["model_3D"]}
 
-        # 4️⃣ 呼叫 generate_3D 時，使用鍵 "image_path" 並傳入 selected_image
-        object_file = generate_3D.invoke({
-            "image_path": selected_image,
+        
+        if not os.path.exists(str(selected_image_full_path_for_3d)): # 二次檢查
+            print(f"⚠️ Generate3DPerspective: 選定的圖片文件路徑 '{selected_image_full_path_for_3d}' 無效或文件不存在 (二次檢查)。")
+            # ... (處理錯誤返回)
+            no_file_entry = {"round": current_round, "status": f"选定图片文件路径无效或不存在: {selected_image_full_path_for_3d}", "filename":str(selected_image_full_path_for_3d), "path":str(selected_image_full_path_for_3d)}
+            if not isinstance(self.state.get("perspective_3D"), list): self.state["perspective_3D"] = []
+            if not isinstance(self.state.get("model_3D"), list): self.state["model_3D"] = []
+            self.state["perspective_3D"] = custom_add_messages(self.state.get("perspective_3D", []), [no_file_entry])
+            self.state["model_3D"] = custom_add_messages(self.state.get("model_3D", []), [no_file_entry])
+            return {"perspective_3D": self.state["perspective_3D"], "model_3D": self.state["model_3D"]}
+
+
+        gen_3d_output_dict = generate_3D.invoke({
+            "image_path": str(selected_image_full_path_for_3d), 
             "current_round": current_round,
+            # "prompt": active_config.llm_output_language # 移除，除非 generate_3D 工具明確需要此 prompt 鍵
         })
-        object_video = object_file.get("video", "無生成結果")
-        object_glb = object_file.get("model", "無模型")
 
-        # 更新 3D 影片與模型資訊
-        existing_3D = self.state.get("perspective_3D", [])
-        updated_3D = custom_add_messages(existing_3D, object_video)
-        self.state["perspective_3D"] = updated_3D
+        video_filename_from_tool = "无生成结果"
+        model_filename_from_tool = "无模型"
+        video_path_from_tool = "无"
+        model_path_from_tool = "无"
 
-        existing_model = self.state.get("model_3D", [])
-        updated_model = custom_add_messages(existing_model, object_glb)
-        self.state["model_3D"] = updated_model
+        if isinstance(gen_3d_output_dict, dict):
+            # 假設 generate_3D 返回的 video 和 model 是包含 'filename' (絕對路徑) 的字典或直接是絕對路徑字符串
+            video_output = gen_3d_output_dict.get("video")
+            model_output = gen_3d_output_dict.get("model")
 
-        print(f"✅ 生成 3D 位置: 影片:{object_video}、模型:{object_glb}")
+            if isinstance(video_output, dict) and isinstance(video_output.get("filename"), str):
+                video_filename_from_tool = os.path.basename(video_output.get("filename"))
+                video_path_from_tool = video_output.get("filename")
+            elif isinstance(video_output, str): # 如果直接返回路徑
+                video_filename_from_tool = os.path.basename(video_output)
+                video_path_from_tool = video_output
+            else:
+                video_filename_from_tool = "返回格式无效(video)"
+
+            if isinstance(model_output, dict) and isinstance(model_output.get("filename"), str):
+                model_filename_from_tool = os.path.basename(model_output.get("filename"))
+                model_path_from_tool = model_output.get("filename")
+            elif isinstance(model_output, str): # 如果直接返回路徑
+                model_filename_from_tool = os.path.basename(model_output)
+                model_path_from_tool = model_output
+            else:
+                model_filename_from_tool = "返回格式无效(model)"
+            
+            if gen_3d_output_dict.get("error"):
+                 print(f"⚠️ Generate3DPerspective: 3D生成工具報告錯誤: {gen_3d_output_dict.get('error')}")
+                 video_filename_from_tool = f"工具錯誤_{video_filename_from_tool}"
+                 model_filename_from_tool = f"工具錯誤_{model_filename_from_tool}"
+
+
+        else:
+            print(f"⚠️ Generate3DPerspective: 3D生成工具未返回字典。返回: {gen_3d_output_dict}")
+            video_filename_from_tool = "工具返回格式错误"
+            model_filename_from_tool = "工具返回格式错误"
+
+
+        video_entry = {"round": current_round, "type": "video", "filename": video_filename_from_tool, "path": video_path_from_tool}
+        model_entry = {"round": current_round, "type": "model", "filename": model_filename_from_tool, "path": model_path_from_tool}
+        
+        existing_perspective_3d_list = self.state.get("perspective_3D", [])
+        if not isinstance(existing_perspective_3d_list, list):
+            existing_perspective_3d_list = []
+            
+        existing_model_3d_list = self.state.get("model_3D", [])
+        if not isinstance(existing_model_3d_list, list):
+            existing_model_3d_list = []
+
+        self.state["perspective_3D"] = custom_add_messages(existing_perspective_3d_list, [video_entry])
+        self.state["model_3D"] = custom_add_messages(existing_model_3d_list, [model_entry])
+
+
+        print(f"✅ 生成 3D 完成: 影片文件:{video_filename_from_tool} (路徑: {video_path_from_tool})、模型文件:{model_filename_from_tool} (路徑: {model_path_from_tool})")
         return {"perspective_3D": self.state["perspective_3D"], "model_3D": self.state["model_3D"]}
 
-# class Generate3DPerspective顯示測試:
-#     def __init__(self, state: GlobalState):
-#         self.state = state
-
-#     def encode_file_to_data_url(self, file_path, mime_type):
-#         """讀取檔案並轉換成 data URL 格式"""
-#         if os.path.exists(file_path):
-#             with open(file_path, "rb") as f:
-#                 encoded = base64.b64encode(f.read()).decode("utf-8")
-#             return f"data:{mime_type};base64,{encoded}"
-#         else:
-#             return None
-
-#     def run(self, state=None):
-#         if state is not None:
-#             self.state = state        
-
-#         # 補上目錄 "./output/model_cache"，並指定測試檔案名稱
-#         OUTPUT_MODEL_CACHE_DIR = "./output/model_cache"
-#         selected_model = os.path.join(OUTPUT_MODEL_CACHE_DIR, "model_result_2.glb")
-#         selected_mp4 = os.path.join(OUTPUT_MODEL_CACHE_DIR, "video_result_2.mp4")
-
-#         # 將影片與模型轉換成 data URL，傳入對應的 MIME 類型
-#         video_data_url = self.encode_file_to_data_url(selected_mp4, "video/mp4")
-#         model_data_url = self.encode_file_to_data_url(selected_model, "model/gltf-binary")
-
-#         self.state["perspective_3D_display"] = video_data_url if video_data_url else "無生成結果"
-#         self.state["model_3D_display"] = model_data_url if model_data_url else "無模型"
-
-#         print(f"✅ 生成 3D 位置: 影片:{selected_mp4}、模型:{selected_model}")
-#         return {
-#             "perspective_3D": self.state["perspective_3D_display"],
-#             "model_3D": self.state["model_3D_display"]
-#         }
-    
 # 深度評估任務：呼叫 LLM（使用圖片辨識工具）對生成圖與未來情境圖進行深度評估 OK
 class DeepEvaluationTask:
     def __init__(self, state: GlobalState):
         self.state = state
 
-    def run(self, state=None):
+    def run(self, state: GlobalState, config: GraphOverallConfig | dict):
         if state is not None:
             self.state = state      
 
-        OUTPUT_EVAL_DIR = "./output/"
-        os.makedirs(OUTPUT_EVAL_DIR, exist_ok=True) 
+        active_config = ensure_graph_overall_config(config)
+        active_language = active_config.llm_output_language
+        
+        # OUTPUT_EVAL_DIR = "./output/" # 已在 DeepEvalTask 内部处理
+        # os.makedirs(OUTPUT_EVAL_DIR, exist_ok=True) 
 
         current_round = self.state.get("current_round", 0) 
-        eval_results_list = self.state.get("evaluation_result", [])  
-        future_img = self.state.get("future_image", [])      
-        perspective_3D = self.state.get("perspective_3D", [])
-        design_advice_list = self.state.get("design_advice", [])
-        
-        # 過濾出當前輪次且 state 為 True 的設計方案（必須是字典格式）
+        eval_results_list_raw = self.state.get("evaluation_result", []) 
+        if not isinstance(eval_results_list_raw, list):
+            eval_results_list_raw = []
+            
+        future_img_list_raw = self.state.get("future_image", []) 
+        perspective_3d_list_raw = self.state.get("perspective_3D", []) 
+        design_advice_list_raw = self.state.get("design_advice", []) 
+
+        future_img_list = [item for item in future_img_list_raw if isinstance(item, dict)]
+        perspective_3d_list = [item for item in perspective_3d_list_raw if isinstance(item, dict)] # 包含 3D 影片/模型信息
+        design_advice_list = [item for item in design_advice_list_raw if isinstance(item, dict)]
+
         valid_advices = [
             advice for advice in design_advice_list
-            if isinstance(advice, dict) and advice.get("round") == current_round and advice.get("state") == True
+            if advice.get("round") == current_round and advice.get("state") == True 
         ]
-        
-        # 從有效的設計方案中取出 "proposal" 作為 advice_text
+        advice_text = "無目標" 
         if valid_advices:
-            selected_advice = valid_advices[0]
-            advice_text = selected_advice.get("proposal", "無目標")
+            advice_text = valid_advices[0].get("proposal", "無目標")
         else:
-            advice_text = "無目標"
+            print(f"⚠️ DeepEvaluationTask: 未找到輪次 {current_round} 且 state 為 True 的有效設計建議。")
 
-        # --- 提取 image ---
-        expected_prefix = f"shell_result_{current_round}"
-        images = []  # 存放符合條件的 image 字串
-        # 遍歷 future_img 中的所有項目（每個項目皆為字典）
-        for item in future_img:
-            if isinstance(item, dict):
-                for key, value in item.items():
-                    # 檢查 key 為 int 且 value 為字串，且前綴符合
-                    if isinstance(key, int) and isinstance(value, str) and value.startswith(expected_prefix):
-                        images.append(value)
-                        # 如果希望每個字典只提取一個符合條件的值，可以 break 退出內層迴圈
-                        break
+        # 提取有效圖片路徑用於 img_recognition
+        valid_future_image_paths_for_eval = []
+        future_image_filenames_for_log = [] # 用於日誌記錄
+        if future_img_list:
+            for img_info in future_img_list:
+                # 假設 "path" 字段存儲了由 FutureScenarioGenerationTask 驗證過的絕對路徑
+                file_path = img_info.get("path") 
+                img_filename = img_info.get("filename", "未知文件名") # 用於日誌
 
-        # --- 提取 video ---
-        expected_prefix2 = f"video_result_{current_round}"
-        videos = []  # 存放符合條件的 video 字串
-        # perspective_3D 預期為 list，每個元素皆為字串
-        for item in perspective_3D:
-            if isinstance(item, str) and item.startswith(expected_prefix2):
-                videos.append(item)
+                if isinstance(file_path, str) and \
+                   file_path not in ["無效路徑或錯誤", "無", "細節數據無效", "老化數據無效", "細節列表無效", "老化列表無效"] and \
+                   not any(err_tag in file_path for err_tag in ["失敗", "異常", "無效"]) and \
+                   os.path.exists(file_path):
+                    valid_future_image_paths_for_eval.append(file_path)
+                    future_image_filenames_for_log.append(os.path.basename(img_filename))
+                else:
+                    print(f"⚠️ DeepEvaluationTask: 從 future_image 中過濾掉無效條目: path='{file_path}', filename='{img_filename}'")
+        
+        img_keywords_content = "無有效未來圖片可供分析關鍵字。"
+        img_eval_text = "無有效未來圖片可供評估。"
 
-        # --- 路徑組合 ---
-        OUTPUT_SHELL_CACHE_DIR = "./output/render_cache"
-        image_paths = [os.path.join(OUTPUT_SHELL_CACHE_DIR, img) for img in images] if images else []
+        if valid_future_image_paths_for_eval:
+            print(f"ℹ️ DeepEvaluationTask: 使用 {len(valid_future_image_paths_for_eval)} 張有效未來圖片進行評估: {future_image_filenames_for_log}")
+            try:
+                keyword_prompt_for_img = active_config.deep_eval_keyword_img_recognition_prompt_template.format(
+                    llm_output_language=active_language
+                )
+                img_key_output_str = img_recognition.invoke({
+                    "image_paths": valid_future_image_paths_for_eval, 
+                    "prompt": keyword_prompt_for_img
+                })        
+                img_keywords_content = img_key_output_str.strip() if isinstance(img_key_output_str, str) else "圖片關鍵詞生成失敗或為空。"
+                print(f"  基於圖片生成的關鍵詞：{img_keywords_content[:200]}...")
 
-        OUTPUT_3D_CACHE_DIR = "./output/model_cache"
-        video_paths = [os.path.join(OUTPUT_3D_CACHE_DIR, vid) for vid in videos] if videos else []
-
-        # **關鍵字生成方向：
-        # 結合設計提案特性：請考量設計提案可能包含的元素，例如：建築類型、曲面形式 (例如：雙曲面、自由曲面、格柵曲面、薄殼曲面...)、材料種類 (例如：集成材、膠合木、CLT...)、構造工法、其他考量等。
-        # 辨識圖片了解情況：假設已透過圖片辨識初步了解設計方案的視覺特徵，例如：曲面的複雜程度、結構系統的類型等。請根據這些可能的圖片資訊，生成更精確的關鍵字。   
-        # 設計提案：{advice_text} 
-
-        # Step 1: 關鍵詞 
-        keyword_prompt = (f"""
-            請生成適用於檢索參考做法的中英文關鍵字。**格式為:中文(英文)**
-            檢索目標：根據圖片中的建築要素尋找關於曲面木構造建築的設計概念、方案、案例研究等資料。
-            尋找曲面木構造在設計、材料、工法、循環性、永續性等方面的規範、技術指南、專家建議等參考資訊。 
-            """
-        )
-        img_key_output = img_recognition.invoke({
-            "image_paths": image_paths,
-            "prompt": keyword_prompt
-        })        
-        keywords = img_key_output.strip() if isinstance(img_key_output, str) else ""
-        print("生成的關鍵詞：", keywords)
-
-        # Step 2: RAG prompt
-        RAG_msg = ARCH_rag_tool.invoke(f"{keywords}")
-        print("RAG檢索結果：", RAG_msg)
-
-            # 數位製造背景知識: (例如：機械手臂木構加工原理、曲面分割與展開演算法、參數化設計在木構建築的應用、數位組裝流程與精度控制等相關文獻、技術指南、案例研究連結)
-            # Timber Curve Frame Pavilion 設計規範: (例如：設計圖說、結構分析報告、材料選用說明、初步的製造流程規劃、設計目標與預期成果描述等)
-            # 相關案例參考: (例如：已成功數位製造的曲面木構建築案例、類似結構形式的案例分析、數位製造工法應用案例等，可提供圖片或連結)
-
-        img_prompt = (   
-            f"針對 timber curve frame pavilion 設計方案渲染圖進行深入評估。"
-            f"作為資深建築設計評審委員，請針對補充條件動態調整評估準則，並提供**公正且有鑑別度的評分**。"
-            f"你的任務是基於以下評估準則，**客觀評估**其建築外殼設計的優劣。"
-            f"""
-            **造型與環境脈絡融合：總分10分
-                評估建築造型是否能融入周圍環境脈絡，例如：自然景觀、都市紋理、地域文化。
-                考量建築造型與環境的協調性、呼應性，以及對環境的尊重程度。
-            **場所精神與使用者關注：總分10分
-                評估建築設計是否能營造獨特的場所精神，回應使用者的需求與體驗。
-                考量建築空間的氛圍、舒適度、機能性，以及對使用者情感和行為的影響。
-            **材料及工法的環境及氣候應對程度：總分10分
-                評估選用的木材材料和工法是否能有效應對當地環境及氣候條件。
-                考量材料的永續性、環境友善性、氣候適應性，以及工法的合理性、效率性、材料損耗。
-            **外殼系統的維護性與耐久性：總分10分
-                評估當前構造形式的系統是否考量到後續的維護與長期耐久性。
-                考量當前構造系統全生命週期的循環性。    
-            **補充條件:{RAG_msg}
+                if "無法識別" in img_keywords_content or not img_keywords_content.strip() : # 檢查是否有意義的關鍵詞
+                     print(f"  ⚠️ 關鍵詞生成可能未成功，關鍵詞內容為: '{img_keywords_content}'")
+                     # 可以選擇不進行後續的圖片評估，或者讓LLM嘗試評估
                 
-            評分標準:針對以上每個評估項目，根據方案表現給予 1.0 - 10.0 分評分 (1.0 = 極差, 10.0 = 極佳)。
-            輸出格式:針對每個評估項目提供評分以及簡述評分理由。最後需計算加總得分並寫為**總分數:數字**
-            """  
-        )
+                # 即使關鍵詞生成不佳，也嘗試進行圖片評估
+                img_eval_prompt_content = active_config.deep_eval_img_eval_img_recognition_prompt_template.format(
+                    rag_msg=img_keywords_content, # rag_msg 可以是空字符串或提示信息
+                    llm_output_language=active_language
+                )
+                img_eval_output_str = img_recognition.invoke({
+                    "image_paths": valid_future_image_paths_for_eval,
+                    "prompt": img_eval_prompt_content
+                })
+                img_eval_text = img_eval_output_str.strip() if isinstance(img_eval_output_str, str) else "圖片評估工具返回空。"
+            except Exception as e_img_rec:
+                print(f"❌ DeepEvaluationTask: 圖片辨識過程中發生錯誤: {e_img_rec}")
+                img_keywords_content = f"圖片辨識錯誤: {e_img_rec}"
+                img_eval_text = f"圖片評估錯誤: {e_img_rec}"
+        else:
+            print("⚠️ DeepEvaluationTask: 無有效未來圖片傳遞給 img_recognition。")
+        
 
-        # 調用工具進行深度評估
-        img_eval_output = img_recognition.invoke({
-            "image_paths": image_paths,
-            "prompt": img_prompt
-        })
+        # 提取有效3D影片/模型路徑用於 video_recognition
+        valid_perspective_3d_paths_for_eval = []
+        perspective_3d_filenames_for_log = []
+        if perspective_3d_list:
+            for p3d_info in perspective_3d_list:
+                # 假設 "path" 字段存儲了由 Generate3DPerspective 驗證過的絕對路徑
+                file_path = p3d_info.get("path")
+                p3d_filename = p3d_info.get("filename", "未知3D文件")
 
-        ##3D辨識邏輯     
-        ##還需要設定RAG木構造資料
-        vid_prompt = (   
-            f"針對 timber curve frame pavilion 設計方案模型進行深入評估。"
-            f"作為專業的建築師、結構技師兼數位製造專家，請針對補充條件動態調整評估準則，並提供**公正且有鑑別度的評分**。"
-            f"你的任務是基於以下評估準則，**客觀評估**其建築設計的優劣。"      
-            f"""
-            **I.整體構造系統之合理性與永續性:總分10分
-                    **結構邏輯性:**  結構系統是否清晰、合理，能有效傳遞力流並抵抗外力？ (例如：抗彎、抗剪、抗扭能力評估)
-                    **結構效率:**  結構系統是否能以最少的材料達成所需的跨度與承載力？ (例如：構材用量、跨度能力比值分析)
-                    **材料永續性:**  結構材料選用是否符合永續發展原則？ (例如：可再生材料比例、碳足跡評估、生命週期評估 LCA)
-                    **環境友善性:**  結構系統的生產、運輸、建造及拆解過程對環境的影響程度？ (例如：碳排放量、廢棄物產生量評估)
-            **II.細部構造之機能性與整合性:總分10分
-                    **機能實現度:**  細部構造是否能有效實現其預期機能？ (例如：連接強度、防水性能、氣密性能評估)
-                    **構造整合性:**  細部構造與整體結構系統的協調性與整合程度？ (例如：力流傳遞的連續性、構造系統的完整性)
-                    **節點設計:**  節點設計是否安全可靠、簡潔有效、易於製造與組裝？ (例如：節點力學性能分析、連接方式效率評估、組裝複雜度分析)
-                    **介面協調性:**  細部構造與其他建築系統 (例如：外牆、屋面、設備) 的介面處理是否協調合理？ (例如：防水細節、保溫隔熱措施、管線整合方案)
-            **III. 曲面造型與構成形式之技術可行性:總分10分
-                    **幾何複雜度:**  曲面造型的幾何形式是否過於複雜，增加製造與建造難度？ (例如：曲率變化分析、曲面分格複雜度評估)
-                    **製造技術:**  模型所展現的曲面構成形式，在現有製造技術條件下是否能實現？ (例如：CNC 加工可行性、熱壓成型可行性、積層製造可行性評估)
-                    **組裝精度:**  模型所展現的曲面精度要求，在現場組裝條件下是否能達成？ (例如：構件加工精度要求、組裝誤差容許度分析)
-                    **經濟性:**  曲面造型的實現是否會導致過高的製造成本與工期？ (例如：材料成本分析、加工成本估算、工期評估)
-            **IV. 材料應用與結構邏輯之契合性:總分10分
-                    **材料特性發揮:**  是否充分利用木材的力學性能 (例如：抗拉、抗壓、彈性模量)、紋理特性、輕質高強等優勢？ (例如：材料力學性能分析、材料選用合理性評估)
-                    **結構邏輯清晰性:**  結構系統的設計是否清晰地展現了材料的力學特性與結構邏輯？ (例如：結構受力分析、力流傳遞路徑可視化)
-                    **材料應用效率:**  材料的應用是否經濟高效，避免過度設計或材料浪費？ (例如：材料用量優化分析、構件尺寸合理性評估)
-            **V. 製造流程與組裝可行性:總分10分
-                    **組裝流程可行性:**  模型的組裝步驟是否清晰合理、易於理解與操作？ (例如：組裝步驟流程圖、組裝難度分析)
-                    **製造效率優化:**  設計方案是否具有優化製造效率的潛力？ (例如：預製化程度評估、模組化設計分析、自動化生產應用潛力)
-                    **材料損耗控制:**  製造過程中是否能有效控制材料損耗？ (例如：材料切割優化方案、剩料再利用策略)
-                    **構件搬運:**  構件的尺寸、重量是否便於搬運與運輸？ (例如：構件尺寸限制分析、運輸成本估算、現場吊裝可行性)
-            **VI. 美學表現與空間意象:總分10分
-                    **造型美感:**  整體造型是否符合建築美學原則，具有視覺吸引力？ (例如：比例協調性評估、線條流暢度分析、形式美感評價)
-                    **光影效果:**  整體空間是否展現良好的光影效果，提升空間的層次感與生動性？  (例如：使用者預期評價)
+                if isinstance(file_path, str) and \
+                   file_path not in ["無效路徑或錯誤", "無"] and \
+                   not any(err_tag in file_path for err_tag in ["失敗", "異常", "無效", "错误"]) and \
+                   os.path.exists(file_path):
+                    valid_perspective_3d_paths_for_eval.append(file_path)
+                    perspective_3d_filenames_for_log.append(os.path.basename(p3d_filename))
+                else:
+                    print(f"⚠️ DeepEvaluationTask: 從 perspective_3D 中過濾掉無效條目: path='{file_path}', filename='{p3d_filename}'")
+
+        vid_eval_text = "無有效3D模型/影片可供評估。"
+        if valid_perspective_3d_paths_for_eval:
+            print(f"ℹ️ DeepEvaluationTask: 使用 {len(valid_perspective_3d_paths_for_eval)} 個有效3D文件進行評估: {perspective_3d_filenames_for_log}")
+            try:
+                # 注意：img_keywords_content 是從未來圖片生成的，可能與3D模型相關性不高，但仍按原邏輯傳入
+                vid_eval_prompt_content = active_config.deep_eval_vid_eval_video_recognition_prompt_template.format(
+                    rag_msg=img_keywords_content, 
+                    llm_output_language=active_language
+                )
+                vid_eval_output_str = video_recognition.invoke({ 
+                    "video_paths": valid_perspective_3d_paths_for_eval, 
+                    "prompt": vid_eval_prompt_content
+                })
+                vid_eval_text = vid_eval_output_str.strip() if isinstance(vid_eval_output_str, str) else "影片評估工具返回空。"
+            except Exception as e_vid_rec:
+                print(f"❌ DeepEvaluationTask: 影片/3D模型辨識過程中發生錯誤: {e_vid_rec}")
+                vid_eval_text = f"影片/3D模型評估錯誤: {e_vid_rec}"
+        else:
+            print("⚠️ DeepEvaluationTask: 無有效3D影片/模型路徑傳遞給 video_recognition。")
 
 
-            **補充條件:{RAG_msg}
-
-            評分標準:針對以上每個評估項目，根據方案表現給予 1.0 - 10.0 分評分 (1.0 = 極差, 10.0 = 極佳)。
-            輸出格式:針對每個評估項目提供評分以及簡述評分理由。最後需計算加總得分並寫為**總分數:數字**
-            """  
-        )
-
-        vid_eval_output = video_recognition.invoke({
-            "video_paths": video_paths,
-            "prompt": vid_prompt
-        })
-
-        img_eval_text = img_eval_output.strip() if isinstance(img_eval_output, str) else ""
-        vid_eval_text = vid_eval_output.strip() if isinstance(vid_eval_output, str) else ""
-
-        ##evaluation_count平均
-        def extract_total_score(text):
-            m = re.search(r"\*\*總分數:([\d.]+)\*\*", text)
-            if m:
+        def extract_total_score(text_score_str):
+            match = re.search(r"\*\*總分數:([\d.]+)\*\*", text_score_str)
+            if match:
                 try:
-                    return float(m.group(1))
-                except:
+                    return float(match.group(1))
+                except ValueError:
                     return 0.0
             else:
-                # 如果沒有符合的總分數格式，取文本中所有浮點數，並返回最大的數字
-                numbers = re.findall(r"(\d+(?:\.\d+)?)", text)
+                numbers = re.findall(r"(\d+(?:\.\d+)?)", text_score_str)
                 if numbers:
-                    return max(map(float, numbers))
+                    try:
+                        return max(map(float, numbers))
+                    except ValueError:
+                        return 0.0
                 return 0.0
-        img_total = extract_total_score(img_eval_text)
-        vid_total = extract_total_score(vid_eval_text)
-        all_score = img_total + vid_total
 
-        # 組合本輪的評估結果，格式為 { current_round: 當前輪次, eval_result: img評語, eval_result2: video評語}
-        current_eval_result = {
+        img_total_score = extract_total_score(img_eval_text)
+        vid_total_score = extract_total_score(vid_eval_text)
+        all_score_for_round = img_total_score + vid_total_score
+
+        current_eval_result_entry = {
             "current_round": current_round,            
-            "eval_result": img_eval_text,
-            "eval_result2": vid_eval_text
+            "eval_result_image": img_eval_text,
+            "eval_result_video": vid_eval_text,
+            "total_score_calculated": all_score_for_round
         }
-        eval_results_list =custom_add_messages(eval_results_list, current_eval_result)
-        self.state["evaluation_result"] = eval_results_list
+        
+        updated_eval_results_list = custom_add_messages(eval_results_list_raw, [current_eval_result_entry])
+        self.state["evaluation_result"] = updated_eval_results_list
 
-        # 組合本輪的平均分數，格式為 {current_round: average_score}，這裡將 current_round 作為字串鍵存入
-        current_eval_count = {str(current_round): all_score}
-        eval_count_list = self.state.get("evaluation_count", [])
-        eval_count_list = custom_add_messages(eval_count_list, current_eval_count)
-        self.state["evaluation_count"] = eval_count_list
+        current_eval_count_entry = {str(current_round): all_score_for_round}
+        eval_count_list_raw = self.state.get("evaluation_count", [])
+        if not isinstance(eval_count_list_raw, list):
+            eval_count_list_raw = []
+        updated_eval_count_list = custom_add_messages(eval_count_list_raw, [current_eval_count_entry])
+        self.state["evaluation_count"] = updated_eval_count_list
 
-        # ✅ 存入檔案
-        # 組合 Markdown 格式內容，將評估結果寫入 Markdown 檔案
-        md_content = f"""# Evaluation Result for Round {current_round}
+        md_content_full = f"""# Evaluation Result for Round {current_round}
 
-        ## Image Evaluation
-        {img_eval_text}
+## Image Evaluation (Based on {future_img_list[0].get('filename') or 'N/A'})
+{img_eval_text}
+Score: {img_total_score}
 
-        ## Video Evaluation
-        {vid_eval_text}
+## Video/3D Model Evaluation (Based on {perspective_3d_list[0].get('filename') or 'N/A'})
+{vid_eval_text}
+Score: {vid_total_score}
 
-        ## Total Score: {all_score}
-        """
-        eval_file_path = os.path.join(OUTPUT_EVAL_DIR, f"eval_result_{current_round}.md")
-        with open(eval_file_path, "w", encoding="utf-8") as f:
-            f.write(md_content)
+## Combined Score for Round: {all_score_for_round}
+"""
+        eval_file_path_md = os.path.join("./output/", f"eval_result_{current_round}.md")
+        try:
+            with open(eval_file_path_md, "w", encoding="utf-8") as f:
+                f.write(md_content_full)
+            print(f"✅ 評估報告已儲存至: {eval_file_path_md}")
+        except IOError as e:
+            print(f"❌ 無法儲存評估報告: {e}")
 
         self.state["current_round"] = current_round + 1  
-        print(f"✅ 深度評估完成，當前輪次: {current_round}")
-        print(f"📌 評估結果: {current_eval_result}")
-        print(f"📌 平均分數: {all_score}")
+        print(f"✅ 深度評估完成，進入下一輪次: {self.state['current_round']}")
+        print(f"📌 本輪總評分: {all_score_for_round}")
         return {
             "evaluation_result": self.state["evaluation_result"],
             "evaluation_count": self.state["evaluation_count"],
@@ -981,143 +1947,123 @@ class EvaluationCheckTask:
     def __init__(self, state: GlobalState):
         self.state = state
 
-    def run(self, state=None):
+    def run(self, state: GlobalState, config: GraphOverallConfig | dict):
         if state is not None:
             self.state = state
+        
+        active_config = ensure_graph_overall_config(config) # 處理 config
 
-        count = self.state.get("current_round", 0)
-        if count < 3:
+        current_iteration_count = self.state.get("current_round", 0) # current_round 代表已完成的輪次，下一輪是 current_round + 1
+        max_rounds = active_config.max_evaluation_rounds
+
+        # current_round 從0開始計數。如果 max_rounds 是3，
+        # 當 current_round 是 0, 1, 2 時，表示還可以繼續迭代。
+        # 當 current_round 變成 3 時，表示已經完成了3輪，應該結束。
+        if current_iteration_count < max_rounds:
             self.state["evaluation_status"] = "NO"
-            print(f"EvaluationCheckTask：評估次數 {count} 未達標，將返回 RAGdesignThinking 執行下一輪。")
+            print(f"EvaluationCheckTask：目前已完成 {current_iteration_count} 輪評估，未達到最大輪數 {max_rounds}，將返回 RAGdesignThinking 執行下一輪。")
         else:
             self.state["evaluation_status"] = "YES"
-            print(f"EvaluationCheckTask：評估次數 {count} 達標，流程結束。")
+            print(f"EvaluationCheckTask：目前已完成 {current_iteration_count} 輪評估，已達到最大輪數 {max_rounds}，流程結束。")
         return {"evaluation_status": self.state["evaluation_status"]}
 
 # 總評估任務(用戶可介入)
 class FinalEvaluationTask:
-    def __init__(self, state: dict, short_term=None, long_term=None):
+    def __init__(self, state: dict, short_term=None, long_term=None): 
         self.state = state
-        # 若未傳入則使用預設的記憶管理器
         self.short_term = short_term if short_term is not None else get_short_term_memory()
         self.long_term = long_term if long_term is not None else get_long_term_store()
 
-    def run(self, state=None):
+    def run(self, state: GlobalState, config: GraphOverallConfig | dict):
         if state is not None:
             self.state = state
 
-        # 從 state 中取得評估結果與評分（累加列表）
-        eval_results = self.state.get("evaluation_result", [])
-        eval_counts = self.state.get("evaluation_count", [])
+        active_config = ensure_graph_overall_config(config)
+        current_llm = active_config.llm_config.get_llm()
+        active_language = active_config.llm_output_language
 
-        # 從記憶管理器讀取短期與長期記憶內容
-        short_memory = self.short_term.retrieve_all() if hasattr(self.short_term, "retrieve_all") else ""
-        long_memory = self.long_term.retrieve_all() if hasattr(self.long_term, "retrieve_all") else ""
-
-        # 建立優化後的 prompt：
-        # 要求 LLM 根據當前輪次直接指出哪個設計方案較好，並分析剩餘方案的優缺點，
-        # 最後給出持續執行方案的深入建議。
-        current_round = self.state.get("current_round", 0)
-        summary_prompt = f"""請根據以下評估結果：      
-        【評估結果】
-        """
-        for res in eval_results:
-            round_num = res.get("current_round", "未知")
-            summary_prompt += f"\n輪次 {round_num}："
-            summary_prompt += f"\n - 圖片評估：{res.get('eval_result', '無')}"
-            summary_prompt += f"\n - 3D 視角評估：{res.get('eval_result2', '無')}\n"
+        eval_results_list_final = self.state.get("evaluation_result", []) 
+        eval_counts_list_final = self.state.get("evaluation_count", []) 
         
-        summary_prompt += "\n【評分結果】\n"
-        for count in eval_counts:
-            for round_key, score in count.items():
-                summary_prompt += f"輪次 {round_key}：總分 {score}\n"
+        if not isinstance(eval_results_list_final, list): eval_results_list_final = []
+        if not isinstance(eval_counts_list_final, list): eval_counts_list_final = []
 
-        summary_prompt += "\n【記憶內容】\n"
-        summary_prompt += "短期記憶：" + (short_memory if short_memory else "無") + "\n"
-        summary_prompt += "長期記憶：" + (long_memory if long_memory else "無") + "\n\n"
+        short_memory_content = self.short_term.retrieve_all() if hasattr(self.short_term, "retrieve_all") else ""
+        long_memory_content = self.long_term.retrieve_all() if hasattr(self.long_term, "retrieve_all") else ""
+        current_round_for_final_eval = self.state.get("current_round", "未知最終輪次") 
 
-        summary_prompt += f"""請綜合以上資訊，請直接指出在第 {current_round} 輪的方案表現最佳，
-        並詳細說明該方案的優點，同時分析其他方案的優缺點。最後，請提供一個持續執行此方案的深入建議。
-        """
+        eval_results_formatted_str = ""
+        for res_item in eval_results_list_final: 
+            if isinstance(res_item, dict):
+                round_num = res_item.get("current_round", "未知輪次")
+                eval_results_formatted_str += f"\n輪次 {round_num}："
+                eval_results_formatted_str += f"\n - 圖片評估：{res_item.get('eval_result_image', '無')}" 
+                eval_results_formatted_str += f"\n - 3D 視角評估：{res_item.get('eval_result_video', '無')}\n" 
+        
+        eval_counts_formatted_str = ""
+        for count_dict_item in eval_counts_list_final: 
+             if isinstance(count_dict_item, dict):
+                for round_key_str, score_val in count_dict_item.items(): 
+                    eval_counts_formatted_str += f"輪次 {round_key_str}：總分 {score_val}\n"
 
-        # 傳入的 prompt 必須是一個列表，且每個元素需為 BaseMessage，例如使用 SystemMessage 包裝
-        llm_response = llm.invoke([SystemMessage(content=summary_prompt)])
-        final_text = llm_response.content if hasattr(llm_response, "content") else llm_response
+        summary_prompt_content_final = active_config.final_evaluation_summary_prompt_template.format(
+            eval_results_formatted=eval_results_formatted_str if eval_results_formatted_str else "無評估結果",
+            eval_counts_formatted=eval_counts_formatted_str if eval_counts_formatted_str else "無評分結果",
+            short_memory=short_memory_content if short_memory_content else "無短期記憶",
+            long_memory=long_memory_content if long_memory_content else "無長期記憶",
+            current_round=current_round_for_final_eval,
+            llm_output_language=active_language
+        )
 
-        # 將最終摘要存入 state 中
-        self.state["final_evaluation"] = final_text
+        llm_response_msg_final = current_llm.invoke([SystemMessage(content=summary_prompt_content_final)])
+        final_text_output = llm_response_msg_final.content if hasattr(llm_response_msg_final, "content") else "LLM總評估生成失敗。"
+
+        self.state["final_evaluation"] = final_text_output
 
         print("✅ 總評估任務完成！")
-        print(f"📌 總評估結果:\n{final_text}")
+        print(f"📌 總評估結果:\n{final_text_output}")
         return {"final_evaluation": self.state["final_evaluation"]}
-
-
-    # def interactive_query(self, query: str):
-    #     """
-    #     當用戶詢問時，利用現有的最終評估摘要以及短期記憶來回覆問題。
-    #     """
-    #     # 從 state 或長期記憶中取出最終評估摘要
-    #     final_eval = self.state.get("final_evaluation", "")
-
-    #     if not final_eval:
-    #         final_eval = self.long_term.get("final_evaluation") or ""
-
-    #     interactive_prompt = (
-    #         f"根據以下最終評估摘要，請回答用戶的問題：\n\n"
-    #         f"{final_eval}\n\n"
-    #         f"用戶問題：{query}\n"
-    #         "請以中文詳盡回答："
-    #     )
-    #     response = llm.invoke({"prompt": interactive_prompt})
-    #     answer = response.content if hasattr(response, "content") else response
-
-    #     # 可將此交互內容存入短期記憶，方便後續對話追蹤
-    #     self.short_term.save("final_evaluation_interaction", {"query": query, "answer": answer})
-
-    #     return answer
-
 
 # =============================================================================
 # 建立工作流程圖 (Graph Setup)
 # =============================================================================
-workflow = StateGraph(GlobalState)
-# workflow.config_schema = AssistantConfig
+workflow = StateGraph(GlobalState, config_schema=GraphOverallConfig)
 
-state = {
+initial_state = {
     "設計目標x設計需求x方案偏好": [],
     "design_summary": "",
     "analysis_img": "",
     "site_analysis": "",
-    "design_advice": "",
-    "case_image": "",
-    "outer_prompt": "",
-    "future_image": "",
-    "perspective_3D": "",
-    "model_3D": "",
-    "GATE1": 1,
-    "GATE2": 1,
+    "design_advice": [],
+    "case_image": [],
+    "outer_prompt": [],
+    "future_image": [],
+    "perspective_3D": [],
+    "model_3D": [],
+    "GATE1": "初始值",
+    "GATE2": "初始值",
     "GATE_REASON1": "",
     "GATE_REASON2": "",
     "current_round": 0,
-    "evaluation_count": 0,
+    "evaluation_count": [],
     "evaluation_status": "",
-    "evaluation_result": "",
+    "evaluation_result": [],
     "final_evaluation": ""
 }
 
-question_task = QuestionTask(state)
-site_analysis_task = SiteAnalysisTask(state)
-rag_thinking = RAGdesignThinking(state)
-gate_check1 = GateCheck1(state)
-shell_prompt = OuterShellPromptTask(state)
-image_render = CaseScenarioGenerationTask(state)
-gate_check2 = GateCheck2(state)
-future_scenario = FutureScenarioGenerationTask(state)
-generate_P3D = Generate3DPerspective(state)
-deep_evaluation = DeepEvaluationTask(state)
-evaluation_check = EvaluationCheckTask(state)
-final_eval = FinalEvaluationTask(state)
-# GenerateReactFlow = GenerateReactFlowTask(state)
+question_task = QuestionTask(initial_state)
+site_analysis_task = SiteAnalysisTask(initial_state)
+rag_thinking = RAGdesignThinking(initial_state)
+gate_check1 = GateCheck1(initial_state)
+# shell_prompt_task = OuterShellPromptTask(initial_state) # 註釋掉
+# image_render_task = CaseScenarioGenerationTask(initial_state) # 註釋掉
+unified_image_gen_task = UnifiedImageGenerationTask(initial_state) # 新增
+gate_check2 = GateCheck2(initial_state)
+future_scenario_task = FutureScenarioGenerationTask(initial_state)
+generate_p3d_task = Generate3DPerspective(initial_state)
+deep_evaluation_task = DeepEvaluationTask(initial_state)
+evaluation_check_task = EvaluationCheckTask(initial_state)
+final_eval_task = FinalEvaluationTask(initial_state)
 
 workflow.set_entry_point("question_summary")
 
@@ -1125,51 +2071,48 @@ workflow.add_node("question_summary", question_task.run)
 workflow.add_node("analyze_site", site_analysis_task.run)
 workflow.add_node("designThinking", rag_thinking.run)
 workflow.add_node("GateCheck1", gate_check1.run)
-workflow.add_node("shell_prompt", shell_prompt.run)
-workflow.add_node("image_render", image_render.run)
+# workflow.add_node("shell_prompt", shell_prompt_task.run) # 註釋掉
+# workflow.add_node("image_render", image_render_task.run) # 註釋掉
+workflow.add_node("img_generation", unified_image_gen_task.run) # 新增
 workflow.add_node("GateCheck2", gate_check2.run)
-workflow.add_node("generate_3D", generate_P3D.run)
-workflow.add_node("future_scenario", future_scenario.run)
-workflow.add_node("deep_evaluation", deep_evaluation.run)
-workflow.add_node("evaluation_check", evaluation_check.run)
-workflow.add_node("final_eval", final_eval.run)
-# workflow.add_node("GenerateReactFlow", GenerateReactFlow.run)
+workflow.add_node("future_scenario", future_scenario_task.run) # 恢復獨立節點
+workflow.add_node("generate_3D", generate_p3d_task.run)       # 恢復獨立節點
+workflow.add_node("deep_evaluation", deep_evaluation_task.run)
+workflow.add_node("evaluation_check", evaluation_check_task.run)
+workflow.add_node("final_eval", final_eval_task.run)
 
 workflow.add_edge("question_summary", "analyze_site")
 workflow.add_edge("analyze_site", "designThinking")
 workflow.add_edge("designThinking", "GateCheck1")
-workflow.add_edge("shell_prompt", "image_render")
-workflow.add_edge("image_render", "GateCheck2")
-workflow.add_edge("future_scenario", "deep_evaluation")
-workflow.add_edge("generate_3D", "deep_evaluation")
+# workflow.add_edge("shell_prompt", "image_render") # 註釋掉
+# workflow.add_edge("image_render", "GateCheck2") # 註釋掉
+workflow.add_edge("img_generation", "GateCheck2") # 新增
+workflow.add_edge("future_scenario", "generate_3D") # 恢復邊
+workflow.add_edge("generate_3D", "deep_evaluation") # 恢復邊
 workflow.add_edge("deep_evaluation", "evaluation_check")
-# workflow.add_edge("deep_evaluation", "GenerateReactFlow")
 workflow.add_edge("final_eval", END)
 
-# GateCheck1 條件節點
 workflow.add_conditional_edges(
     "GateCheck1",
     lambda state: "YES" if state.get("GATE1") == "有" else "NO",
     {
-        "YES": "shell_prompt", "NO": "designThinking"  
+        "YES": "img_generation",  # 修改：指向新節點
+        "NO": "designThinking"  
     }
 )
 
-# GateCheck2 條件節點
 workflow.add_conditional_edges(
     "GateCheck2",
     lambda state: "YES" if isinstance(state.get("GATE2"), int) else "NO",
-    { "YES": "future_scenario", "NO": "shell_prompt" }
+    { 
+        "YES": "future_scenario", # 修改：GateCheck2 的 YES 分支指向 future_scenario
+        "NO": "img_generation" 
+    }
 )
-workflow.add_edge("GateCheck2", "generate_3D") 
 
 workflow.add_conditional_edges("evaluation_check",lambda state: state["evaluation_status"],
     { "NO": "designThinking",   "YES": "final_eval"  })
 
-# =============================================================================
-# 構建並運行流程
-# =============================================================================
 graph = workflow.compile()
 
-# graph.invoke(state)
-graph.name = "Multi-Agent System"
+graph.name = "Multi-Agent System for Timber Pavilion Design"

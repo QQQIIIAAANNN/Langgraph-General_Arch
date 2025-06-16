@@ -58,6 +58,7 @@ from src.state import WorkflowState, TaskState # 從 state.py 導入狀態
 # 2. 環境變數與組態載入
 # =============================================================================
 load_dotenv()
+
 config_manager = ConfigManager("config.json")
 _full_static_config = config_manager.get_full_config() # Load once for static parts
 workflow_config_static = _full_static_config.workflow
@@ -886,7 +887,7 @@ def _generate_stacked_bar_chart_for_options(
             if option_id_val:
                 mapped_assessments[option_id_val] = item
             else:
-                print(f"  - Warning (get_scores_by_option_id): Item missing option_id, skipping: {str(item)[:100]}")
+                print(f"  - Warning (get_scores_by_option_id): Item from source missing option_id, skipping: {str(item)[:100]}")
         return mapped_assessments
 
     processed_llm_assessments = []
@@ -906,7 +907,10 @@ def _generate_stacked_bar_chart_for_options(
     for assessment in temp_assessments_for_cost_collection:
         if not isinstance(assessment, dict):
             continue
+        # {{ EDIT START }}
+        # Check for various possible cost keys from different tools/sources
         cost = assessment.get("estimated_cost", assessment.get("estimated_cost_img", assessment.get("estimated_cost_vid")))
+        # {{ EDIT END }}
         if cost is not None:
             try:
                 all_estimated_costs.append(float(cost))
@@ -925,15 +929,17 @@ def _generate_stacked_bar_chart_for_options(
         "cost_efficiency_score",  "green_building_score"
     ]
 
-    def scale_assessment_item(item: Dict[str, Any], source_suffix_short: str) -> Dict[str, Any]:
+    def scale_assessment_item(item: Dict[str, Any], source_suffix_short: str, global_min_cost: float, global_max_cost: float) -> Dict[str, Any]:
         scaled_item_output = {} 
+        # {{ EDIT START }}
+        # Use get with default None to handle missing keys gracefully
         option_id_val = item.get("option_id", item.get("Option Id"))
+        # {{ EDIT END }}
         if option_id_val:
              scaled_item_output["option_id"] = option_id_val
         else: 
             print(f"  - Warning (scale_assessment_item): Item from source '{source_suffix_short}' is missing option_id. Defaulting scores to 0. Item: {str(item)[:100]}")
             scaled_item_output["option_id"] = f"unknown_option_src_{source_suffix_short}"
-
 
         direct_score_internal_bases = [
             "user_goal_responsiveness_score", "aesthetics_context_score",
@@ -943,7 +949,7 @@ def _generate_stacked_bar_chart_for_options(
         def find_score_value(item_dict: Dict[str, Any], base_key_underscore: str, current_source_suffix_short: str) -> Optional[float]:
             def format_title_case_key(base_key: str, suffix_for_format: str) -> str:
                  parts = base_key.split('_')
-                 formatted_base = ' '.join(word.capitalize() for word in parts[:-1]) + " Score" if parts[-1] == "score" else ' '.join(word.capitalize() for word in parts)
+                 formatted_base = ' '.join(word.capitalize() for word in parts[:-1]) + " Score" if parts and parts[-1] == "score" else ' '.join(word.capitalize() for word in parts) # Added check for empty parts
                  capitalized_suffix_for_format = suffix_for_format.capitalize()
                  # Handle "Llm" specifically if suffix is "llm"
                  if suffix_for_format.lower() == "llm": capitalized_suffix_for_format = "Llm"
@@ -971,7 +977,7 @@ def _generate_stacked_bar_chart_for_options(
             # 5. Universal keys (no suffix) - less likely for direct scores but good fallback
             possible_keys_to_try.append(base_key_underscore) # e.g. "user_goal_responsiveness_score"
             parts = base_key_underscore.split('_') # For Title case no suffix
-            possible_keys_to_try.append(' '.join(word.capitalize() for word in parts[:-1]) + " Score" if parts[-1] == "score" else ' '.join(word.capitalize() for word in parts))
+            possible_keys_to_try.append(' '.join(word.capitalize() for word in parts[:-1]) + " Score" if parts and parts[-1] == "score" else ' '.join(word.capitalize() for word in parts)) # Added check for empty parts
 
             # Deduplicate keys while preserving order of first appearance
             final_possible_keys = list(dict.fromkeys(possible_keys_to_try))
@@ -980,7 +986,10 @@ def _generate_stacked_bar_chart_for_options(
 
 
             for key_attempt in final_possible_keys:
+                # {{ EDIT START }}
+                # Use .get() to safely access the value
                 raw_value = item_dict.get(key_attempt)
+                # {{ EDIT END }}
                 if raw_value is not None:
                      try:
                          score = float(raw_value)
@@ -996,20 +1005,34 @@ def _generate_stacked_bar_chart_for_options(
         for internal_base_key in direct_score_internal_bases:
             output_plot_key = f"{internal_base_key}_{source_suffix_short}"
             score = find_score_value(item, internal_base_key, source_suffix_short)
+            # {{ EDIT START }}
+            # Ensure default 0.0 if find_score_value returns None
             scaled_item_output[output_plot_key] = max(0.0, min(10.0, score if score is not None else 0.0))
-            
-        cost_raw_value = item.get("estimated_cost")
-        gb_perc_raw_value = item.get("green_building_potential_percentage")
+            # {{ EDIT END }}
+
+        # --- Calculate Cost Efficiency Score (0-10) from raw cost ---
+        # {{ EDIT START }}
+        # Check for various possible cost keys from different tools/sources
+        cost_raw_value = item.get("estimated_cost", item.get("estimated_cost_img", item.get("estimated_cost_vid")))
+        # {{ EDIT END }}
+        gb_perc_raw_value = item.get("green_building_potential_percentage") # Assuming this key is consistent
 
         gb_score_key_scaled_output = f"green_building_score_{source_suffix_short}_scaled"
         gb_score = 0.0
         if gb_perc_raw_value is not None:
             try:
-                gb_score = max(0.0, min(10.0, float(gb_perc_raw_value) / 10.0))
+                gb_percentage_float = float(gb_perc_raw_value)
+                gb_score = max(0.0, min(10.0, gb_percentage_float / 10.0))
             except (ValueError, TypeError):
                 print(f"  - Warning (Scale Item): Invalid green building percentage '{gb_perc_raw_value}' for source '{source_suffix_short}' in option '{option_id_val or 'unknown'}'. Setting scaled score to 0.")
         else:
-             print(f"  - Info (Scale Item): 'green_building_potential_percentage' is None for option '{option_id_val or 'unknown'}' from source '{source_suffix_short}'. Scaled green score set to 0.")
+             # Fallback to collected_green_building_score if percentage is missing/invalid
+             collected_gb_score_raw = find_score_value(item, "green_building_score", source_suffix_short) # Try to find the score directly if percentage is missing
+             if collected_gb_score_raw is not None:
+                  gb_score = max(0.0, min(10.0, collected_gb_score_raw))
+                  # print(f"  - Info (Scale Item): Used collected_green_building_score ({gb_score:.2f}) as percentage was missing for option '{option_id_val or 'unknown'}' from source '{source_suffix_short}'.")
+             else:
+                  print(f"  - Info (Scale Item): 'green_building_potential_percentage' is None and direct score not found for option '{option_id_val or 'unknown'}' from source '{source_suffix_short}'. Scaled green score set to 0.")
         scaled_item_output[gb_score_key_scaled_output] = gb_score
 
         cost_eff_score_key_scaled_output = f"cost_efficiency_score_{source_suffix_short}_scaled"
@@ -1017,35 +1040,72 @@ def _generate_stacked_bar_chart_for_options(
         if cost_raw_value is not None:
             try:
                 current_cost = float(cost_raw_value)
-                if not all_estimated_costs or min_overall_cost == max_overall_cost:
-                    cost_score = 5.0 if all_estimated_costs else 0.0 
+                if global_min_cost is None or global_max_cost is None or global_min_cost == global_max_cost:
+                    # If no global range or all costs are the same, default to a neutral score or 0
+            # {{ EDIT START }}
+                    # Default score for cost efficiency when no range is 1.0 (as per radar logic)
+                    cost_score = 1.0 if global_min_cost is not None else 0.0 # If there's data but no range, default to 1.0. If no data, default 0.0? Let's stick to 1.0 if data exists.
+                    # Re-evaluating: if global_min_cost is None, means all_estimated_costs is empty, should be 0. If min == max, all costs are the same, a neutral score like 5 is more appropriate, but user wants min 1. Let's set to 1.0 if there's *any* cost data.
+                    cost_score = 1.0 if cost_raw_value is not None else 0.0
+                    # {{ EDIT END }}
+                    # print(f"  - CostCalc (Scale Item): No valid global cost range ({global_min_cost}-{global_max_cost}). Using default score {cost_score:.1f} for option '{option_id_val or 'unknown'}' from source '{source_suffix_short}'.")
                 else:
-                    score_val_cost = 10.0 * (max_overall_cost - current_cost) / (max_overall_cost - min_overall_cost)
-                    cost_score = max(0.0, min(10.0, score_val_cost)) # Renamed variable to avoid conflict
+                    # Scale cost (lower cost = higher score)
+                    # Linear interpolation between max_cost (score 0) and min_cost (score 10)
+                    score_val_cost = 10.0 * (global_max_cost - current_cost) / (global_max_cost - global_min_cost)
+                    # {{ EDIT START }}
+                    # Clamp the scaled score between 1.0 and 10.0
+                    cost_score = max(1.0, min(10.0, score_val_cost))
+                    # {{ EDIT END }}
+                    # print(f"  - CostCalc (Scale Item): Budget calc used. Option '{option_id_val or 'unknown'}' Cost {current_cost:.2f}, Score {cost_score:.2f} from source '{source_suffix_short}'.")
             except (ValueError, TypeError):
                 print(f"  - Warning (Scale Item): Invalid estimated cost value '{cost_raw_value}' for source '{source_suffix_short}' in option '{option_id_val or 'unknown'}'. Setting scaled cost score to 0.")
         else:
-             print(f"  - Info (Scale Item): 'estimated_cost' is None for option '{option_id_val or 'unknown'}' from source '{source_suffix_short}'. Scaled cost score set to 0.")
+            # Fallback to collected_cost_efficiency_score if raw cost is missing/invalid
+            collected_cost_score_raw = find_score_value(item, "cost_efficiency_score", source_suffix_short) # Try to find the score directly if raw cost is missing
+            if collected_cost_score_raw is not None:
+                 # {{ EDIT START }}
+                 # Clamp the fallback collected score between 1.0 and 10.0
+                 cost_score = max(1.0, min(10.0, collected_cost_score_raw))
+                 # {{ EDIT END }}
+                 # print(f"  - Info (Scale Item): Used collected_cost_efficiency_score ({cost_score:.2f}) as raw cost was missing for option '{option_id_val or 'unknown'}' from source '{source_suffix_short}'.")
+            else:
+                 # {{ EDIT START }}
+                 # Default cost score if no raw cost and no collected score is 1.0 (consistent with radar)
+                 cost_score = 1.0
+                 # {{ EDIT END }}
+                 # print(f"  - Info (Scale Item): 'estimated_cost' is None and direct score not found for option '{option_id_val or 'unknown'}' from source '{source_suffix_short}'. Scaled cost score set to default 1.0.")
         scaled_item_output[cost_eff_score_key_scaled_output] = cost_score
-        
+
+        # Ensure all expected plot keys for this source exist, defaulting to 0.0
         for key_base in plot_base_keys:
             expected_plot_key_for_source = f"{key_base}_{source_suffix_short}"
             if key_base == "cost_efficiency_score" or key_base == "green_building_score":
                 expected_plot_key_for_source += "_scaled"
-            
-            if expected_plot_key_for_source not in scaled_item_output:
-                 print(f"  - Debug (Scale Item): Fallback Initializing missing plot key '{expected_plot_key_for_source}' to 0.0 for option '{option_id_val or 'unknown'}' from source '{source_suffix_short}'.")
-                 scaled_item_output[expected_plot_key_for_source] = 0.0
-        
+
+            # {{ EDIT START }}
+            # Safely check if the key exists and is numeric, otherwise default
+            # For cost efficiency, default should be 1.0 here if the base key is cost_efficiency_score
+            default_val = 0.0
+            if key_base == "cost_efficiency_score":
+                 default_val = 1.0
+
+            if expected_plot_key_for_source not in scaled_item_output or not isinstance(scaled_item_output[expected_plot_key_for_source], (int, float)):
+                 # print(f"  - Debug (Scale Item): Initializing/Correcting missing or non-numeric plot key '{expected_plot_key_for_source}' to {default_val:.1f} for option '{option_id_val or 'unknown'}' from source '{source_suffix_short}'.")
+                 scaled_item_output[expected_plot_key_for_source] = default_val
+            # {{ EDIT END }}
+
         return scaled_item_output
 
+    # --- MODIFICATION: Pass global_min_cost and global_max_cost to scale_assessment_item ---
     for item in llm_assessments_list:
-        if isinstance(item, dict): processed_llm_assessments.append(scale_assessment_item(item, "llm"))
+        if isinstance(item, dict): processed_llm_assessments.append(scale_assessment_item(item, "llm", min_overall_cost, max_overall_cost))
     for item in image_assessments_list:
-        if isinstance(item, dict): processed_image_assessments.append(scale_assessment_item(item, "img"))
+        if isinstance(item, dict): processed_image_assessments.append(scale_assessment_item(item, "img", min_overall_cost, max_overall_cost))
     for item in video_assessments_list:
-        if isinstance(item, dict): processed_video_assessments.append(scale_assessment_item(item, "vid"))
-    
+        if isinstance(item, dict): processed_video_assessments.append(scale_assessment_item(item, "vid", min_overall_cost, max_overall_cost))
+    # --- END MODIFICATION ---
+
     llm_option_scores_map = get_scores_by_option_id(processed_llm_assessments)
     image_option_scores_map = get_scores_by_option_id(processed_image_assessments)
     video_option_scores_map = get_scores_by_option_id(processed_video_assessments)
@@ -1059,28 +1119,31 @@ def _generate_stacked_bar_chart_for_options(
         "耐久性與維護性", "早期成本效益估算", "綠建築永續潛力"
     ]
     num_dimensions = len(dimension_display_names)
-    
+
     source_configs = [
         {"name": "LLM 評估", "data_map": llm_option_scores_map, "suffix_short": "llm", "color": "cornflowerblue"},
         {"name": "圖像工具評估", "data_map": image_option_scores_map, "suffix_short": "img", "color": "salmon"},
         {"name": "影片工具評估", "data_map": video_option_scores_map, "suffix_short": "vid", "color": "mediumseagreen"},
     ]
-    
+
     total_distinct_bars = num_options * num_dimensions
-    x_indices = np.arange(total_distinct_bars) 
-    
+    x_indices = np.arange(total_distinct_bars)
+
     fig, ax = plt.subplots(figsize=(max(12, total_distinct_bars * 0.7), 10))
 
     legend_handles_from_bars = []
-    x_tick_labels_major = [] 
+    x_tick_labels_major = []
     x_tick_positions_major = []
     max_y_value_observed = 0.0
 
     current_bar_idx = 0
     for opt_idx, option_info_original in enumerate(options_input_data):
+        # {{ EDIT START }}
+        # Safely get option_id and description
         option_id = option_info_original.get("option_id", option_info_original.get("Option Id", f"Opt{opt_idx+1}"))
-        option_desc_short = textwrap.fill(option_info_original.get("description", option_id), width=12)
-        
+        option_desc_short = textwrap.fill(option_info_original.get("description", option_id) or option_id, width=12) # Use option_id if description is None/empty
+        # {{ EDIT END }}
+
         major_tick_pos = (opt_idx * num_dimensions) + (num_dimensions / 2.0) - 0.5
         x_tick_positions_major.append(major_tick_pos)
         x_tick_labels_major.append(option_desc_short)
@@ -1088,26 +1151,30 @@ def _generate_stacked_bar_chart_for_options(
         max_height_in_option_group = 0.0
 
         for dim_idx, dim_name in enumerate(dimension_display_names):
-            base_score_key_internal = plot_base_keys[dim_idx] 
+            base_score_key_internal = plot_base_keys[dim_idx]
             current_bar_bottom = 0.0
-            
+
             for src_cfg_idx, source_cfg in enumerate(source_configs):
                 source_name = source_cfg["name"]
                 # Get the pre-processed dictionary for this option_id from this source's map
-                option_scores_dict_from_source = source_cfg["data_map"].get(option_id) 
-                
+                option_scores_dict_from_source = source_cfg["data_map"].get(option_id)
+
                 actual_score_key_to_fetch = f"{base_score_key_internal}_{source_cfg['suffix_short']}"
                 if base_score_key_internal == "cost_efficiency_score" or base_score_key_internal == "green_building_score":
                     actual_score_key_to_fetch += "_scaled"
-                
+
                 score_value = 0.0
                 if option_scores_dict_from_source and isinstance(option_scores_dict_from_source, dict):
                     # Now get the specific score using the constructed key
+                    # {{ EDIT START }}
+                    # Use .get() to safely extract the score, default to 0.0 if key missing or value is None
                     score_value = option_scores_dict_from_source.get(actual_score_key_to_fetch, 0.0)
-                    if not isinstance(score_value, (int,float)): # Double check type
-                        # print(f"  - Plot Warning: Score '{actual_score_key_to_fetch}' for option '{option_id}' from '{source_name}' not numeric ({score_value}). Using 0.")
-                        score_value = 0.0
-                else: 
+                    # Ensure it's numeric after extraction
+                    if not isinstance(score_value, (int, float)):
+                         # print(f"  - Plot Warning: Score '{actual_score_key_to_fetch}' for option '{option_id}' from '{source_name}' not numeric ({score_value}). Using 0.")
+                         score_value = 0.0
+                    # {{ EDIT END }}
+                else:
                     # This case means the entire option_id was missing from this source's map
                     # (e.g., image_option_scores_map had no entry for this option_id)
                     # The scale_assessment_item should have ensured all keys exist with 0.0,
@@ -1115,16 +1182,16 @@ def _generate_stacked_bar_chart_for_options(
                     # print(f"  - Plot Debug: No scores dict for option '{option_id}' from source '{source_name}'. Scores will be 0.")
                     pass
 
-                # Ensure score_value is float for plotting
+                # Ensure score_value is float for plotting (redundant due to check above, but safe)
                 try:
                     score_value = float(score_value)
                 except (ValueError, TypeError):
                     score_value = 0.0
 
 
-                bar_plot = ax.bar(x_indices[current_bar_idx], score_value, 
+                bar_plot = ax.bar(x_indices[current_bar_idx], score_value,
                                   bottom=current_bar_bottom,
-                                  color=source_cfg["color"], 
+                                  color=source_cfg["color"],
                                   edgecolor='grey', width=0.7,
                                   label=source_name if opt_idx == 0 and dim_idx == 0 and src_cfg_idx == 0 else "") # Simpler legend handle creation
 
@@ -1133,7 +1200,7 @@ def _generate_stacked_bar_chart_for_options(
                             ha='center', va='center', color='black', fontsize=6,
                             fontproperties=cjk_font_prop,
                             path_effects=[PathEffects.withStroke(linewidth=0.5, foreground='white')])
-                
+
                 current_bar_bottom += score_value
 
                 # Collect legend handles more reliably
@@ -1311,6 +1378,15 @@ def generate_evaluation_visualization_node(state: WorkflowState, config: Runnabl
     # --- END MODIFICATION ---
     if "selected_option_identifier" in llm_branch_payload:
         current_task["evaluation"]["selected_option_identifier"] = llm_branch_payload["selected_option_identifier"]
+    # --- NEW: Merge FinalEvaAgent specific fields from LLM branch payload ---
+    if selected_agent == "FinalEvaAgent":
+        if "iteration_review_and_suggestions" in llm_branch_payload:
+            current_task["evaluation"]["iteration_review_and_suggestions"] = llm_branch_payload["iteration_review_and_suggestions"]
+            print(f"  - Merged 'iteration_review_and_suggestions' from LLM branch.")
+        if "improvement_suggestions_final" in llm_branch_payload:
+            current_task["evaluation"]["improvement_suggestions_final"] = llm_branch_payload["improvement_suggestions_final"]
+            print(f"  - Merged 'improvement_suggestions_final' from LLM branch.")
+    # --- END NEW ---
     
     # --- Merge feedback_log ---
     # Start with existing feedback, then append branch feedback in order: Text > Image > Video
@@ -1576,6 +1652,15 @@ def generate_evaluation_visualization_node(state: WorkflowState, config: Runnabl
     current_task["outputs"] = current_task.get("outputs", {})
     current_task["outputs"]["detailed_option_scores"] = options_with_calculated_final_scores # Also store in outputs for consistency
 
+    # --- NEW: Add FinalEvaAgent specific outputs to current_task["outputs"] ---
+    if selected_agent == "FinalEvaAgent":
+        if "iteration_review_and_suggestions" in current_task["evaluation"]:
+            current_task["outputs"]["iteration_review_and_suggestions"] = current_task["evaluation"]["iteration_review_and_suggestions"]
+        if "improvement_suggestions_final" in current_task["evaluation"]:
+            current_task["outputs"]["improvement_suggestions_final"] = current_task["evaluation"]["improvement_suggestions_final"]
+        print(f"  - FinalEvaAgent specific outputs (iteration review, improvements) added to task outputs.")
+    # --- END NEW ---
+
     print(f"  - Final scores calculated and stored for {len(options_with_calculated_final_scores)} options.")
 
     # Retrieve the CJK font property found during initialization
@@ -1766,6 +1851,16 @@ def generate_evaluation_visualization_node(state: WorkflowState, config: Runnabl
     if current_task["evaluation"].get("feedback_llm_overall"):
         overall_feedback_parts.append(f"  LLM Master Feedback: {current_task['evaluation']['feedback_llm_overall']}")
 
+    # --- NEW: Add iteration review and improvement suggestions to overall feedback for FinalEvaAgent ---
+    if selected_agent == "FinalEvaAgent":
+        iteration_review_text = current_task["evaluation"].get("iteration_review_and_suggestions")
+        improvement_sugg_text = current_task["evaluation"].get("improvement_suggestions_final")
+        if iteration_review_text:
+            overall_feedback_parts.append(f"\nIterative Development Process Review & Suggestions:\n{iteration_review_text}")
+        if improvement_sugg_text:
+            overall_feedback_parts.append(f"\nOverall Improvement Suggestions for Project:\n{improvement_sugg_text}")
+    # --- END NEW ---
+
     # Add summary for each scored option
     if options_with_calculated_final_scores:
         overall_feedback_parts.append("\nDetailed Option Summaries:")
@@ -1863,10 +1958,17 @@ async def prepare_evaluation_inputs_node(state: WorkflowState, config: RunnableC
 
     runtime_config = config.get("configurable", {})
     llm_output_language = runtime_config.get("global_llm_output_language", LLM_OUTPUT_LANGUAGE_DEFAULT)
-    # --- MODIFICATION: Pass agent name for default LLM lookup ---
-    ea_llm_config_params = runtime_config.get("ea_llm", {})
+    # --- MODIFIED: Properly construct LLM config dict from runtime_config for EvaAgent ---
+    ea_llm_config_params = {
+        "model_name": runtime_config.get("ea_model_name"),
+        "temperature": runtime_config.get("ea_temperature"),
+        "max_tokens": runtime_config.get("ea_max_tokens"),
+    }
+    # Filter out None values if not present in runtime_config
+    ea_llm_config_params = {k: v for k, v in ea_llm_config_params.items() if v is not None}
+
     llm = initialize_llm(ea_llm_config_params, agent_name_for_default_lookup="eva_agent") # eva_agent is the config key
-    # --- END MODIFICATION ---
+    # --- END MODIFIED ---
 
     current_task["task_inputs"] = {}
     prompt_inputs = {}
@@ -1876,7 +1978,7 @@ async def prepare_evaluation_inputs_node(state: WorkflowState, config: RunnableC
 
     # `options_for_evaluation_pre_llm` is used to pass a preliminary structuring to the LLM.
     # The LLM is then expected to refine this, especially for file associations and unique option_ids.
-    options_for_evaluation_pre_llm = [] 
+    options_for_evaluation_pre_llm = []
 
     if is_standard_eval:
         prompt_template_name = "prepare_evaluation_inputs"
@@ -2258,8 +2360,15 @@ def generate_specific_criteria_node(state: WorkflowState, config: RunnableConfig
     print(f"  - Generating criteria/rubric for Agent: {selected_agent}")
 
     runtime_config = config["configurable"]
-    ea_llm_config = runtime_config.get("ea_llm", {})
-    llm = initialize_llm(ea_llm_config)
+    # --- MODIFIED: Properly construct LLM config dict from runtime_config for EvaAgent ---
+    ea_llm_config_params = {
+        "model_name": runtime_config.get("ea_model_name"),
+        "temperature": runtime_config.get("ea_temperature"),
+        "max_tokens": runtime_config.get("ea_max_tokens"),
+    }
+    ea_llm_config_params = {k: v for k, v in ea_llm_config_params.items() if v is not None}
+    llm = initialize_llm(ea_llm_config_params, agent_name_for_default_lookup="eva_agent") # Use eva_agent config
+    # --- END MODIFIED ---
     llm_output_language = runtime_config.get("global_llm_output_language", LLM_OUTPUT_LANGUAGE_DEFAULT)
 
     prompt_template = None
@@ -2583,7 +2692,7 @@ def evaluate_with_llm_node(state: WorkflowState, config: RunnableConfig) -> Dict
     print(f"--- Running Node: {node_name} ---")
     tasks = [t.copy() for t in state["tasks"]]
     current_idx = state["current_task_index"]
-    if not (0 <= current_idx < len(tasks)): 
+    if not (0 <= current_idx < len(tasks)):
          # In a parallel node, if something is fundamentally wrong with index,
          # we should return a payload indicating failure for this branch.
          return {"llm_temp_output": {"error": f"Invalid task index {current_idx}", "task_failed_in_branch": True, "subgraph_error_from_branch": f"Invalid task index {current_idx}"}}
@@ -2607,12 +2716,18 @@ def evaluate_with_llm_node(state: WorkflowState, config: RunnableConfig) -> Dict
     specific_criteria = current_task.get("evaluation", {}).get("specific_criteria", "Default criteria apply / Rubric not generated.")
 
     runtime_config = config["configurable"]
-    # --- MODIFICATION: Pass agent name for default LLM lookup ---
-    ea_llm_config_params = runtime_config.get("ea_llm", {})
-    llm = initialize_llm(ea_llm_config_params, agent_name_for_default_lookup="eva_agent") 
-    # --- END MODIFICATION ---
+    # --- MODIFIED: Properly construct LLM config dict from runtime_config for EvaAgent ---
+    ea_llm_config_params = {
+        "model_name": runtime_config.get("ea_model_name"),
+        "temperature": runtime_config.get("ea_temperature"),
+        "max_tokens": runtime_config.get("ea_max_tokens"),
+    }
+    ea_llm_config_params = {k: v for k, v in ea_llm_config_params.items() if v is not None}
+
+    llm = initialize_llm(ea_llm_config_params, agent_name_for_default_lookup="eva_agent")
+    # --- END MODIFIED ---
     llm_output_language = runtime_config.get("global_llm_output_language", LLM_OUTPUT_LANGUAGE_DEFAULT)
-    
+
     # --- MODIFICATION: Get prompt template using new key name from runtime config first ---
     evaluation_template_config_key = "ea_evaluation_prompt"
     evaluation_template_str = runtime_config.get(evaluation_template_config_key) or \
@@ -2623,8 +2738,25 @@ def evaluate_with_llm_node(state: WorkflowState, config: RunnableConfig) -> Dict
     llm_overall_feedback = "No overall feedback from LLM."
     llm_assessment_summary = "N/A"
     llm_selected_option_identifier = None
+    # --- NEW: Add fields for FinalEvaAgent specific outputs ---
+    llm_iteration_review = None
+    llm_improvement_suggestions_final = None # Renamed to avoid conflict if 'improvement_suggestions' used by EvaAgent for pass/fail
+    # --- END NEW ---
     branch_error = ""
     branch_failed = False # Flag to indicate critical failure in this branch
+
+    # {{ EDIT START }}
+    # Helper to process lists of file dicts into joined path strings
+    def to_path_str(file_list_of_dicts: Optional[List[Dict[str, Any]]]) -> str:
+        if isinstance(file_list_of_dicts, list):
+            paths = [item['path'] for item in file_list_of_dicts if isinstance(item, dict) and 'path' in item]
+            return ", ".join(paths) or "None"
+        elif file_list_of_dicts is None: # if .get() returned None because key was absent.
+            return "None"
+        else: # It was not a list and not None (e.g. LLM returned a string or int by mistake)
+            print(f"  - Warning (LLM Eval Node): Expected a list of file dicts for path string conversion, got {type(file_list_of_dicts)}. Defaulting to 'None'.")
+            return "None"
+    # {{ EDIT END }}
 
     # Prepare prompt inputs common to all modes
     prompt_inputs = {
@@ -2641,19 +2773,12 @@ def evaluate_with_llm_node(state: WorkflowState, config: RunnableConfig) -> Dict
         "evaluation_target_other_files_str": str(prepared_inputs.get("evaluation_target_other_files", []) or "None") if selected_agent == "EvaAgent" else "None",
         # Final/Special Eval Inputs (will be empty/None if not Special/Final)
         "full_task_summary": prepared_inputs.get("evaluation_target_full_summary", "N/A") if selected_agent != "EvaAgent" else "N/A", # Use the prepared summary from inputs
-        "evaluation_target_key_image_paths_str": ", ".join(prepared_inputs.get("evaluation_target_key_image_paths", [])) or "None" if selected_agent != "EvaAgent" else "None",
-        "evaluation_target_key_video_paths_str": ", ".join(prepared_inputs.get("evaluation_target_key_video_paths", [])) or "None" if selected_agent != "EvaAgent" else "None",
+        "evaluation_target_key_image_paths_str": to_path_str(prepared_inputs.get("evaluation_target_key_image_paths")) if selected_agent != "EvaAgent" else "None",
+        "evaluation_target_key_video_paths_str": to_path_str(prepared_inputs.get("evaluation_target_key_video_paths")) if selected_agent != "EvaAgent" else "None",
         "evaluation_target_other_artifacts_summary_str": prepared_inputs.get("evaluation_target_other_artifacts_summary", "N/A") if selected_agent != "EvaAgent" else "N/A",
         "options_data_for_llm_eval_json": json.dumps(prepared_inputs.get("options_data", []), ensure_ascii=False, default=str) if selected_agent in ["SpecialEvaAgent", "FinalEvaAgent"] else "[]",
-        # --- MODIFICATION: Read feedback summaries from task_inputs if already there, otherwise default. Merge node will consolidate. ---
         "image_tool_feedback": prepared_inputs.get("image_tool_feedback_summary", "N/A from prep inputs"), # This might need adjustment - maybe get from state directly before merge?
-        "video_tool_feedback": prepared_inputs.get("video_tool_feedback_summary", "N/A from prep inputs")  # Same as above
-        # It seems better to get these from state within the merge node, not pass them to LLM eval node.
-        # Let's remove these two from prompt_inputs and template. The merge node will use them.
-        # REMOVED: "image_tool_feedback" and "video_tool_feedback" from prompt_inputs and template
-        # The LLM evaluation prompt should probably NOT include feedback from other branches, as it should operate independently.
-        # The merge node is where cross-branch info should be consolidated for final scoring/summary.
-        # Let's revert the prompt template modification for 'evaluation'.
+        "video_tool_feedback": prepared_inputs.get("video_tool_feedback_summary", "N/A from prep inputs") 
     }
     
     # Re-checking the 'evaluation' prompt template - it DOES include 'image_tool_feedback' and 'video_tool_feedback'.
@@ -2676,7 +2801,11 @@ def evaluate_with_llm_node(state: WorkflowState, config: RunnableConfig) -> Dict
         "task_failed_in_branch": False,
         "feedback_llm_overall": "", # Overall feedback from LLM eval
         "assessment": "N/A", # Overall assessment from LLM eval (e.g., Score 7/10)
-        "selected_option_identifier": None # Selected option from LLM eval
+        "selected_option_identifier": None, # Selected option from LLM eval
+        # --- NEW: Add placeholders for FinalEvaAgent specific outputs in payload ---
+        "iteration_review_and_suggestions": None,
+        "improvement_suggestions_final": None
+        # --- END NEW ---
     }
 
     if not evaluation_template_str:
@@ -2755,6 +2884,13 @@ def evaluate_with_llm_node(state: WorkflowState, config: RunnableConfig) -> Dict
                         llm_selected_option_identifier = parsed_json.get("selected_option_identifier")
                         llm_assessment_summary = parsed_json.get("assessment", "N/A")
                         llm_overall_feedback = parsed_json.get("feedback", "No overall feedback from LLM.")
+                        # --- NEW: Extract FinalEvaAgent specific fields ---
+                        if selected_agent == "FinalEvaAgent":
+                            llm_iteration_review = parsed_json.get("iteration_review_and_suggestions")
+                            llm_improvement_suggestions_final = parsed_json.get("improvement_suggestions")
+                            print(f"    - FinalEvaAgent: Iteration Review: {'Present' if llm_iteration_review else 'Missing'}")
+                            print(f"    - FinalEvaAgent: Improvement Suggestions: {'Present' if llm_improvement_suggestions_final else 'Missing'}")
+                        # --- END NEW ---
 
                         if isinstance(detailed_option_scores_from_llm, list):
                             llm_eval_results_for_options = detailed_option_scores_from_llm
@@ -2869,6 +3005,11 @@ def evaluate_with_llm_node(state: WorkflowState, config: RunnableConfig) -> Dict
         llm_branch_payload["feedback_llm_overall"] = llm_overall_feedback
         llm_branch_payload["assessment"] = llm_assessment_summary # Store summary like "Score (7/10)"
         llm_branch_payload["selected_option_identifier"] = llm_selected_option_identifier
+        # --- NEW: Add FinalEvaAgent specific fields to payload ---
+        if selected_agent == "FinalEvaAgent":
+            llm_branch_payload["iteration_review_and_suggestions"] = llm_iteration_review
+            llm_branch_payload["improvement_suggestions_final"] = llm_improvement_suggestions_final
+        # --- END NEW ---
 
         print(f"  - {selected_agent}: LLM evaluation part completed. Returning payload.")
         return {"llm_temp_output": llm_branch_payload}

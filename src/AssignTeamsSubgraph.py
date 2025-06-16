@@ -10,6 +10,13 @@ from typing import Dict, List, Any, Literal, Union, Optional, Tuple
 from pathlib import Path
 import traceback
 import asyncio
+# --- ADDED: Import PIL for image processing ---
+try:
+    from PIL import Image
+except ImportError:
+    print("Warning: Pillow not installed. Image processing (like cropping for model_render_image) will be skipped. Please install with 'pip install Pillow'.")
+    Image = None # Set to None if not available
+# --- END ADDED ---
 
 # LangChain/LangGraph Imports
 from langchain_core.messages import AIMessage, HumanMessage, BaseMessage, ToolMessage
@@ -104,8 +111,9 @@ if "OSMMCPCoordinator" not in agent_descriptions:
 # 3. 常數設定 (Mostly static, okay to load from config or define here)
 # =============================================================================
 OUTPUT_DIR = workflow_config_static.output_directory
-RENDER_CACHE_DIR = os.path.join(OUTPUT_DIR, "render_cache")
-MODEL_CACHE_DIR = os.path.join(OUTPUT_DIR, "model_cache")
+GENERATION_OUTPUT_DIR = os.path.join(OUTPUT_DIR, "render_cache")
+RENDER_CACHE_DIR = os.path.join(OUTPUT_DIR, "cache/render_cache")
+MODEL_CACHE_DIR = os.path.join(OUTPUT_DIR, "cache/model_cache")
 os.makedirs(RENDER_CACHE_DIR, exist_ok=True)
 os.makedirs(MODEL_CACHE_DIR, exist_ok=True)
 MEMORY_DIR = os.path.join("knowledge", "memory")
@@ -217,19 +225,33 @@ def _update_task_state_after_tool(
                               # Example simple representation:
                               msg_dict = {
                                    "type": msg.type,
-                                   # --- MODIFIED: Ensure content is also truncated for display if it's very long ---
-                                   "content": (
-                                       (repr(msg.content)[:200] + "..." if len(repr(msg.content)) > 200 else repr(msg.content))
-                                       if msg.content else "[No Content]"
-                                   ),
-                                   "additional_kwargs": msg.additional_kwargs,
+                                   # --- MODIFIED: Adjust truncation, especially for AIMessage content ---
+                                   "additional_kwargs": msg.additional_kwargs, # Keep kwargs first
                               }
+                              
+                              # Handle content display
+                              content_to_display = "[No Content]"
+                              if msg.content:
+                                  # --- MODIFICATION: No truncation for [目標階段計劃] ---
+                                  if isinstance(msg, AIMessage) and isinstance(msg.content, str) and msg.content.startswith("[目標階段計劃]:"):
+                                      content_to_display = msg.content # No truncation
+                                  # --- END MODIFICATION ---
+                                  else: # Apply existing truncation logic for other messages
+                                      content_repr = repr(msg.content)
+                                      if len(content_repr) > 500: # Increased general truncation limit
+                                          content_to_display = content_repr[:500] + "..."
+                                      else:
+                                          content_to_display = content_repr
+                              msg_dict["content"] = content_to_display
+                              # --- END MODIFICATION for content truncation ---
+
                               if hasattr(msg, 'name'): msg_dict['name'] = msg.name
                               if hasattr(msg, 'tool_call_id'): msg_dict['tool_call_id'] = msg.tool_call_id
-                              if hasattr(msg, 'tool_calls'): 
+                              if hasattr(msg, 'tool_calls') and msg.tool_calls: # Check if tool_calls is not None or empty
                                   # Also truncate tool_calls representation if it's too verbose
                                   tool_calls_repr = repr(msg.tool_calls)
-                                  msg_dict['tool_calls'] = tool_calls_repr[:200] + "..." if len(tool_calls_repr) > 200 else tool_calls_repr
+                                  # Increased truncation limit for tool_calls as well
+                                  msg_dict['tool_calls'] = tool_calls_repr[:500] + "..." if len(tool_calls_repr) > 500 else tool_calls_repr
                               serializable_history.append(msg_dict)
                          except Exception as msg_ser_err:
                               print(f"  Warning: Could not serialize message {type(msg)}: {msg_ser_err}")
@@ -394,9 +416,19 @@ async def prepare_tool_inputs_node(state: WorkflowState, config: RunnableConfig)
     # Retrieve runtime configuration
     runtime_config = config.get("configurable", {})
 
+    # --- MODIFIED: Properly construct LLM config dict from runtime_config for AssignAgent ---
     # Determine which LLM to use (specific agent LLM or default)
-    aa_llm_config_params = runtime_config.get("aa_llm", {})
+    aa_llm_config_params = {
+        "model_name": runtime_config.get("aa_model_name"),
+        "temperature": runtime_config.get("aa_temperature"),
+        "max_tokens": runtime_config.get("aa_max_tokens"),
+        # Note: provider is inferred by initialize_llm from model_name
+    }
+    # Filter out None values if not present in runtime_config
+    aa_llm_config_params = {k: v for k, v in aa_llm_config_params.items() if v is not None}
+
     llm = initialize_llm(aa_llm_config_params, agent_name_for_default_lookup="assign_agent") # Use assign_agent config
+    # --- END MODIFIED ---
 
     prompt_template = None
     prompt_template_name = "prepare_tool_inputs_prompt" # This is the name in config
@@ -653,12 +685,23 @@ async def run_llm_task_node(state: WorkflowState, config: RunnableConfig) -> Dic
         if not prompt_for_llm: raise ValueError("Missing 'prompt' in task_inputs")
 
         runtime_config = config["configurable"]
-        llm_config_dict = runtime_config.get("ta_llm", {})
-        llm = initialize_llm(llm_config_dict)
+        # --- MODIFIED: Properly construct LLM config dict from runtime_config for ToolAgent (used by LLMTaskAgent) ---
+        # Using 'ta_llm' config for LLMTaskAgent execution
+        llm_config_dict = {
+            "model_name": runtime_config.get("ta_model_name"),
+            "temperature": runtime_config.get("ta_temperature"),
+            "max_tokens": runtime_config.get("ta_max_tokens"),
+            # Note: provider is inferred by initialize_llm from model_name
+        }
+        # Filter out None values if not present in runtime_config
+        llm_config_dict = {k: v for k, v in llm_config_dict.items() if v is not None}
+
+        llm = initialize_llm(llm_config_dict, agent_name_for_default_lookup="tool_agent")
+        # --- END MODIFIED ---
         print(f"LLM Task Node: Invoking LLM ({llm.__class__.__name__})...") # Log LLM class
         response = await llm.ainvoke(prompt_for_llm)
         result_content = response.content.strip()
-        print(f"LLM Task Node: Received response: {result_content[:100]}...")
+        print(f"LLM Task Node: Received response: {result_content[:100]}...") # Handle non-string results if necessary
         final_outputs = {"content": result_content}
         final_output_files = []
     except Exception as e:
@@ -904,10 +947,10 @@ def run_web_search_tool_node(state: WorkflowState, config: RunnableConfig) -> Di
     tasks[current_idx] = _update_task_state_after_tool(current_task, outputs=final_outputs, output_files=output_files_list, error=error_to_report)
     return {"tasks": tasks, "current_task": tasks[current_idx].copy()}
 
-# --- MODIFIED: run_model_render_tool_node (now handles both photorealism and future simulation) ---
+# --- run_model_render_tool_node (MODIFIED to handle odd dimensions) ---
 def run_model_render_tool_node(state: WorkflowState, config: RunnableConfig) -> Dict[str, Any]:
     node_name = "Model Render Tool"
-    print(f"--- Running {node_name} (Handles Photorealism & Future Simulation) ---")
+    print(f"--- Running {node_name} (Handles Photorealistic Rendering) ---") # Modified description
     current_idx = state.get("current_task_index", -1)
     tasks = [t.copy() for t in state.get("tasks", [])]
     if current_idx < 0 or current_idx >= len(tasks): return {"tasks": state.get("tasks", [])}
@@ -923,117 +966,139 @@ def run_model_render_tool_node(state: WorkflowState, config: RunnableConfig) -> 
             raise ValueError("Invalid or missing 'task_inputs'")
 
         initial_outer_prompt_context = task_inputs.get("outer_prompt") # This is the contextual prompt from prepare_tool_inputs
-        image_inputs_paths = task_inputs.get("image_inputs") # List of image paths, RENAMED from render_image_input
-        is_future_scenario = task_inputs.get("is_future_scenario", False) # Boolean flag
+        image_inputs_paths = task_inputs.get("image_inputs") # List of image paths
 
         if not initial_outer_prompt_context:
             raise ValueError("Missing required input 'outer_prompt' (contextual prompt)")
-        if not image_inputs_paths or not isinstance(image_inputs_paths, list) or not image_inputs_paths or not all(isinstance(p, str) for p in image_inputs_paths): # Added check for empty list
+        if not image_inputs_paths or not isinstance(image_inputs_paths, list) or not image_inputs_paths or not all(isinstance(p, str) for p in image_inputs_paths):
             raise ValueError("Missing or invalid 'image_inputs' (must be a non-empty list of string paths)")
-        if not isinstance(is_future_scenario, bool):
-            raise ValueError("'is_future_scenario' must be a boolean")
 
-        print(f"{node_name}: Task type: {'Future Simulation' if is_future_scenario else 'Photorealistic Render'}")
+        print(f"{node_name}: Task type: Photorealistic Render") # Simplified task type
         print(f"  Initial outer_prompt='{initial_outer_prompt_context[:70]}...', processing {len(image_inputs_paths)} image(s).")
 
         for idx, image_full_path in enumerate(image_inputs_paths):
             print(f"  Processing image {idx+1}/{len(image_inputs_paths)}: {image_full_path}")
             
-            refined_prompt_text = initial_outer_prompt_context # Default to initial prompt
-            try:
-                if is_future_scenario:
-                    # Prompt for ImageRecognition: Ask it to generate a final English ComfyUI prompt for future simulation
-                    recognition_prompt_ir = f"Based on the following context for a future architectural scenario: '{initial_outer_prompt_context}', and by analyzing the provided image, generate a detailed and specific, final, ENGLISH ComfyUI prompt. This prompt should be directly usable by an image generation tool to visually simulate the described future scenario on the given image. Focus on elements that would change or appear in the future based on the context and image content."
-                else: # Photorealistic rendering
-                    # Prompt for ImageRecognition: Ask it to generate a final English ComfyUI prompt for photorealism
-                    recognition_prompt_ir = f"For the architectural scheme described as: '{initial_outer_prompt_context}', and by analyzing the provided image (paying close attention to its perspective, view, and existing elements), generate a detailed and specific, final, ENGLISH ComfyUI prompt. This prompt should be directly usable by an image generation tool to create a high-quality photorealistic rendering of the image, enhancing realism and matching the described scheme."
-                
-                print(f"    Invoking ImageRecognition for: {image_full_path} with IR prompt: '{recognition_prompt_ir[:100]}...'")
-                
-                refined_prompt_dict_or_str = img_recognition({
-                    "image_paths": [image_full_path],
-                    "prompt": recognition_prompt_ir
-                })
+            # The prompt for model_render_image will be the initial_outer_prompt_context
+            # as img_recognition based refinement is removed.
+            current_prompt_for_tool = initial_outer_prompt_context
+            processed_image_path_for_tool = image_full_path # Default to original path
 
-                if isinstance(refined_prompt_dict_or_str, str):
-                    refined_prompt_text = refined_prompt_dict_or_str
-                elif isinstance(refined_prompt_dict_or_str, dict) and "description" in refined_prompt_dict_or_str:
-                    refined_prompt_text = refined_prompt_dict_or_str["description"]
-                else:
-                    print(f"    Warning: ImageRecognition returned unexpected format for {image_full_path}. Using initial_outer_prompt. Output: {refined_prompt_dict_or_str}")
-                    # Fallback already handled by refined_prompt_text = initial_outer_prompt_context
-                
-                if not refined_prompt_text or (isinstance(refined_prompt_text, str) and any(err_str in refined_prompt_text for err_str in ["錯誤", "Error", "找不到"])):
-                     print(f"    Warning: ImageRecognition failed or returned error for {image_full_path}: '{refined_prompt_text}'. Using initial_outer_prompt for this image.")
-                     refined_prompt_text = initial_outer_prompt_context # Ensure fallback
+            # --- Image Dimension Check and Cropping (Remains) ---
+            if Image: 
+                try:
+                    with Image.open(image_full_path) as img:
+                        original_width, original_height = img.size
+                        needs_cropping = False
+                        new_width, new_height = original_width, original_height
 
-                print(f"    Refined prompt for {image_full_path}: '{refined_prompt_text[:70]}...'")
-            except Exception as recog_err:
-                print(f"    Error during ImageRecognition for {image_full_path}: {recog_err}. Using initial_outer_prompt.")
-                # refined_prompt_text is already initial_outer_prompt_context by default
+                        if original_width % 2 != 0:
+                            new_width -= 1
+                            needs_cropping = True
+                            print(f"    Warning: Image width is odd ({original_width}). Will crop to {new_width}.")
+                        if original_height % 2 != 0:
+                            new_height -= 1
+                            needs_cropping = True
+                            print(f"    Warning: Image height is odd ({original_height}). Will crop to {new_height}.")
 
-            print(f"    Calling model_render_image with outer_prompt='{refined_prompt_text[:50]}...', render_image='{os.path.basename(image_full_path)}'")
-            # The model_render_image tool itself should handle the type of rendering based on the refined_prompt
-            # or potentially different ComfyUI workflows if the tool is made more complex.
-            # For now, we assume the refined_prompt is sufficient to guide the *single* model_render_image tool.
+                        if needs_cropping:
+                            cropped_img = img.crop((0, 0, new_width, new_height))
+                            temp_filename = f"cropped_{uuid.uuid4().hex[:8]}_{os.path.basename(image_full_path)}"
+                            temp_filepath = os.path.join(RENDER_CACHE_DIR, temp_filename)
+                            save_format = img.format if img.format in ['JPEG', 'PNG', 'BMP', 'GIF'] else 'PNG'
+                            if save_format == 'JPEG' and cropped_img.mode == 'RGBA':
+                                cropped_img = cropped_img.convert('RGB')
+                                print(f"    Converted cropped image from RGBA to RGB for JPEG saving.")
+                            cropped_img.save(temp_filepath, format=save_format)
+                            processed_image_path_for_tool = temp_filepath 
+                            print(f"    Cropped image saved to temporary path: {temp_filepath}")
+                        else:
+                            print("    Image dimensions are already even. No cropping needed.")
+
+                except FileNotFoundError:
+                     print(f"    Error: Input image file not found at {image_full_path}. Skipping processing.")
+                     _append_feedback(current_task, f"Input image not found: {image_full_path}", node_name)
+                     continue 
+                except Exception as img_e:
+                    print(f"    Error processing image file {image_full_path} for dimension check/cropping: {img_e}")
+                    traceback.print_exc()
+                    _append_feedback(current_task, f"Image processing error for {os.path.basename(image_full_path)}: {img_e}", node_name)
+                    continue 
+            else:
+                 print("    Pillow not available. Skipping image dimension check and cropping.")
+            # --- END Image Dimension Check and Cropping ---
+
+            # --- REMOVED: Image Recognition Prompt Refinement ---
+            # The refined_prompt_text is now directly initial_outer_prompt_context
+
+            # --- Call Model Render Tool (Use the *processed* image path and initial prompt) ---
+            print(f"    Calling model_render_image with outer_prompt='{current_prompt_for_tool[:50]}...', image_input_path='{processed_image_path_for_tool}'")
             result = model_render_image({
-                "outer_prompt": refined_prompt_text,
-                "render_image": os.path.basename(image_full_path)
+                "outer_prompt": current_prompt_for_tool, # Use the initial prompt directly
+                "image_inputs": processed_image_path_for_tool
             })
 
             if isinstance(result, str) and result.startswith("Error:"):
                 print(f"    Tool Error for {image_full_path}: {result}")
-                current_task["feedback_log"] = (current_task.get("feedback_log","") + f"\nFailed to render {image_full_path}: {result}").strip()
+                _append_feedback(current_task, f"Failed to render {os.path.basename(image_full_path)}: {result}", node_name)
                 continue 
 
             if not isinstance(result, str) or not result:
                 print(f"    Tool returned unexpected/empty result for {image_full_path}: {result}")
-                current_task["feedback_log"] = (current_task.get("feedback_log","") + f"\nUnexpected result for {image_full_path}: {result}").strip()
+                _append_feedback(current_task, f"Unexpected result for {os.path.basename(image_full_path)}: {result}", node_name)
                 continue 
 
+            # --- Process Tool Output ---
             output_filename_from_tool = result.strip()
             if output_filename_from_tool:
-                file_info = _save_tool_output_file(
+                file_info = _save_tool_output_file( 
                     output_filename_from_tool,
-                    RENDER_CACHE_DIR, 
-                    "image/png",
-                    # 修改為結構化描述
-                    f"SourceAgent: {current_task.get('selected_agent', 'ModelRenderingAgent')}; "
+                    GENERATION_OUTPUT_DIR,
+                    "image/png", 
+                    f"SourceAgent: {current_task.get('selected_agent', 'ModelRenderAgent')}; " # Corrected agent name
                     f"TaskDesc: {current_task.get('description', 'N/A')}; "
-                    f"RenderedView: {idx + 1}/{len(image_inputs_paths)}" # Simplified
+                    f"RenderedView: {idx + 1}/{len(image_inputs_paths)}; "
+                    f"InputImage: {os.path.basename(image_full_path)}"
                 )
                 if file_info:
                     aggregated_output_files_list.append(file_info)
                     aggregated_generated_filenames.append(output_filename_from_tool)
-                    print(f"    Successfully processed and saved: {output_filename_from_tool}")
+                    print(f"    Successfully processed and saved tool output: {output_filename_from_tool}")
                 else:
-                    print(f"    Could not find/process tool output file: {output_filename_from_tool} for {image_full_path}")
-                    current_task["feedback_log"] = (current_task.get("feedback_log","") + f"\nOutput file not found/processed for {image_full_path}: {output_filename_from_tool}").strip()
+                    print(f"    Could not find/process tool output file: {output_filename_from_tool} for input {os.path.basename(image_full_path)}")
+                    _append_feedback(current_task, f"Tool output file not found/processed for input {os.path.basename(image_full_path)}: {output_filename_from_tool}", node_name)
             else:
-                print(f"    Tool did not return a filename for {image_full_path}.")
-                current_task["feedback_log"] = (current_task.get("feedback_log","") + f"\nNo output filename for {image_full_path}.").strip()
+                print(f"    Tool did not return a filename for input {os.path.basename(image_full_path)}.")
+                _append_feedback(current_task, f"Tool returned no output filename for input {os.path.basename(image_full_path)}.", node_name)
 
+        # --- Final Check for Generated Files ---
+        if not aggregated_output_files_list and image_inputs_paths:
+            # If there were inputs but no successful outputs
+            feedback = current_task.get("feedback_log") or "ModelRenderAgent: Tool ran but failed to produce/locate any output files for the given render_image(s)."
+            print(f"{node_name} Warning: {feedback}")
+            error_to_report = ValueError(feedback)
 
-        if not aggregated_output_files_list:
-            if not current_task.get("feedback_log"):
-                 current_task["feedback_log"] = "ModelRenderAgent: Tool ran but failed to produce/locate any output files for the given render_image(s)."
-            raise ValueError(current_task["feedback_log"] or "Tool ran but failed to produce/locate any output files.")
 
         final_outputs = {"generated_filenames": aggregated_generated_filenames}
-        print(f"{node_name}: Completed. Generated {len(aggregated_generated_filenames)} file(s).")
+        if aggregated_generated_filenames:
+             print(f"{node_name}: Completed. Generated {len(aggregated_generated_filenames)} file(s).")
+        else:
+             print(f"{node_name}: Completed, but no files were successfully generated/processed.")
 
-    except Exception as e:
+
+    except Exception as e: # Catch errors in the node's setup or general logic
         error_to_report = e
-        final_outputs = {} 
+        final_outputs = {"error_message": str(e)}
         traceback.print_exc()
 
-
+    # Update task state using the helper function
     tasks[current_idx] = _update_task_state_after_tool(
         current_task,
         outputs=final_outputs,
-        output_files=aggregated_output_files_list, 
+        output_files=aggregated_output_files_list, # Contains all successfully processed files
         error=error_to_report
     )
+    # Return the updated tasks list and the current task copy
     return {"tasks": tasks, "current_task": tasks[current_idx].copy()}
 
 # --- run_generate_3d_tool_node ---
@@ -1374,16 +1439,32 @@ async def run_rhino_mcp_node(state: WorkflowState, config: RunnableConfig) -> Di
             "saved_image_data_uri": None,
             "consecutive_llm_text_responses": 0,
             "rhino_screenshot_counter": 0, # Initialize counter for the internal graph
-            # {{ edit_1 }}
             "last_executed_node": None
-            # {{ end_edit_1 }}
+
         }
         
         print(f"  Starting Rhino MCP internal graph execution... Max steps: {max_mcp_steps}")
         final_internal_mcp_state = None
 
         # --- Main MCP Loop using the imported graph ---
-        for step_config in rhino_mcp_instance.stream(internal_mcp_graph_state, config=config, stream_mode="values"):
+
+        # NEW: Prepare a config with an increased recursion limit for the internal MCP graph
+        mcp_invocation_config = config.copy() # Start with the config passed to the node
+        if "configurable" not in mcp_invocation_config:
+            mcp_invocation_config["configurable"] = {}
+        
+        # Increase the recursion limit for the MCP graph instance
+        # The default is 25. Let's set it higher, e.g., 1000.
+        # 您可以根據需要調整這個值
+        new_recursion_limit = 1000
+        mcp_invocation_config["configurable"]["recursion_limit"] = new_recursion_limit
+        print(f"  Invoking Rhino MCP internal graph with recursion_limit: {new_recursion_limit}")
+
+        async for step_config in rhino_mcp_instance.astream(
+            internal_mcp_graph_state, 
+            config=mcp_invocation_config, # Pass the modified config
+            stream_mode="values"
+        ):
             # step_config is a dictionary where keys are node names and values are their outputs
             # We are interested in the full state after each step to extract output_definitions
             # The 'values' stream_mode gives us the full state after each node that has executed.
@@ -1419,6 +1500,7 @@ async def run_rhino_mcp_node(state: WorkflowState, config: RunnableConfig) -> Di
             current_step_output_defs = mcp_step_config_from_ai.get("output_definitions", [])
             
             # --- MODIFICATION: Renaming and processing output files ---
+            processed_image_from_state_this_step = False # Flag to avoid double processing
             if current_step_output_defs:
                 print(f"  - Rhino MCP Step Output Definitions: {len(current_step_output_defs)}")
                 for idx, output_def in enumerate(current_step_output_defs):
@@ -1450,7 +1532,8 @@ async def run_rhino_mcp_node(state: WorkflowState, config: RunnableConfig) -> Di
                             current_file_description_parts.append(f"ScreenshotNumFromTool: {internal_counter_val}")
                             current_file_description_parts.append(f"FileName: {filename_for_entry}")
                             current_file_description_parts.append(f"PlannedName: {planned_name_from_def}")
-                            print(f"    - Processing Screenshot (from internal state): {filename_for_entry}, Path: {path_for_entry}")
+                            print(f"    - Processing Screenshot (from internal state via output_def): {filename_for_entry}, Path: {path_for_entry}")
+                            processed_image_from_state_this_step = True # Mark as processed
                         else:
                             # Fallback if saved_image_path from internal state is missing/invalid
                             mcp_errors.append(f"Rhino Agent planned image output '{planned_name_from_def}' but actual file from internal state ('{img_path_from_internal_state}') not found.")
@@ -1512,13 +1595,64 @@ async def run_rhino_mcp_node(state: WorkflowState, config: RunnableConfig) -> Di
                             except Exception as e_b64:
                                 print(f"      - Warning: Could not read/encode Rhino output file {path_for_entry} for base64: {e_b64}")
                         output_files_list.append(file_entry)
-            # --- END MODIFICATION for renaming and processing ---
+            
+            # --- ADDED: Check for saved_image_path directly from internal state if not processed via output_definitions ---
+            # This handles cases where capture_focused_view ran, saved an image, but it wasn't in output_definitions
+            # (e.g., if the AI message after the tool run didn't include it in output_definitions)
+            if not processed_image_from_state_this_step:
+                img_path_from_internal_state = final_internal_mcp_state.get("saved_image_path")
+                internal_counter_val = final_internal_mcp_state.get("rhino_screenshot_counter", 0) # Get counter for description
+                
+                if img_path_from_internal_state and os.path.exists(img_path_from_internal_state):
+                    # Check if this path was already added to output_files_list to prevent duplicates
+                    # This is a simple check; a more robust one might involve comparing more than just path.
+                    if not any(f.get("path") == img_path_from_internal_state for f in output_files_list):
+                        print(f"  - Processing Screenshot (directly from internal state 'saved_image_path'): {img_path_from_internal_state}")
+                        filename_for_entry = os.path.basename(img_path_from_internal_state)
+                        
+                        # Determine mime type
+                        mime_type = "image/png" # Default
+                        ext = os.path.splitext(filename_for_entry)[1].lower()
+                        if ext in [".jpg", ".jpeg"]: mime_type = "image/jpeg"
+                        elif ext == ".gif": mime_type = "image/gif"
+                        elif ext == ".webp": mime_type = "image/webp"
 
+                        current_file_description_parts_direct = [
+                            f"SourceAgent: {current_task.get('selected_agent', 'RhinoMCPAgent')}",
+                            f"TaskDesc: {current_task.get('description', 'N/A')}",
+                            f"ScreenshotNumFromTool: {internal_counter_val}",
+                            f"FileName: {filename_for_entry}",
+                            f"Origin: DirectFromInternalState" # Indicate source
+                        ]
+                        structured_description_direct = "; ".join(current_file_description_parts_direct)
+
+                        file_entry_direct = {
+                            "filename": filename_for_entry,
+                            "path": img_path_from_internal_state,
+                            "type": mime_type,
+                            "description": structured_description_direct
+                        }
+                        # Add base64
+                        try:
+                            with open(img_path_from_internal_state, "rb") as f_content:
+                                encoded_string = base64.b64encode(f_content.read()).decode('utf-8')
+                            file_entry_direct["base64_data"] = f"data:{mime_type};base64,{encoded_string}"
+                        except Exception as e_b64:
+                            print(f"      - Warning: Could not read/encode Rhino output file {img_path_from_internal_state} for base64: {e_b64}")
+                        
+                        output_files_list.append(file_entry_direct)
+                        print(f"    - Added {filename_for_entry} to output_files_list.")
+                    else:
+                        print(f"  - Info: Screenshot '{img_path_from_internal_state}' from internal state already processed, skipping direct add.")
+            # --- END ADDED ---
+
+            # --- MODIFIED Loop Termination Condition ---
             if final_internal_mcp_state.get("task_complete") or \
                (isinstance(final_internal_mcp_state.get("messages", [])[-1] if final_internal_mcp_state.get("messages") else None, AIMessage) and \
-                any(kw in str(final_internal_mcp_state.get("messages", [])[-1].content).lower() for kw in ["全部任務已完成", "[fallback_confirmed_completion]"])):
-                print(f"  Rhino MCP internal graph indicated task completion.")
+                "[fallback_confirmed_completion]" in str(final_internal_mcp_state.get("messages", [])[-1].content).lower()):
+                print(f"  Rhino MCP internal graph indicated task completion (via task_complete flag or fallback_confirmed_completion).")
                 break
+            # --- END MODIFIED Loop Termination Condition ---
             
             # Check for max steps for the *outer* loop controlling the internal graph
             if len(local_mcp_state["messages"]) // 2 > max_mcp_steps : # Approximation of steps
@@ -1533,6 +1667,34 @@ async def run_rhino_mcp_node(state: WorkflowState, config: RunnableConfig) -> Di
                 # saved_image_path and data_uri are for the *overall task output if a primary one exists*
                 # For Rhino, multiple files are handled via output_files_list
             }
+
+            # --- ADDED: Check for saved_csv_path from internal state ---
+            # This ensures that if the planning summary CSV was created, it's captured.
+            saved_csv_path = final_internal_mcp_state.get("saved_csv_path")
+            if saved_csv_path and os.path.exists(saved_csv_path):
+                if not any(f.get("path") == saved_csv_path for f in output_files_list):
+                    print(f"  - Processing CSV Report (from internal state 'saved_csv_path'): {saved_csv_path}")
+                    csv_filename = os.path.basename(saved_csv_path)
+                    csv_description_parts = [
+                        f"SourceAgent: {current_task.get('selected_agent', 'RhinoMCPAgent')}",
+                        f"TaskDesc: {current_task.get('description', 'N/A')}",
+                        f"FileName: {csv_filename}",
+                        f"Origin: DirectFromInternalState_CSVReport"
+                    ]
+                    structured_csv_description = "; ".join(csv_description_parts)
+
+                    csv_file_entry = {
+                        "filename": csv_filename,
+                        "path": saved_csv_path,
+                        "type": "text/csv",
+                        "description": structured_csv_description
+                    }
+                    output_files_list.append(csv_file_entry)
+                    print(f"    - Added {csv_filename} to output_files_list.")
+                else:
+                    print(f"  - Info: CSV Report '{saved_csv_path}' from internal state already processed, skipping direct add.")
+            # --- END ADDED ---
+
             if mcp_errors:
                  mcp_final_outcome_for_task_update["mcp_execution_errors"] = mcp_errors
         else:

@@ -44,10 +44,9 @@ class WorkflowState(TypedDict):
     current_task_index: Optional[int]
     tasks: Optional[List[TaskState]]
     interrupt_result: Optional[str]
-    qa_context: Optional[List[Union[HumanMessage, AIMessage]]] # Keep BaseMessage types here? Or define dummy? Let's keep for now. Needs Langchain import
-    # --- MODIFICATION: Rename WorkflowState keys to reflect they are temporary ---
-    # These keys are used by LangGraph to collect outputs from parallel branches
+    qa_context: Optional[List[Union[HumanMessage, AIMessage]]]
     llm_temp_output: Optional[Dict[str, Any]] 
     image_temp_output: Optional[Dict[str, Any]]
     video_temp_output: Optional[Dict[str, Any]]
-    # --- END MODIFICATION ---
+    final_summary_word_path: Optional[str]
+    # sankey_structure_data: Optional[Dict[str, Any]]

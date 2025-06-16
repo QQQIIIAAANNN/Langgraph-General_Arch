@@ -8,6 +8,7 @@ import uuid
 import base64
 import time
 import re
+from collections import defaultdict
 
 # --- Add PIL for image loading (Keep for initial message construction if needed elsewhere) ---
 try:
@@ -34,7 +35,7 @@ print("日誌記錄已移除，將使用 print 輸出。")
 from langchain_core.messages import BaseMessage, HumanMessage, AIMessage, SystemMessage, ToolMessage
 from langchain_core.prompts import ChatPromptTemplate, MessagesPlaceholder
 from langchain_core.runnables import RunnableConfig
-from langchain_core.tools import BaseTool
+from langchain_core.tools import BaseTool, tool
 from langchain_openai import ChatOpenAI
 from langgraph.graph import StateGraph, END, add_messages
 
@@ -67,7 +68,7 @@ except Exception as e:
 # --- MCP Server Configurations (修改 OSM 設定) ---
 MCP_CONFIGS = {
     "rhino": {
-        "command": "Z:\\miniconda3\\envs\\rhino_mcp\\python",
+        "command": "Z:\\miniconda3\\envs\\rhino_mcp\\python.exe",
         "args": ["-m","rhino_mcp.server"],
         "transport": "stdio",
     },
@@ -112,6 +113,77 @@ class MCPAgentState(TypedDict):
     rhino_screenshot_counter: int = 0 
     # --- END MODIFICATION ---
     last_executed_node: Optional[str] = None # 記錄最後執行的節點名稱
+    # --- 新增: 存儲CSV報告路徑 ---
+    saved_csv_path: Optional[str] = None
+
+# =============================================================================
+# 本地工具定義 (Local Tools)
+# =============================================================================
+@tool
+def create_planned_data_summary_csv(data_rows: List[Dict[str, Union[str, float]]], total_area: float, bcr: Optional[float], far: Optional[float], filename: str = "planned_project_summary.csv") -> str:
+    """
+    根據「規劃好」的設計數據生成CSV摘要文件。
+    此工具不與Rhino互動；它只記錄計畫中提供的數據。
+    在規劃階段結束時使用此工具，以創建設計意圖的摘要。
+
+    Args:
+        data_rows: 一個字典列表，每個字典代表一個空間。必須包含 'name' (str), 'area' (float), 'percentage' (float) 和 'floor' (str, 例如 "Floor 1") 鍵。
+        total_area: 規劃的總樓地板面積 (float)。
+        bcr: 規劃的建蔽率 (float, 百分比)。如果無則為空。
+        far: 規劃的容積率 (float)。如果無則為空。
+        filename: 輸出的CSV文件名。預設為 "planned_project_summary.csv"。
+
+    Returns:
+        一個確認成功和保存文件路徑的字串，以 [CSV_FILE_PATH]: 為前綴。
+    """
+    import csv
+    import time
+    from collections import defaultdict
+    output_dir = r"D:\MA system\LangGraph\output\space"
+    if not os.path.exists(output_dir):
+        os.makedirs(output_dir)
+    
+    base, ext = os.path.splitext(filename)
+    timestamp = time.strftime("%Y%m%d_%H%M%S")
+    new_filename = f"{base}_{timestamp}{ext}"
+    file_path = os.path.join(output_dir, new_filename)
+    headers = ["Space Name", "Area (sqm)", "Percentage (%)"]
+
+    spaces_by_floor = defaultdict(list)
+    for row in data_rows:
+        floor = row.get('floor', 'Unassigned')
+        spaces_by_floor[floor].append(row)
+    
+    try:
+        with open(file_path, mode='w', newline='', encoding='utf-8-sig') as csv_file:
+            writer = csv.writer(csv_file)
+            
+            writer.writerow(["Project Summary (Based on Plan)"])
+            writer.writerow(["Total Planned Floor Area (sqm)", round(total_area, 2)])
+            writer.writerow(["Planned Building Coverage Ratio (%)", bcr if bcr is not None else "N/A"])
+            writer.writerow(["Planned Floor Area Ratio", far if far is not None else "N/A"])
+            writer.writerow([])
+            
+            writer.writerow(["Planned Space Details"])
+
+            sorted_floors = sorted(spaces_by_floor.keys())
+            for floor in sorted_floors:
+                writer.writerow([])
+                writer.writerow([f"--- {floor} ---"])
+                writer.writerow(headers)
+                for row in spaces_by_floor[floor]:
+                    writer.writerow([
+                        row.get('name', 'N/A'), 
+                        round(row.get('area', 0.0), 2),
+                        round(row.get('percentage', 0.0), 2)
+                    ])
+                
+        return f"[CSV_FILE_PATH]:{file_path}"
+    except Exception as e:
+        return f"[ERROR] Failed to create planned summary table: {str(e)}"
+
+# --- 新增: 本地工具列表 ---
+LOCAL_TOOLS = [create_planned_data_summary_csv]
 
 # =============================================================================
 # 工具管理 (使用 print 替換 logging)
@@ -262,13 +334,20 @@ async def get_mcp_tools(mcp_name: str) -> List[BaseTool]:
 # =============================================================================
 # --- 通用 Rhino/Revit 執行提示 ---
 RHINO_AGENT_EXECUTION_PROMPT = SystemMessage(content="""你是一個嚴格按計劃執行任務的助手，專門為 CAD/BIM 環境生成指令。消息歷史中包含了用戶請求和一個分階段目標的計劃。
-你的任務是：
-1.  透過查看計劃和歷史**執行計劃**(不可跳過計畫)。禁止生成新的目標、計劃或方案，或延續生成原本的計畫。你的任務是執行已有的計劃。
-2.  你的首要任務是識別並執行計劃中的**第一個具體動作/階段目標**。通常上一個歷史訊息(ToolMessage或AIMessage)沒有錯誤，代表更前面的階段已經完成只是訊息被省略。請直接下一個未完成目標。
-3.  **要調用工具來執行動作，請必須生成 `tool_calls` 在首位的 AIMessage 以請求該工具調用**。**不要僅用文字描述你要調用哪個工具，而是實際生成工具調用指令。** 一次只生成一個工具調用請求。
-4.  嚴格禁止使用 f-string 格式化字串。請使用 `.format()` 或 `%` 進行字串插值。(此為 IronPython 2.7 環境限制)
-5.  **仔細參考工具描述或 Mcp 文檔確認函數用法與參數正確性，必須實際生成結構化的工具呼叫指令。**
-6.  **多方案管理 (重要):**
+**你的核心任務：根據計劃，執行且僅執行下一個未完成的步驟。嚴禁重複已完成的步驟。**
+
+**定位下一步驟的演算法 (必須嚴格遵守):**
+1.  **檢查歷史紀錄:** 查看最近的幾條消息。你的主要依據是最後一條 `ToolMessage`。
+2.  **匹配上次動作:** 將 `ToolMessage` 的結果與 `[目標階段計劃]:` 中的步驟進行比對，找出它對應的是計劃中的第幾個步驟。
+3.  **確定下一步:** 緊接在上一步之後的那個步驟，就是你現在需要執行的**唯一目標**。例如，如果上一步是計劃的第 1 步，你現在就必須執行第 2 步。
+4.  **初始情況:** 如果歷史紀錄中沒有 `ToolMessage` (代表這是計劃生成後的第一次執行)，則從計劃的第 1 步開始。
+5.  **錯誤處理:** 如果 `ToolMessage` 指出上一步驟執行失敗，你的任務是分析錯誤原因，並嘗試**修正並重新執行同一個步驟**。
+                                             
+**執行規則:**                                                                       
+1.  **要調用工具來執行動作，請必須生成 `tool_calls` 在首位的 AIMessage 以請求該工具調用**。**不要僅用文字描述你要調用哪個工具，而是實際生成工具調用指令。** 一次只生成一個工具調用請求。
+2.  嚴格禁止使用 f-string 格式化字串。請使用 `.format()` 或 `%` 進行字串插值。(此為 IronPython 2.7 環境限制)
+3.  **仔細參考工具描述或 Mcp 文檔確認函數用法與參數正確性，必須實際生成結構化的工具呼叫指令。**
+4.  **多方案管理 (重要):**
     * 當生成多個方案時，**每個方案必須完全獨立**，視為單獨的任務序列處理
     * **方案隔離原則:**
         * **每個方案必須有自己的頂層圖層**，使用 `rs.AddLayer("方案A_描述")` 創建
@@ -276,12 +355,12 @@ RHINO_AGENT_EXECUTION_PROMPT = SystemMessage(content="""你是一個嚴格按計
         * **所有物件必須正確配置到其所屬方案的圖層**，使用 `rs.CurrentLayer("方案X_描述::子圖層")`
         * **完成每個方案後必須截圖**，再開始下一個方案
     * **避免方案間的量體重疊**，可考慮在不同方案間使用座標偏移
-7.  **量體生成策略:**
+5.  **量體生成策略:**
     * **空間操作優先使用布林運算**：使用 `rs.BooleanUnion()`、`rs.BooleanDifference()`、`rs.BooleanIntersection()` 創造複雜形態
     * **善用幾何變換**：使用旋轉、縮放、移動等操作調整物件姿態，創造更豐富的空間層次
     * **避免無效量體**：不要創建過小、位置不合理或對空間表達無貢獻的量體
     * **注意 IronPython 2.7 語法限制**：Rhino 8使用IronPython 2.7，禁止使用Python 3特有語法   
-8.  **曲面造型策略:**
+6.  **曲面造型策略:**
         *   **曲面創建類別：**
             *   **掃掠 (Sweep):**
                 *   `rs.AddSweep1(rail_curve_id, shape_curve_ids)`: 將剖面曲線列表 `shape_curve_ids` 沿單一軌道 `rail_curve_id` 掃掠成曲面。注意剖面曲線的方向和順序。
@@ -298,19 +377,24 @@ RHINO_AGENT_EXECUTION_PROMPT = SystemMessage(content="""你是一個嚴格按計
                 *   `rs.ExtrudeCurveStraight(curve_id, start_point, end_point)` 或 `rs.ExtrudeCurveStraight(curve_id, direction_vector)`: 將曲線 `curve_id` 沿直線擠出指定距離和方向。
                 *   `rs.ExtrudeCurveTapered(curve_id, distance, direction, base_point, angle)`: 將曲線 `curve_id` 沿 `direction` 方向擠出 `distance` 距離，同時以 `base_point` 為基準、按 `angle` 角度進行錐化。
                 *   `rs.ExtrudeSurface(surface_id, path_curve_id, cap=True/False)`: 將曲面 `surface_id` 沿路徑曲線 `path_curve_id` 擠出成實體或開放形狀，可選是否封口 (`cap`)。
-9.  **Rhino 圖層管理 (重要):** 當生成 Rhino 代碼時：
+7.  **Rhino 圖層管理 (重要):** 當生成 Rhino 代碼時：
         *   如果當前階段目標**明確要求**在特定圖層上操作，**必須**在相關操作（如創建物件）**之前**包含 `rs.CurrentLayer('目標圖層名稱')` 指令。
         *   如果目標涉及控制圖層可見性（例如，準備截圖），**必須**包含 `rs.LayerVisible('圖層名', True/False)` 指令。
-    *   **截圖前的圖層準備：在調用 `capture_focused_view` 進行截圖之前，必須確保只有與當前截圖目標直接相關的圖層是可見的。所有其他不相關的圖層，特別是那些可能遮擋目標視圖的圖層（例如，其他樓層、其他設計方案的頂層圖層、輔助線圖層等），都應使用 `rs.LayerVisible('圖層名', False)` 進行隱藏。**
-10. **最終步驟 (Rhino/Revit):**
+    *   **截圖前的圖層準備：在調用 `capture_focused_view` 進行截圖之前，必須確保只有與當前截圖目標直接相關的圖層是可見的。所有其他不相關的圖層，特別是那些可能遮擋目標視圖的圖層（例如，其他樓層、其他設計方案的頂層圖層、輔助線圖層等），都應使用 `rs.LayerVisible('圖層名', False)` 進行隱藏。 使用透視/兩點透視截圖時須確保相關圖層都有開啟**
+8. **最終步驟 (Rhino/Revit):**
     *   對於 Rhino/Revit 任務，每當完成一個方案或一個樓層就**必須**要調用 `capture_focused_view` 工具來截取畫面。截圖時如果設定相機位置，確保(`target_position`)位於方案的中心點。
     *   **僅當消息歷史清楚地表明計劃中的最後階段目標已成功執行**，你才能生成文本回復：`全部任務已完成` 以結束整個任務。
-11. 如果當前階段目標不需要工具即可完成（例如，僅需總結信息），請生成說明性的自然語言回應。
-12. 若遇工具錯誤，分析錯誤原因 (尤其是代碼執行錯誤)，**嘗試修正你的工具調用參數或生成的代碼**，然後再次請求工具調用。如果無法修正，請報告問題。
-
+9. 如果當前階段目標不需要工具即可完成（例如，僅需總結信息），請生成說明性的自然語言回應。
+10.若遇工具錯誤，分析錯誤原因 (尤其是代碼執行錯誤)，**嘗試修正你的工具調用參數或生成的代碼**，然後再次請求工具調用。如果無法修正，請報告問題。
+11.規劃數據摘要報告 (空間規劃任務的必要首步):僅當**任務是關於**空間佈局規劃** (例如，量體配置等)，你**必須在第一個步驟**執行生成摘要報告。
+                                             
 **常規執行：對於計劃中的任何步驟，不要用自然語言解釋你要做什麼，直接生成包含 Tool Calls 結構的工具調用。**
-**關鍵指令：第一步或下一步是工具調用時，必須在回應中包含 Tool Calls 結構，不要包含對話!!。直到錯誤或是全部任務完成後，才可生成純文字的完成訊息。**
-**絕對指令：不要延續[目標階段計劃]生成 "任務完成" 或將任務完成當作一個步驟和目標。當前一個訊息是[目標階段計劃]時直接進行工具調用，不要包含描述性文本!!!!**""")
+**關鍵指令：不要用自然語言解釋你要做什麼，直接根據你用上述演算法定位到的下一步驟，生成包含 Tool Calls 結構的工具調用。**
+**絕對指令：不要延續[目標階段計劃]生成 "任務完成" 或將任務完成當作一個步驟。當前一個訊息是[目標階段計劃]時直接進行工具調用，不要包含描述性文本！**
+                                             
+**可用工具清單:**
+你能夠使用以下工具來完成計劃中的步驟。你必須使用這些工具，並嚴格按照其參數要求來生成工具調用。
+{tool_descriptions}""")
 
 # --- Pinterest 執行提示 ---
 PINTEREST_AGENT_EXECUTION_PROMPT = SystemMessage(content="""你是一個 Pinterest 圖片搜索助手。
@@ -342,7 +426,7 @@ ROUTER_PROMPT = """你是一個智能路由代理。根據使用者的**初始�
 - 'pinterest': 主要處理與 Pinterest 圖片搜索和下載相關的請求。
 - 'osm': 主要處理與 OpenStreetMap 地圖相關的請求。
 
-分析以下**初始使用者請求文本**，並決定最適合處理此請求的代理。
+分析以下**初始使用者請求文本**，並決定最適合處理此請求的代理。生成模型的任務以rhino為主，除非特別指定用revit。
 你的回應必須是 'revit', 'rhino', 'pinterest' 或 'osm'。請只回應目標代理的名稱。
 
 初始使用者請求文本：
@@ -353,17 +437,17 @@ PLAN_PREFIX = "[目標階段計劃]:\n"
 
 # --- Fallback Agent Prompt ---
 FALLBACK_PROMPT = SystemMessage(content="""你是一個補救與驗證助手。主要助手可能已完成其步驟、卡住了，或聲稱任務已完成。
-你的任務是：
-1.  仔細分析消息歷史，特別是 `[目標階段計劃]:` 和最近幾條主要助手的回應。
-2.  **分析主要助手狀態**：
-       *   如果主要助手的最後一條回應**不是工具調用**，而是描述性文本（例如 "正在執行階段 X..." 或類似的對話），這通常表示主要助手**卡住了**或者未能按預期生成工具調用。
-   3.  **驗證完成狀態 (如果主要助手聲稱完成或歷史表明可能已到最後階段)**：
-       *   查看 `[目標階段計劃]:`，識別出計劃中的**最後一個階段目標**。檢查最近的消息歷史，判斷這個**最後的階段目標是否已經成功執行完畢**。
-   4.  **確定下一步**：
-       *   如果根據上述驗證，計劃中的**最後一個階段目標確實已成功執行**，請**只輸出**文本消息：`[FALLBACK_CONFIRMED_COMPLETION]`。
-       *   如果主要助手**卡住了**（如第 2 點所述），或者任務**未完成** (例如，最後的計劃步驟未完成，或者還有更早的計劃步驟未完成且你可以識別出來)，並且你可以根據計劃和歷史確定下一個**應該執行的階段目標**，請**生成執行該目標所需的 `tool_calls`**。直接輸出包含工具調用的 AIMessage。**優先嘗試從計劃中找到下一個應該執行的步驟並為其生成工具調用。**
-       *   如果任務**未完成**，且你無法根據現有信息確定下一步、無法恢復流程（例如，無法識別計劃的最後一步，或無法判斷其是否完成，或無法為卡住的助手找到解決方案），請**只輸出**文本消息：`[FALLBACK_CANNOT_RECOVER]`。
-   
+    你的任務是：
+    1.  仔細分析消息歷史，特別是 `[目標階段計劃]:` 和最近幾條主要助手的回應。
+    2.  **分析主要助手狀態**：
+        *   如果主要助手的最後一條回應**不是工具調用**，而是描述性文本（例如 "正在執行階段 X..." 或類似的對話），這通常表示主要助手**卡住了**或者未能按預期生成工具調用。
+    3.  **驗證完成狀態 (如果主要助手聲稱完成或歷史表明可能已到最後階段)**：
+        *   查看 `[目標階段計劃]:`，識別出計劃中的**最後一個階段目標**。檢查最近的消息歷史，請獨立判斷這個**最後的階段目標是否已經成功執行完畢**。
+    4.  **確定下一步**：
+        *   如果根據上述驗證，計劃中的**最後一個階段目標確實已成功執行**，請**只輸出**文本消息：`[FALLBACK_CONFIRMED_COMPLETION]`。
+        *   如果主要助手**卡住了**（如第 2 點所述），或者任務**未完成** (例如，最後的計劃步驟未完成，或者還有更早的計劃步驟未完成且你可以識別出來)，並且你可以根據計劃和歷史確定下一個**應該執行的階段目標**，請**生成執行該目標所需的 `tool_calls`**。直接輸出包含工具調用的 AIMessage。**優先嘗試從計劃中找到下一個應該執行的步驟並為其生成工具調用。**
+        *   如果任務**未完成**，且你無法根據現有信息確定下一步、無法恢復流程（例如，無法識別計劃的最後一步，或無法判斷其是否完成，或無法為卡住的助手找到解決方案），請**只輸出**文本消息：`[FALLBACK_CANNOT_RECOVER]`。
+
    **關鍵：不要重複主要助手剛剛完成的步驟。專注於未完成的目標或驗證最終狀態。如果主要助手明顯卡在某個描述性文本而未生成工具調用，你的首要任務是根據計劃推斷並生成正確的工具調用。**
    
    消息歷史:
@@ -552,136 +636,14 @@ async def call_llm_with_tools(
     """
     print(f"  >> 調用 Agent LLM ({agent_llm.model}) 執行下一步 (使用提示: {execution_prompt.content[:50]}...)...")
     try:
-        # --- 手動構造工具定義列表 (僅處理 MCP 工具) ---
-        print("     準備 MCP 工具定義列表，手動修正特殊參數...")
-        tools_for_binding = []
-        for tool in selected_tools:
-            if tool.name == "get_scene_objects_with_metadata":
-                # 保留原有的手動宣告
-                print(f"     正在為 '{tool.name}' 創建手動 Gemini FunctionDeclaration...")
-                manual_declaration = {
-                    "name": tool.name,
-                    "description": tool.description,
-                    "parameters": {
-                        "type": "OBJECT",
-                        "properties": {
-                            "filters": {
-                                "type": "OBJECT",
-                                "description": "篩選條件，例如 {'layer': 'Default', 'name': 'Cube*'}",
-                                "nullable": True,
-                            },
-                            "metadata_fields": {
-                                "type": "ARRAY",
-                                "description": "要返回的元數據欄位列表，例如 ['name', 'layer', 'short_id']",
-                                "nullable": True,
-                                "items": { "type": "STRING" }
-                            }
-                        },
-                    }
-                }
-                tools_for_binding.append(manual_declaration)
-                print(f"     手動定義已創建: {tool.name}")
-            elif tool.name == "zoom_to_target" or tool.name == "capture_focused_view":
-                print(f"     正在為含bounding_box參數的工具 '{tool.name}' 創建手動 Gemini FunctionDeclaration...")
-                # 構建共用的基本屬性
-                properties = {
-                    "view": {
-                        "type": "STRING",
-                        "description": "視圖名稱或ID",
-                        "nullable": True
-                    }
-                }
-                
-                # 根據工具名稱添加特定屬性
-                if tool.name == "zoom_to_target":
-                    properties.update({
-                        "object_ids": {
-                            "type": "ARRAY",
-                            "description": "要縮放到的對象ID列表",
-                            "nullable": True,
-                            "items": {"type": "STRING"}
-                        },
-                        "all_views": {
-                            "type": "BOOLEAN",
-                            "description": "是否應用於所有視圖",
-                            "nullable": True
-                        }
-                    })
-                elif tool.name == "capture_focused_view":
-                    properties.update({
-                        "projection_type": {
-                            "type": "STRING",
-                            "description": "投影類型: 'parallel', 'perspective', 'two_point'",
-                            "nullable": True
-                        },
-                        "lens_angle": {
-                            "type": "NUMBER",
-                            "description": "透視或兩點投影的鏡頭角度",
-                            "nullable": True
-                        },
-                        # --- 新增相機參數定義 ---
-                        "camera_position": {
-                            "type": "ARRAY",
-                            "description": "相機位置的 [x, y, z] 坐標",
-                            "nullable": True,
-                             "items": {"type": "NUMBER"}
-                        },
-                        "target_position": {
-                             "type": "ARRAY",
-                             "description": "目標點的 [x, y, z] 坐標",
-                             "nullable": True,
-                             "items": {"type": "NUMBER"}
-                         },
-                         # --- 結束新增 ---
-                        "layer": {
-                            "type": "STRING",
-                            "description": "用於篩選顯示註釋的圖層名稱",
-                            "nullable": True
-                        },
-                        "show_annotations": {
-                            "type": "BOOLEAN",
-                            "description": "是否顯示物件註釋",
-                            "nullable": True
-                        },
-                        "max_size": {
-                            "type": "INTEGER",
-                            "description": "截圖的最大尺寸",
-                            "nullable": True
-                        }
-                    })
-                
-                # 為兩個工具都添加正確的bounding_box結構
-                properties["bounding_box"] = {
-                    "type": "ARRAY",
-                    "description": "邊界框的8個角點坐標 [[x,y,z], [x,y,z], ...]",
-                    "nullable": True,
-                    "items": {
-                        "type": "ARRAY",
-                        "items": {
-                            "type": "NUMBER"
-                        }
-                    }
-                }
-                
-                # 創建完整的手動宣告
-                manual_declaration = {
-                    "name": tool.name,
-                    "description": tool.description,
-                    "parameters": {
-                        "type": "OBJECT",
-                        "properties": properties
-                    }
-                }
-                
-                tools_for_binding.append(manual_declaration)
-                print(f"     手動定義已創建: {tool.name}")
-            else:
-                tools_for_binding.append(tool)
-                print(f"     保留標準 MCP BaseTool 對象: {tool.name}")
+        # --- 使用輔助函數獲取 Gemini 兼容的工具定義 ---
+        print("     正在準備 Gemini 兼容的工具定義列表...")
+        gemini_compatible_tools = _prepare_gemini_compatible_tools(selected_tools)
+        print(f"     獲取了 {len(gemini_compatible_tools)} 個 Gemini 兼容的工具定義。")
 
         # --- 綁定工具到 agent_llm ---
         print("     正在將 MCP 工具 (含手動定義) 綁定到 LLM...")
-        llm_with_tools = agent_llm.bind_tools(tools_for_binding)
+        llm_with_tools = agent_llm.bind_tools(gemini_compatible_tools) # Use corrected tools
         print("     MCP 工具綁定完成。")
 
         # --- 配置 Runnable 移除回調 ---
@@ -764,6 +726,97 @@ async def call_llm_with_tools(
         return AIMessage(content=error_content)
 
 
+# --- NEW HELPER FUNCTION for preparing Gemini-compatible tools ---
+def _prepare_gemini_compatible_tools(mcp_tools: List[BaseTool]) -> List[Union[BaseTool, Dict]]:
+    """
+    為 Gemini LLM 準備工具列表，手動修正特定工具的 schema。
+    """
+    print("     [Helper] 準備 Gemini 兼容的工具定義列表...")
+    tools_for_binding = []
+    if not mcp_tools:
+        print("     [Helper] 警告: 傳入的 mcp_tools 列表為空。")
+        return []
+
+    for tool in mcp_tools:
+        if not tool or not hasattr(tool, 'name'):
+            print(f"     [Helper] 警告: 工具列表中發現無效工具對象: {tool}")
+            continue
+
+        if tool.name == "get_scene_objects_with_metadata":
+            print(f"     [Helper] 為 '{tool.name}' 創建手動 Gemini FunctionDeclaration...")
+            manual_declaration = {
+                "name": tool.name,
+                "description": tool.description,
+                "parameters": {
+                    "type": "OBJECT",
+                    "properties": {
+                        "filters": {
+                            "type": "OBJECT",
+                            "description": "篩選條件，例如 {'layer': 'Default', 'name': 'Cube*'}",
+                            "nullable": True,
+                        },
+                        "metadata_fields": {
+                            "type": "ARRAY",
+                            "description": "要返回的元數據欄位列表，例如 ['name', 'layer', 'short_id']",
+                            "nullable": True,
+                            "items": { "type": "STRING" }
+                        }
+                    },
+                }
+            }
+            tools_for_binding.append(manual_declaration)
+        elif tool.name == "zoom_to_target" or tool.name == "capture_focused_view":
+            print(f"     [Helper] 為含 bounding_box 參數的工具 '{tool.name}' 創建手動 Gemini FunctionDeclaration...")
+            properties = {
+                "view": { "type": "STRING", "description": "視圖名稱或ID", "nullable": True }
+            }
+            if tool.name == "zoom_to_target":
+                properties.update({
+                    "object_ids": { "type": "ARRAY", "description": "要縮放到的對象ID列表", "nullable": True, "items": {"type": "STRING"} },
+                    "all_views": { "type": "BOOLEAN", "description": "是否應用於所有視圖", "nullable": True }
+                })
+            elif tool.name == "capture_focused_view":
+                properties.update({
+                    "projection_type": { "type": "STRING", "description": "投影類型: 'parallel', 'perspective', 'two_point'", "nullable": True },
+                    "lens_angle": { "type": "NUMBER", "description": "透視或兩點投影的鏡頭角度", "nullable": True },
+                    "camera_position": { "type": "ARRAY", "description": "相機位置的 [x, y, z] 坐標", "nullable": True, "items": {"type": "NUMBER"} },
+                    "target_position": { "type": "ARRAY", "description": "目標點的 [x, y, z] 坐標", "nullable": True, "items": {"type": "NUMBER"} },
+                    "layer": { "type": "STRING", "description": "用於篩選顯示註釋的圖層名稱", "nullable": True },
+                    "show_annotations": { "type": "BOOLEAN", "description": "是否顯示物件註釋", "nullable": True },
+                    "max_size": { "type": "INTEGER", "description": "截圖的最大尺寸", "nullable": True }
+                })
+            
+            # Correct bounding_box for Gemini: items need a type for the inner array's elements
+            properties["bounding_box"] = {
+                "type": "ARRAY",
+                "description": "邊界框的8個角點坐標 [[x,y,z], [x,y,z], ...]",
+                "nullable": True,
+                "items": { # This 'items' describes the outer array (list of points)
+                    "type": "ARRAY", # Each item is an array (a point)
+                    "items": { # This 'items' describes the inner array (coordinates of a point)
+                        "type": "NUMBER" # Each coordinate is a NUMBER
+                    }
+                }
+            }
+            manual_declaration = {
+                "name": tool.name,
+                "description": tool.description,
+                "parameters": { "type": "OBJECT", "properties": properties }
+            }
+            tools_for_binding.append(manual_declaration)
+        else:
+            tools_for_binding.append(tool) # Add other tools as they are
+            # print(f"     [Helper] 保留標準 MCP BaseTool 對象: {tool.name}")
+    
+    if not tools_for_binding and mcp_tools: # If all tools were invalid or some other issue
+        print("     [Helper] 警告: 工具準備後列表為空，但原始列表非空。可能所有工具都無法處理。")
+    elif not tools_for_binding and not mcp_tools:
+        pass # Expected if input was empty
+    else:
+        print(f"     [Helper] 完成 Gemini 兼容工具準備，共 {len(tools_for_binding)} 個。")
+    return tools_for_binding
+# --- END NEW HELPER FUNCTION ---
+
 # =============================================================================
 # 圖節點 (Graph Nodes)
 # =============================================================================
@@ -774,11 +827,20 @@ RPM_DELAY = 6.5 # 比 6 秒稍長一點，留點餘裕
 async def route_mcp_target(state: MCPAgentState, config: RunnableConfig) -> Dict:
     """使用 utility_llm 判斷用戶初始請求文本應路由到哪個 MCP (revit, rhino, pinterest)。"""
     print("--- 執行 MCP 路由節點 ---")
+
+    # --- NEW: Check if target_mcp is already set in the state ---
+    pre_set_target_mcp = state.get("target_mcp")
+    valid_mcp_targets = ["revit", "rhino", "pinterest", "osm"]
+    if pre_set_target_mcp and pre_set_target_mcp in valid_mcp_targets:
+        print(f"  檢測到已預設 target_mcp: '{pre_set_target_mcp}'。直接使用此目標，跳過 LLM 路由。")
+        return {"target_mcp": pre_set_target_mcp, "last_executed_node": "router_skipped_due_to_preset"}
+    # --- END NEW ---
+
     initial_request_text = state.get('initial_request', '')
     if not initial_request_text:
-        print("錯誤：狀態中未找到 'initial_request'。默認為 revit。")
+        print("錯誤：狀態中未找到 'initial_request' 且 target_mcp 未預設。默認為 rhino。")
         # {{ edit_1 }}
-        return {"target_mcp": "revit", "last_executed_node": "router"}
+        return {"target_mcp": "rhino", "last_executed_node": "router_defaulted_rhino_no_request"}
         # {{ end_edit_1 }}
 
     print(f"  根據初始請求文本路由: '{initial_request_text[:150]}...'")
@@ -787,26 +849,26 @@ async def route_mcp_target(state: MCPAgentState, config: RunnableConfig) -> Dict
         response = await utility_llm.ainvoke([SystemMessage(content=prompt)], config=config)
         route_decision = response.content.strip().lower()
         print(f"  LLM 路由決定: {route_decision}")
-        if route_decision in ["revit", "rhino", "pinterest", "osm"]:
+        if route_decision in valid_mcp_targets: # Use the list here
             # {{ edit_2 }}
-            return {"target_mcp": route_decision, "last_executed_node": "router"}
+            return {"target_mcp": route_decision, "last_executed_node": "router_llm_decision"}
             # {{ end_edit_2 }}
         else:
-            print(f"  警告: LLM 路由器的回應無法識別 ('{route_decision}')。預設為 revit。")
+            print(f"  警告: LLM 路由器的回應無法識別 ('{route_decision}')。預設為 rhino。")
             # {{ edit_3 }}
-            return {"target_mcp": "revit", "last_executed_node": "router"}
+            return {"target_mcp": "rhino", "last_executed_node": "router_defaulted_rhino_unknown_llm_response"}
             # {{ end_edit_3 }}
     except Exception as e:
         print(f"  路由 LLM 呼叫失敗: {e}")
         traceback.print_exc()
         # {{ edit_4 }}
-        return {"target_mcp": "revit", "last_executed_node": "router"}
+        return {"target_mcp": "rhino", "last_executed_node": "router_defaulted_rhino_llm_exception"}
         # {{ end_edit_4 }}
 
 
 # <<< 新增：訊息剪枝輔助函式 >>>
-MAX_RECENT_INTERACTIONS_DEFAULT = 7
-MAX_RECENT_INTERACTIONS_FORCING = 10
+MAX_RECENT_INTERACTIONS_DEFAULT = 18
+MAX_RECENT_INTERACTIONS_FORCING = 23
 
 def _prune_messages_for_llm(full_messages: List[BaseMessage], max_recent_interactions: int = MAX_RECENT_INTERACTIONS_DEFAULT) -> List[BaseMessage]:
     if not full_messages:
@@ -902,16 +964,30 @@ async def agent_node_logic(state: MCPAgentState, config: RunnableConfig, mcp_nam
     current_messages = list(state['messages'])
     last_message = current_messages[-1] if current_messages else None
     current_consecutive_responses = state.get("consecutive_llm_text_responses", 0)
-    # {{ edit_1 }}
     # Ensure rhino_screenshot_counter is present in the state, default to 0 if not
     current_rhino_screenshot_counter = state.get("rhino_screenshot_counter", 0)
-    # {{ end_edit_1 }}
 
     # --- 處理 capture_viewport, OSM, Pinterest 的 ToolMessage 返回 ---
     IMAGE_PATH_PREFIX = "[IMAGE_FILE_PATH]:"
     OSM_IMAGE_PATH_PREFIX = "[OSM_IMAGE_PATH]:" # Assuming OSM tool returns this prefix
+    CSV_PATH_PREFIX = "[CSV_FILE_PATH]:"
 
     if isinstance(last_message, ToolMessage):
+        # Handle Local CSV Creation Tool
+        if last_message.name == "create_planned_data_summary_csv":
+            if last_message.content.startswith(CSV_PATH_PREFIX):
+                csv_path = last_message.content[len(CSV_PATH_PREFIX):]
+                print(f"  檢測到計劃數據CSV報告已生成於: {csv_path}")
+                # This tool is called after planning is done. The next step is to start executing the modeling.
+                # Returning a message here allows the agent to acknowledge and proceed.
+                return {
+                    "messages": [AIMessage(content=f"計劃總結報告已在規劃階段完成，並保存於 {csv_path}。現在開始執行模型建構。")],
+                    "saved_csv_path": csv_path,
+                    "task_complete": False, # Modeling is not yet done
+                    "consecutive_llm_text_responses": 0,
+                    "last_executed_node": f"{mcp_name}_agent"
+                }
+
         # Handle Rhino/Revit Screenshot Path
         if last_message.name == "capture_focused_view" and isinstance(last_message.content, str):
             if last_message.content.startswith(IMAGE_PATH_PREFIX):
@@ -931,7 +1007,7 @@ async def agent_node_logic(state: MCPAgentState, config: RunnableConfig, mcp_nam
                     sanitized_req_prefix = "".join(filter(lambda x: x.isalnum() or x == '_', req_str_part.replace(" ", "_")[:20]))
                     
                     original_extension = os.path.splitext(uuid_image_path)[1]
-                    new_filename = f"{sanitized_req_prefix}_Shot-{current_rhino_screenshot_counter}_ID-{original_extension}"
+                    new_filename = f"{sanitized_req_prefix}_Shot-{current_rhino_screenshot_counter}{original_extension}"
                     
                     try:
                         if os.path.exists(uuid_image_path):
@@ -970,7 +1046,7 @@ async def agent_node_logic(state: MCPAgentState, config: RunnableConfig, mcp_nam
                     data_uri_for_state = f"data:{mime_type};base64,{base64_data}"
                     # {{ edit_4 }}
                     return {
-                         "messages": [AIMessage(content=f"已成功截取畫面並保存至 {new_image_path_for_state}。請繼續執行計劃的後續步驟。")],
+                         "messages": [AIMessage(content=f"已成功截取畫面並保存至 {new_image_path_for_state}。")],
                          "saved_image_path": new_image_path_for_state, 
                          "saved_image_data_uri": data_uri_for_state,
                          "task_complete": False, 
@@ -1104,6 +1180,10 @@ async def agent_node_logic(state: MCPAgentState, config: RunnableConfig, mcp_nam
             print(f"  獲取了 {len(mcp_tools)} 個 {mcp_name} MCP 工具 (用於規劃提示)。")
             if not mcp_tools: print(f"  警告：未找到 {mcp_name} 工具！")
 
+            # --- 新增: 將本地工具加入列表 ---
+            all_available_tools = mcp_tools + LOCAL_TOOLS
+            print(f"  提供給規劃師的工具總數: {len(all_available_tools)} (MCP: {len(mcp_tools)}, Local: {len(LOCAL_TOOLS)})")
+
             # --- 選擇規劃提示 ---
             active_planning_prompt_content = ""
             if mcp_name in ["rhino", "revit"]:
@@ -1113,62 +1193,72 @@ async def agent_node_logic(state: MCPAgentState, config: RunnableConfig, mcp_nam
             **重要要求：**
             1.  **量化與具體化:** 對於幾何操作 (Rhino/Revit)，每個階段目標**必須**包含盡可能多的**具體數值、尺寸、座標、角度、數量、距離、方向、或清晰的空間關係描述**。
             2.  **邏輯順序:** 確保階段目標按邏輯順序排列，後續步驟依賴於先前步驟的結果。
-                3.  **空間佈局規劃 (Rhino):**
+            3.  **基地與座標系統意識 (Rhino - 極度重要):**
+                *   **確立基準方位:** 在進行任何與基地佈局相關的規劃時，**第一步必須是確立一個清晰的座標系統和方向基準**。明確定義「北」方與其他「東、西、南」對應的向量（例如，世界座標的Y軸正方向 `(0, 1, 0)`），並在後續所有步驟中嚴格遵守此基準。
+                *   **邊界意識:** 如果任務提供了基地邊界，**必須**將處理基地邊界作為優先步驟。
+                    *   a. 規劃創建或識別代表基地邊界的曲線。
+                    *   b. 在規劃放置任何建築量體、道路或景觀元素之前，**必須**先驗證其預計位置**完全位於**已定義的基地邊界內部。可以規劃獲取基地邊界的 bounding box 作為快速檢查。
+            4.  **空間佈局規劃 (Rhino):**
                     *   當任務涉及空間配置或多個量體的佈局時，計劃應明確描述這些量體之間的**拓撲關係** (如相鄰、共享面、包含) 和**相對位置** (如A在B的上方，C在D的西側並偏移X單位)。
                     *   **空間單元化原則：原則上，每一個獨立的功能空間（例如客廳、單獨的臥室、廚房、衛生間等）都應該規劃為一個獨立的幾何量體。避免使用單一量體代表多個不同的功能空間。為每個規劃生成的獨立空間量體或重要動線元素指定一個有意義的臨時名稱或標識符，並在後續的建模步驟中通過 Rhino 的 `add_object_metadata()` 功能將此名稱賦予對應的 Rhino 物件。**
                     *   **圖層規劃 - 初始設定：** 在開始任何建模或創建新的方案/基礎圖層 (如 "方案A", "Floor_1") 之前，**必須**規劃一個步驟：首先獲取當前場景中的所有圖層列表，然後將所有已存在的**頂層圖層**及其子圖層設置為不可見。這樣可以確保在一個乾淨的環境中開始新的設計工作。之後再創建並設置當前工作所需的圖層。
                     *   **圖層規劃 - 動線表達與分層 (Rhino):**
-                        *   對於**水平動線**（例如走廊、通道），如果需要視覺化，建議規劃使用 Rhino 中的線條 (`rs.AddLine()`) 或非常薄的板狀量體來示意其路徑和寬度。這些水平動線元素**必須**規劃到其所服務的樓層圖層下的**子圖層**中，例如：`Floor_1::Corridors_F1` 或 `Floor_Ground::Horizontal_Circulation`。
+                        *   對於**水平動線**（例如走廊、通道），如果需要視覺化，建議規劃使用非常薄的板狀量體來示意其路徑和寬度。這些水平動線元素**必須**規劃到其所服務的樓層圖層下的**子圖層**中，例如：`Floor_1::Corridors_F1` 或 `Floor_Ground::Horizontal_Circulation`。
                         *   對於**垂直動線**（例如樓梯、坡道、電梯井），則應規劃使用合適的3D量體來表達其佔據的空間和形態。這些垂直動線元素通常規劃到一個獨立的頂層圖層下，例如 `Circulation::Vertical_Core` 或 `Stairs_Elevators`。
                         *   所有動線元素也必須根據其服務的樓層或連接關係，正確地規劃到相應的圖層下。
                     *   在進行複雜的空間佈局規劃時，可以先(以文字描述的形式)構思一個2D平面上的關係草圖，標註出各個獨立空間量體和動線的大致位置、尺寸和鄰接關係，然後再將此2D關係轉化為3D建模步驟的規劃。
-                    *   規劃時需仔細考慮並確保最終生成的**量體數量、各個空間量體的具體位置和尺寸**符合設計意圖和空間邏輯。
-                4.  **多方案與多樓層處理 (Rhino):**
-                    *   如果用戶請求中明確要求"多方案"或"不同選項"，**必須**將每個方案視為一個**獨立的、完整的任務序列**來規劃。
-                    *   為每個方案指定一個清晰的名稱或標識符 (例如 "方案A_現代風格", "方案B_傳統風格")，並在整個方案的規劃和執行階段中使用此標識。
-                    *   計劃應清晰地標示每個方案的開始和結束。
-                    *   **對於包含多個樓層的設計方案，在完成每一樓層的主要建模內容後，應規劃一次詳細的截圖步驟。多方案規劃時每一方案完成後也同樣。 (參考下方截圖規劃詳細流程)。**
-                    *   對於多樓層可以規劃同時展示所有樓層的截圖總覽，但對於多方案不用。
-                5.  **造型與形態規劃 (Rhino):**
-                    *   當任務目標涉及'造型探索'、'形態生成'或對現有量體進行'外觀設計'時，規劃階段應積極考慮如何利用布林運算 (如加法、減法、交集) 和幾何變換 (如扭轉、彎曲、陣列、縮放、旋轉) 等高級建模技巧來達成獨特且具有空間感的「虛、實」幾何形態。
-                    *   **如要創造更具特殊性、流動性或有機感的造型，應考慮並規劃使用多種曲面生成與編輯技巧。規劃時應考慮工具的輸入要求：**
-                        *   **曲面應用技巧：** 優先規劃從曲線或曲面創建實體或有厚度的曲面，不要只是開放曲面。應用上盡量不要混雜保持造型純粹性。
-                        *   **曲面創建類別：**
-                            *   **掃掠 (Sweep):**
-                                *   `rs.AddSweep1(rail_curve_id, shape_curve_ids)`: 將剖面曲線列表 `shape_curve_ids` 沿單一軌道 `rail_curve_id` 掃掠成曲面。注意剖面曲線的方向和順序。
-                                *   `rs.AddSweep2(rail_curve_ids, shape_curve_ids)`: 將剖面曲線列表 `shape_curve_ids` 沿兩個軌道列表 `rail_curve_ids` 掃掠成曲面。注意剖面曲線的方向、順序及與軌道的接觸。
-                            *   **放樣 (Loft):**
-                                *   `rs.AddLoftSrf(curve_ids, start_pt=None, end_pt=None, type=0, style=0, simplify=0, closed=False)`: 在有序的曲線列表 `curve_ids` 之間創建放樣曲面。注意曲線方向和接縫點。可指定類型、樣式等。
-                            *   **網格曲面 (Network Surface):**
-                                *   `rs.AddNetworkSrf(curve_ids)`: 從一組相交的曲線網絡 `curve_ids` 創建曲面。所有 U 方向曲線必須與所有 V 方向曲線相交。
-                            *   **平面曲面 (Planar Surface):**
-                                *   `rs.AddPlanarSrf(curve_ids)`: 從一個或多個封閉的*平面*曲線列表 `curve_ids` 創建平面曲面。曲線必須共面且封閉。
-                        *   **實體創建類別：**
-                            *   **擠出 (Extrusion):**
-                                *   `rs.ExtrudeCurve(curve_id, path_curve_id)`: 將輪廓線 `curve_id` 沿路徑曲線 `path_curve_id` 擠出成曲面。
-                                *   `rs.ExtrudeCurveStraight(curve_id, start_point, end_point)` 或 `rs.ExtrudeCurveStraight(curve_id, direction_vector)`: 將曲線 `curve_id` 沿直線擠出指定距離和方向。
-                                *   `rs.ExtrudeCurveTapered(curve_id, distance, direction, base_point, angle)`: 將曲線 `curve_id` 沿 `direction` 方向擠出 `distance` 距離，同時以 `base_point` 為基準、按 `angle` 角度進行錐化。
-                                *   `rs.ExtrudeSurface(surface_id, path_curve_id, cap=True/False)`: 將曲面 `surface_id` 沿路徑曲線 `path_curve_id` 擠出成實體或開放形狀，可選是否封口 (`cap`)。
-                    *   在計劃中明確指出預計在哪些步驟使用這些技巧，以及預期達成的形態效果和所需的輸入物件。造型上應具有特殊的美學價值並符合設計概念。
-                6.  **圖像參考規劃 (若有提供圖像):**
-                    *   在生成具體的建模計劃之前，**必須**先進行詳細的"圖像分析與解讀"階段。
-                    *   規劃時應基於：觀察到的主要建築體塊組成和它們之間的**空間布局關係**（例如，穿插、並列、堆疊）；估計主要部分之間的精確長、寬、高比例關係；主次要量體的位置關係；主要的立面特徵（重點是整體形態）；柱子及其他特殊形式。
-                    *   **必須**將上述圖像分析得出的觀察結果，轉化為後續 Rhino 建模步驟中的具體參數和操作指導。**需特別注意絕對座標上的位置關係；方體的高度及角度關係；長短邊的方向關係，以構成符合圖片目標的建築塊體。**
-                7.  **截圖規劃詳細流程 (Rhino/Revit):**
-                    *   每當計劃需要截圖時 (例如完成一個樓層、一個設計方案，或應用戶明確要求)，**必須**規劃以下完整步驟：
-                        1.  **設定視圖投影模式：** 明確指定是平行投影 (`parallel`)、透視投影 (`perspective`) 還是兩點透視 (`two_point`)。
-                        2.  **view物件：** 如果要使用view鎖定並聚焦截圖對象，請先獲取對象name或ID。
-                        3.  **管理圖層可見性 (關鍵步驟)：**
-                            a.  規劃獲取當前場景中所有圖層的列表。
-                            b.  識別出當前截圖目標**直接相關**的圖層（例如，如果要截取 "Floor_1" 的俯視圖，則相關圖層是 "Floor_1" 及其所有子圖層，如 `Floor_1::Walls`, `Floor_1::Corridors_F1` 等）。
-                            c.  規劃遍歷所有圖層，將所有**不屬於**上述直接相關圖層集合的**其他頂層圖層**（及其所有子圖層，通常通過隱藏其頂層母圖層實現）設置為**不可見**。
-                            d.  確保所有與當前截圖目標**直接相關**的圖層均設置為**可見**，所有當前可見的目標物件都完整顯示在視圖。
-                        4.  **執行截圖：** 規劃調用 `capture_focused_view` 工具。此工具本身具備縮放視圖到目標的功能。
-                        **在截圖時，必須確保當前樓層的視圖不被遮擋，尤其是俯視圖。**
-                        **對於空間佈局規劃任務，適用於`parallel`；對於目的為渲染的建模，適用於`two_point`並配合相機採用人視角；其餘情況皆適用`perspective`。**
-                        **相機調整建議：** 設定相機位置(`camera_position`)、目標點(`target_position`)、透鏡角度 (`lens_angle`)(越小越遠，預設20)。如果規劃人平視視角z高度一定要是2m；規劃俯視z高度要是45m以上。
-                8.  **目標狀態:** 計劃應側重於**每個階段要達成的目標狀態**，說明該階段完成後場景應有的變化。
-                    *   **最後一個計劃應包含"全部任務已完成"時的相關行動，引導實際執行時的處理。**
+                *   規劃時需仔細考慮並確保最終生成的**量體數量、各個空間量體的具體位置和尺寸**符合設計意圖和空間邏輯。 **對於每個創建的空間，必須使用 `rs.AddTextDot("空間名稱", (x,y,z))` 在其量體中心附近標示空間名稱。絕對禁止使用 `rs.AddText()` 或 `rs.SetUserText()`。**
+            5.  **多方案與多樓層處理 (Rhino):**
+                *   如果用戶請求中明確要求"多方案"或"不同選項"，**必須**將每個方案視為一個**獨立的、完整的任務序列**來規劃。
+                *   為每個方案指定一個清晰的名稱或標識符 (例如 "方案A_現代風格", "方案B_傳統風格")，並在整個方案的規劃和執行階段中使用此標識。
+                *   計劃應清晰地標示每個方案的開始和結束。
+                *   **對於包含多個樓層的設計方案，在完成每一樓層的主要建模內容後，應規劃一次詳細的截圖步驟。多方案規劃時每一方案完成後也同樣。 (參考下方截圖規劃詳細流程)。**
+                *   對於多樓層可以規劃同時展示所有樓層的截圖總覽，但對於多方案不用。
+            6.  **造型與形態規劃 (Rhino):**
+                *   當任務目標涉及'造型方案'、'形態生成'或對現有量體進行'外觀設計'時，規劃階段應積極考慮如何利用布林運算 (如加法、減法、交集) 和幾何變換 (如扭轉、彎曲、陣列、縮放、旋轉) 等高級建模技巧來達成獨特且具有空間感的「虛、實」幾何形態。
+                *   **如要創造更具特殊性、流動性或有機感的造型，應考慮並規劃使用多種曲面生成與編輯技巧。規劃時應考慮工具的輸入要求：**
+                    *   **曲面應用技巧：** 優先規劃從曲線或曲面創建實體或有厚度的曲面，不要只是開放曲面。應用上盡量不要混雜保持造型純粹性。
+                    *   **曲面創建類別：**
+                        *   **掃掠 (Sweep):**
+                            *   `rs.AddSweep1(rail_curve_id, shape_curve_ids)`: 將剖面曲線列表 `shape_curve_ids` 沿單一軌道 `rail_curve_id` 掃掠成曲面。注意剖面曲線的方向和順序。
+                            *   `rs.AddSweep2(rail_curve_ids, shape_curve_ids)`: 將剖面曲線列表 `shape_curve_ids` 沿兩個軌道列表 `rail_curve_ids` 掃掠成曲面。注意剖面曲線的方向、順序及與軌道的接觸。
+                        *   **放樣 (Loft):**
+                            *   `rs.AddLoftSrf(curve_ids, start_pt=None, end_pt=None, type=0, style=0, simplify=0, closed=False)`: 在有序的曲線列表 `curve_ids` 之間創建放樣曲面。注意曲線方向和接縫點。可指定類型、樣式等。
+                        *   **網格曲面 (Network Surface):**
+                            *   `rs.AddNetworkSrf(curve_ids)`: 從一組相交的曲線網絡 `curve_ids` 創建曲面。所有 U 方向曲線必須與所有 V 方向曲線相交。
+                        *   **平面曲面 (Planar Surface):**
+                            *   `rs.AddPlanarSrf(curve_ids)`: 從一個或多個封閉的*平面*曲線列表 `curve_ids` 創建平面曲面。曲線必須共面且封閉。
+                    *   **實體創建類別：**
+                        *   **擠出 (Extrusion):**
+                            *   `rs.ExtrudeCurve(curve_id, path_curve_id)`: 將輪廓線 `curve_id` 沿路徑曲線 `path_curve_id` 擠出成曲面。
+                            *   `rs.ExtrudeCurveStraight(curve_id, start_point, end_point)` 或 `rs.ExtrudeCurveStraight(curve_id, direction_vector)`: 將曲線 `curve_id` 沿直線擠出指定距離和方向。
+                            *   `rs.ExtrudeCurveTapered(curve_id, distance, direction, base_point, angle)`: 將曲線 `curve_id` 沿 `direction` 方向擠出 `distance` 距離，同時以 `base_point` 為基準、按 `angle` 角度進行錐化。
+                            *   `rs.ExtrudeSurface(surface_id, path_curve_id, cap=True/False)`: 將曲面 `surface_id` 沿路徑曲線 `path_curve_id` 擠出成實體或開放形狀，可選是否封口 (`cap`)。
+                *   在計劃中明確指出預計在哪些步驟使用這些技巧，以及預期達成的形態效果和所需的輸入物件。造型上應具有特殊的美學價值並符合設計概念。
+            7.  **圖像參考規劃 (若有提供圖像):**
+                *   在生成具體的建模計劃之前，**必須**先進行詳細的"圖像分析與解讀"階段。
+                *   規劃時應基於：觀察到的主要建築體塊組成和它們之間的**空間布局關係**（例如，穿插、並列、堆疊）；估計主要部分之間的精確長、寬、高比例關係；主次要量體的位置關係；主要的立面特徵（重點是整體形態）；柱子及其他特殊形式。
+                *   **必須**將上述圖像分析得出的觀察結果，轉化為後續 Rhino 建模步驟中的具體參數和操作指導。**需特別注意絕對座標上的位置關係；方體的高度及角度關係；長短邊的方向關係，以構成符合圖片目標的建築塊體。**
+                *   **如果任務是參考圖片進行空間佈局(或量體配置)規劃，要在主要建築塊體的關係下發展詳細量體及空間配置。不需要建立精確立面等細部特徵。**
+            8.  **截圖規劃詳細流程 (Rhino/Revit):**
+                *   **截圖策略：** 規劃應分為兩個主要截圖階段，以確保成果的完整展示：
+                    1.  **整體視圖階段：** 在所有主要建模步驟完成後，首先規劃生成一到兩個能夠展示整體設計的**透視 (`perspective`) 或兩點透視 (`two_point`)** 視圖。在執行此階段的截圖時，**必須確保所有與設計方案相關的圖層（例如所有樓層、外部造型、基地等）都是可見的**，以呈現完整的模型。
+                    2.  **分層平面圖階段：** 如果是量體或平面規劃任務，在整體視圖截圖完成後，再針對**每一個樓層**規劃生成單獨的、**俯視的平行投影 (`parallel`)** 視圖。在執行此階段的截圖時，**必須只顯示當前正在截圖的樓層圖層**，並隱藏所有其他不相關的樓層圖層，以確保平面圖的清晰性。
+                *   **每張截圖的詳細步驟：**
+                    a.  **設定視圖與投影：** 明確指定投影模式 (`perspective`, `two_point`, `parallel`) 並設定適當的鏡頭角度。對於俯視平面圖，必須使用 `parallel` 模式。**對於目的為渲染的模型，適用於`two_point`並配合相機採用人視角(`z=2`,`lens_angle=10`)；展示其他類型的模型，適用於`perspective`。**
+                    b.  **管理圖層可見性 (關鍵)：** 規劃獲取當前場景中所有圖層的列表後，根據上述的「整體視圖」或「分層平面圖」策略，精確地規劃顯示或隱藏哪些圖層。
+                    c.  **設定相機 (可選但建議)：** 對於透視圖，規劃設定相機位置 (`camera_position`) 和目標點 (`target_position`)，以獲得最佳視角。例如，人視角高度約為 `z=2`,`lens_angle=10`，鳥瞰視角可以更高。**不論何時，必須確保相機旋轉設定為0，切勿讓其變為-90度。**
+                    d.  **執行截圖：** 規劃調用 `capture_focused_view` 工具。 建議設定相機後還要使用zoom功能鎖定目標。 
+            9.  **目標狀態:** 計劃應側重於**每個階段要達成的目標狀態**，說明該階段完成後場景應有的變化。
+                *   **最後一個計劃應包含"全部任務已完成"時的相關行動，引導實際執行時的處理。**
+            10.  **規劃數據摘要報告 (空間規劃任務的必要首步):**
+                *   **僅當**任務是關於**空間佈局規劃** (例如，量體配置等)，你**必須**將生成摘要報告作為計劃的**第一個步驟**。
+                *   **此步驟基於你即將制定的後續建模步驟，先行總結和報告規劃的量化數據。如果是要求分析已有的方案，則應該要先分析再進行數據摘要整理。**
+                *   **規劃的第一步應如下：**
+                    1.  **預先匯總:** 在腦中構思好所有建模步驟後，審查你計劃要創建的所有空間（如客廳、臥室等）的名稱、**所屬樓層**和具體尺寸/面積。
+                    2.  **計算匯總數據:** 基於這些規劃數值，計算出總面積、每個空間的面積佔比，以及建蔽率(BCR)和容積率(FAR)（如果適用）。
+                    3.  **規劃首個工具調用:** 將匯總好的數據（`data_rows` - 其中每個空間字典需包含 `name`, `area`, `percentage` **和 `floor`**，`total_area`, `bcr`, `far`）作為參數，將對 `create_planned_data_summary_csv` 工具的調用規劃為整個計劃的**第 1 步**。
+                    4.  **後續步驟:** 在此報告步驟之後，再依次列出所有實際的 Rhino 模型建構步驟。
 
             **rhino提醒:目前單位是M(公尺)。**這個計劃應側重於**每個階段要達成的目標狀態並包含細節**，而不是具體的工具使用細節。將任務分解成符合邏輯順序及細節的多個階段目標。直接輸出這個階段性目標計劃，不要额外的開場白或解釋。
             可用工具如下 ({mcp_name}):
@@ -1194,7 +1284,7 @@ async def agent_node_logic(state: MCPAgentState, config: RunnableConfig, mcp_nam
             # --- 格式化規劃提示 (Only for Rhino/Revit as others have descriptions embedded or generated above) ---
             planning_system_content_final = active_planning_prompt_content
             if mcp_name in ["rhino", "revit"]:
-                tool_descriptions_for_prompt = "\n".join([f"- {tool.name}: {tool.description}" for tool in mcp_tools])
+                tool_descriptions_for_prompt = "\n".join([f"- {tool.name}: {tool.description}" for tool in all_available_tools])
                 planning_system_content_final = active_planning_prompt_content.format(
                     mcp_name=mcp_name,
                     tool_descriptions=tool_descriptions_for_prompt
@@ -1283,49 +1373,55 @@ async def agent_node_logic(state: MCPAgentState, config: RunnableConfig, mcp_nam
             print(f"  獲取了 {len(mcp_tools)} 個 {mcp_name} MCP 工具 (用於執行)。")
             if not mcp_tools: print(f"  警告：執行階段未找到 {mcp_name} 工具！")
 
+            # --- 組合所有可用工具 ---
+            all_tools_for_execution = mcp_tools + LOCAL_TOOLS
+
             # --- 選擇執行提示 ---
-            active_execution_prompt = None
+            active_execution_prompt_template = None # Use template now
             if mcp_name in ["rhino", "revit"]:
                 # Use the globally defined RHINO_AGENT_EXECUTION_PROMPT
-                active_execution_prompt = RHINO_AGENT_EXECUTION_PROMPT
+                active_execution_prompt_template = RHINO_AGENT_EXECUTION_PROMPT
             elif mcp_name == "pinterest":
                  # Use the globally defined PINTEREST_AGENT_EXECUTION_PROMPT
-                 active_execution_prompt = PINTEREST_AGENT_EXECUTION_PROMPT
+                 active_execution_prompt_template = PINTEREST_AGENT_EXECUTION_PROMPT # No formatting needed
             elif mcp_name == "osm":
                  # Use the globally defined OSM_AGENT_EXECUTION_PROMPT
-                 active_execution_prompt = OSM_AGENT_EXECUTION_PROMPT
+                 active_execution_prompt_template = OSM_AGENT_EXECUTION_PROMPT # No formatting needed
             else: # Fallback
                 print(f"  警告：執行階段找不到為 {mcp_name} 定義的特定執行提示，將使用 Rhino/Revit 後備提示。")
-                active_execution_prompt = RHINO_AGENT_EXECUTION_PROMPT
+                active_execution_prompt_template = RHINO_AGENT_EXECUTION_PROMPT
 
-            if not active_execution_prompt:
+            if not active_execution_prompt_template:
                  # Safety check
                  print(f"  !! 嚴重錯誤：未能為 {mcp_name} 確定有效的執行提示！")
                  return {"messages": [AIMessage(content=f"內部錯誤：無法為 {mcp_name} 加載執行指令。")], "consecutive_llm_text_responses": 0, "last_executed_node": f"{mcp_name}_agent_error"}
 
+            # --- NEW: Format execution prompt with tools for relevant agents ---
+            active_execution_prompt = None
+            if "{tool_descriptions}" in active_execution_prompt_template.content:
+                tool_descriptions_for_exec = "\n".join([f"- {tool.name}: {tool.description}" for tool in all_tools_for_execution])
+                active_execution_prompt = SystemMessage(
+                    content=active_execution_prompt_template.content.format(tool_descriptions=tool_descriptions_for_exec)
+                )
+            else:
+                # For prompts that don't need tool formatting (like Pinterest/OSM)
+                active_execution_prompt = active_execution_prompt_template
+            # --- END NEW ---
+
             # --- 判斷是否為計劃生成後首次執行 ---
             is_first_execution_after_plan = False
-            # 檢查倒數第二條消息是否為計劃消息 (因為當前節點由 should_continue 在計劃後導回)
-            # <<< 恢復檢查邏輯 >>>
-            if len(current_messages) >= 2:
-                 # Let's check the *last* message added by the previous node turn.
-                 # If the previous node was the planning step, the last message IS the plan.
-                 last_message_is_plan = isinstance(last_message, AIMessage) and \
-                                        isinstance(last_message.content, str) and \
-                                        last_message.content.strip().startswith(PLAN_PREFIX)
-
-                 if last_message_is_plan:
-                     # Check if it's not an error message containing the prefix
-                     is_actual_plan_msg = "無法為您的請求制定計劃" not in last_message.content and \
-                                          "調用規劃 LLM 時發生錯誤" not in last_message.content
-                     if is_actual_plan_msg:
-                         # Check if the second to last message is the Human message (or similar check)
-                         # to confirm this is likely the *first* execution after planning.
-                         # This check is heuristic. A more robust way might involve state flags.
-                         if len(current_messages) == 2 and isinstance(current_messages[0], HumanMessage):
-                             is_first_execution_after_plan = True
-                             print("    檢測到這是計劃生成後的第一個執行調用 (基於消息歷史長度)。")
-                         # Add more robust check if needed, e.g., check if previous state involved planning node
+            # 如果 plan_exists (我們在執行分支) 且最後一條消息是有效的計劃消息,
+            # 這意味著我們剛從規劃階段過渡到執行階段的第一步。
+            if plan_exists and isinstance(last_message, AIMessage) and \
+               isinstance(last_message.content, str) and \
+               last_message.content.strip().startswith(PLAN_PREFIX):
+                
+                # 再次確認這不是一個包含 PLAN_PREFIX 的錯誤消息
+                is_actual_plan_msg = "無法為您的請求制定計劃" not in last_message.content and \
+                                     "調用規劃 LLM 時發生錯誤" not in last_message.content
+                if is_actual_plan_msg:
+                    is_first_execution_after_plan = True
+                    print("    檢測到這是計劃生成後的第一個執行調用 (最後一條消息是有效的計劃)。")
 
             # --- 準備執行階段的消息 ---
             messages_for_execution = current_messages
@@ -1357,21 +1453,25 @@ async def agent_node_logic(state: MCPAgentState, config: RunnableConfig, mcp_nam
             execution_response = None
             try:
                 # --- PRUNE MESSAGES ---
-                # <<< 恢復特殊剪枝邏輯 >>>
-                max_interactions_for_pruning = MAX_RECENT_INTERACTIONS_DEFAULT
-                if is_first_execution_after_plan:
-                    # Using a smaller number for the first execution might be removing too much context.
-                    # Let's revert to the default for now.
-                    max_interactions_for_pruning = 2 # Use a smaller number for the first execution
-                    print(f"    為首次執行調用減少歷史記錄交互數量至: {max_interactions_for_pruning}")
-                    # pass # Use default
+                pruned_messages_for_llm = messages_for_execution # 預設不剪枝
 
-                print(f"  準備執行 LLM 調用，原始待處理消息數: {len(messages_for_execution)}")
-                # 使用調整後的 max_interactions 進行剪枝
-                pruned_messages_for_llm = _prune_messages_for_llm(messages_for_execution, max_interactions_for_pruning)
-                print(f"  剪枝後傳遞給 LLM 的消息數: {len(pruned_messages_for_llm)}")
+                if mcp_name == "rhino":
+                    max_interactions_for_rhino_pruning = MAX_RECENT_INTERACTIONS_DEFAULT
+                    if is_first_execution_after_plan:
+                        max_interactions_for_rhino_pruning = 2
+                        print(f"    為 Rhino 首次執行調用，設定 max_interactions_for_pruning={max_interactions_for_rhino_pruning} (保留初始請求、計劃和少量近期互動)。")
+                    else:
+                        print(f"    為 Rhino 非首次執行調用，使用預設歷史記錄交互數量: {max_interactions_for_rhino_pruning}")
+                    
+                    print(f"  Rhino: 準備執行 LLM 調用，原始待處理消息數: {len(messages_for_execution)}")
+                    pruned_messages_for_llm = _prune_messages_for_llm(messages_for_execution, max_interactions_for_rhino_pruning)
+                else: # 對於 revit, pinterest, osm 等其他 MCP
+                    print(f"  {mcp_name.upper()}: 不執行訊息剪枝。原始待處理消息數: {len(messages_for_execution)}")
+                    # pruned_messages_for_llm 已設為 messages_for_execution (不剪枝)
 
-                execution_response = await call_llm_with_tools(pruned_messages_for_llm, mcp_tools, active_execution_prompt)
+                print(f"  剪枝後/處理後傳遞給 LLM 的消息數: {len(pruned_messages_for_llm)}")
+                
+                execution_response = await call_llm_with_tools(pruned_messages_for_llm, all_tools_for_execution, active_execution_prompt)
 
             finally:
                 print(f"     執行 LLM 調用結束，等待 {RPM_DELAY} 秒...")
@@ -1470,9 +1570,10 @@ async def agent_tool_executor(state: MCPAgentState, config: RunnableConfig) -> D
 
     print(f"  目標 MCP: {target_mcp}")
     try:
-        selected_tools = await get_mcp_tools(target_mcp)
-        print(f"  使用 {len(selected_tools)} 個 {target_mcp} 工具。")
-        tool_messages = await execute_tools(last_message, selected_tools) # 移除 state 參數
+        mcp_tools = await get_mcp_tools(target_mcp)
+        all_tools_for_execution = mcp_tools + LOCAL_TOOLS
+        print(f"  使用 {len(all_tools_for_execution)} 個總工具 ({target_mcp} MCP: {len(mcp_tools)}, Local: {len(LOCAL_TOOLS)})。")
+        tool_messages = await execute_tools(last_message, all_tools_for_execution) # 移除 state 參數
         print(f"  工具執行完成，返回 {len(tool_messages)} 個 ToolMessage。")
         # {{ edit_3 }}
         return {"messages": tool_messages, "last_executed_node": "agent_tool_executor"}
@@ -1498,54 +1599,214 @@ async def call_fallback_agent(state: MCPAgentState, config: RunnableConfig) -> D
          return {"messages": [AIMessage(content="[FALLBACK_ERROR] Missing target MCP in state.")]}
 
     # 提取相關歷史記錄用於提示
-    plan_content = ""
     plan_message = next((msg for msg in reversed(current_messages) if isinstance(msg, AIMessage) and isinstance(msg.content, str) and msg.content.strip().startswith(PLAN_PREFIX)), None)
-    if plan_message:
-        plan_content = plan_message.content
+    plan_content_for_prompt = ""
+    if plan_message and isinstance(plan_message.content, str):
+        # MODIFIED: Use the full plan content for the prompt
+        plan_content_for_prompt = plan_message.content.strip()
+        print(f"  提取到完整計劃內容 (用於 Fallback Prompt): {plan_content_for_prompt[:500]}...")
 
-    # 只取最近幾條消息 + 計劃
-    # {{ edit_1 }}
-    # 增加 Fallback Agent 能看到的歷史消息數量
-    relevant_history_messages = _prune_messages_for_llm(current_messages, max_recent_interactions=7) # 使用建議的較大值
-    # {{ end_edit_1 }}
-    history_str = "\n".join([f"{type(m).__name__}: {str(m.content)[:500]}..." for m in relevant_history_messages])
+    # 只取最近幾條消息 + 計劃 (計劃已單獨處理，這裡只取非計劃的近期消息)
+    # MODIFIED: _prune_messages_for_llm now only gets recent *non-plan* messages if plan is found
+    # Or, we can build the history string more explicitly. Let's build it explicitly for clarity.
+    
+    history_items = []
+    # Add the initial human message if available (usually the first)
+    if current_messages and isinstance(current_messages[0], HumanMessage):
+        first_human_msg = current_messages[0]
+        # Summarize the initial human message if it's the one with the image content list
+        if isinstance(first_human_msg.content, list):
+            text_part = ""
+            for item in first_human_msg.content:
+                 if isinstance(item, dict) and item.get("type") == "text":
+                      text_part = item.get("text", "")
+                      break
+            history_items.append(f"初始用戶請求 (HumanMessage): {text_part[:300]}...") # Summarize initial request text
+        else:
+             history_items.append(f"初始用戶請求 (HumanMessage): {str(first_human_msg.content)[:300]}...") # Summarize initial request string
 
-    prompt_content = FALLBACK_PROMPT.content.format(relevant_history=history_str)
+    # Add the plan message's full content (already extracted above)
+    if plan_content_for_prompt:
+         history_items.append(f"\n---\n完整目標階段計劃 (AIMessage):\n{plan_content_for_prompt}\n---")
+
+
+    # Add recent messages (excluding the initial human message and the plan message if they are at the end)
+    # Let's grab the last N messages, but skip the first if it's the initial human, and skip the last if it's the plan message itself.
+    messages_for_recent_history = current_messages[1:] # Skip the first message assuming it's the initial Human
+    if messages_for_recent_history and plan_message and id(messages_for_recent_history[-1]) == id(plan_message):
+         messages_for_recent_history = messages_for_recent_history[:-1] # Skip the plan message if it's the last
+
+    # Get the last few relevant messages (e.g., last 5-7 interactions)
+    max_recent = 7 # Limit recent history to avoid overwhelming the LLM
+    recent_messages_to_summarize = messages_for_recent_history[-max_recent:]
+
+
+    for msg in recent_messages_to_summarize:
+        msg_summary = f"{type(msg).__name__}: "
+        if isinstance(msg.content, str):
+            msg_summary += f"{msg.content[:500]}..." if len(msg.content) > 500 else msg.content
+        elif isinstance(msg.content, list):
+            # Summarize list content (e.g., tool message with file path)
+            summary_parts = []
+            for item in msg.content:
+                if isinstance(item, dict) and item.get("type") == "text":
+                    summary_parts.append(item.get("text", "")[:100] + "...")
+                elif isinstance(item, str): # Handle ToolMessage content which might be JSON string or simple string
+                    summary_parts.append(item[:100] + "...")
+                else:
+                    summary_parts.append(f"[{type(item).__name__} content]")
+            msg_summary += " | ".join(summary_parts)
+        elif hasattr(msg, 'tool_calls') and msg.tool_calls: # Check for tool_calls attribute
+            # Summarize tool calls
+            tool_call_summaries = []
+            for tc in msg.tool_calls:
+                 tool_call_summaries.append(f"ToolCall(name={tc.get('name', 'N/A')}, args={str(tc.get('args', {}))[:100]}...)")
+            msg_summary += f"ToolCalls: {'; '.join(tool_call_summaries)}"
+
+        history_items.append(msg_summary)
+
+    # Join the history items into a single string for the prompt
+    relevant_history_str = "\n".join(history_items)
+
+
+    prompt_content = FALLBACK_PROMPT.content.format(relevant_history=relevant_history_str)
     fallback_system_message = SystemMessage(content=prompt_content)
-    print(f"  Fallback Agent Prompt:\n{prompt_content[:500]}...")
+    print(f"  Fallback Agent Prompt (Partial Preview):\n{prompt_content[:1000]}...") # Print a longer preview
 
-    fallback_response = None
+    original_fallback_response = None
+    fallback_response_to_return = None
+    mcp_tools_raw = [] # Define outside try for access in parsing block
+
     try:
         # 獲取工具以供綁定（補救 LLM 也需要知道可用工具）
-        mcp_tools = await get_mcp_tools(target_mcp)
-        if not mcp_tools:
+        mcp_tools_raw = await get_mcp_tools(target_mcp) # Assign to mcp_tools_raw
+        if not mcp_tools_raw:
              print(f"  !! Fallback Agent 警告：未找到 {target_mcp} 工具！")
-             # Fallback might still work by generating text, but tool calls won't be possible
+        
+        # --- 使用輔助函數準備 Gemini 兼容的工具 ---
+        gemini_compatible_fallback_tools = _prepare_gemini_compatible_tools(mcp_tools_raw)
 
-        # 使用 utility_llm 或配置的主 LLM 進行補救
-        # 這裡我們使用 utility_llm (gpt-4o-mini)，假設它更擅長這種糾錯任務
-        fallback_llm = utility_llm # Or configure agent_llm differently
-        llm_with_tools = fallback_llm.bind_tools(mcp_tools) # Bind tools even to fallback
+        # 使用 agent_llm (Gemini)
+        fallback_llm = agent_llm 
+        llm_with_tools = fallback_llm.bind_tools(gemini_compatible_fallback_tools) # Bind corrected tools
         llm_configured = llm_with_tools.with_config({"callbacks": None})
 
-        # 為補救 LLM 準備消息 (只發送 System 提示，讓它基於提示中的歷史分析)
-        # 注意：這裡不傳遞完整的消息歷史給 invoke，而是將其包含在 System 提示中
-        fallback_response = await llm_configured.ainvoke([fallback_system_message])
-        print(f"  Fallback Agent 響應: {fallback_response}")
+        messages_for_llm_invoke = [fallback_system_message]
+        # Add a neutral HumanMessage to ensure the 'contents' field is not empty
+        # when the SystemMessage is potentially moved to 'system_instruction' by LangChain.
+        # This message also serves as a conversational turn for the LLM to respond to.
+        # Using "." is a common minimal prompt to trigger a response based on system instructions.
+        messages_for_llm_invoke.append(HumanMessage(content="."))
+
+        # original_fallback_response = await llm_configured.ainvoke([fallback_system_message]) # OLD
+        original_fallback_response = await llm_configured.ainvoke(messages_for_llm_invoke) # NEW
+        print(f"  Fallback Agent 原始響應: {original_fallback_response}")
+        
+        fallback_response_to_return = original_fallback_response # Default
+
+
+        # --- Reinstated: Process fallback_response to extract tool_calls from content if necessary ---
+        if isinstance(original_fallback_response, AIMessage) and \
+           isinstance(original_fallback_response.content, str) and \
+           not original_fallback_response.tool_calls: 
+            
+            content_str = original_fallback_response.content.strip()
+            is_potential_json_tool_call = False
+            if (content_str.startswith('{') and content_str.endswith('}')):
+                 is_potential_json_tool_call = True
+            elif content_str.startswith('```json'):
+                 match = re.match(r'^```json\s*(\{.*?\})\s*```$', content_str, re.DOTALL | re.IGNORECASE)
+                 if match:
+                     content_str = match.group(1).strip()
+                     is_potential_json_tool_call = True
+                 else:
+                     if "tool_calls" in content_str and ("recipient_name" in content_str or "name" in content_str) : # Added "name"
+                          cleaned_md_json_str = re.sub(r'^```(?:json)?\s*|\s*```$', '', original_fallback_response.content.strip(), flags=re.IGNORECASE)
+                          if cleaned_md_json_str.strip().startswith('{'):
+                              content_str = cleaned_md_json_str.strip()
+                              is_potential_json_tool_call = True
+            
+            if is_potential_json_tool_call:
+                try:
+                    parsed_json = json.loads(content_str)
+                    if isinstance(parsed_json, dict) and "tool_calls" in parsed_json and isinstance(parsed_json["tool_calls"], list):
+                        processed_tool_calls = []
+                        for tc_orig in parsed_json["tool_calls"]:
+                            if isinstance(tc_orig, dict):
+                                tc = tc_orig.copy() 
+                                tool_name_to_set = None
+                                tool_args_to_set = tc.get("parameters", tc.get("args", {}))
+                                raw_name = tc.get("recipient_name", tc.get("name"))
+
+                                if raw_name:
+                                    func_name_part = raw_name
+                                    if raw_name.startswith("functions."):
+                                        func_name_part = raw_name.split("functions.", 1)[1]
+                                    
+                                    found_tool_match = False
+                                    # Use mcp_tools_raw which contains the original BaseTool objects
+                                    for t_obj in mcp_tools_raw: 
+                                        if t_obj.name == func_name_part: 
+                                            tool_name_to_set = t_obj.name
+                                            found_tool_match = True
+                                            break
+                                        if t_obj.name.endswith(f"_{func_name_part}"): 
+                                            tool_name_to_set = t_obj.name
+                                            found_tool_match = True
+                                            break
+                                    if not found_tool_match:
+                                         print(f"  Fallback Agent: Could not reliably map name '{raw_name}' to a known tool. Using '{func_name_part}'.")
+                                         tool_name_to_set = func_name_part
+                                else:
+                                    print(f"  Fallback Agent: Tool call missing 'recipient_name' or 'name': {tc_orig}")
+                                    continue 
+                                
+                                new_tc_entry = {
+                                    "name": tool_name_to_set,
+                                    "args": tool_args_to_set,
+                                    "id": tc.get("id", str(uuid.uuid4()))
+                                }
+                                processed_tool_calls.append(new_tc_entry)
+                            
+                        if processed_tool_calls:
+                             placeholder_content = "[Fallback agent initiated tool call via content parsing.]"
+                             fallback_response_to_return = AIMessage(
+                                 content=placeholder_content, 
+                                 tool_calls=processed_tool_calls,
+                                 id=original_fallback_response.id if original_fallback_response else str(uuid.uuid4()), 
+                                 additional_kwargs=original_fallback_response.additional_kwargs if original_fallback_response else {},
+                                 response_metadata=original_fallback_response.response_metadata if original_fallback_response else {},
+                                 # tool_call_chunks should be fine as None/default if not streaming
+                             )
+                             print(f"  Fallback Agent: Reconstructed AIMessage with tool_calls attribute: {fallback_response_to_return.tool_calls} and content: '{placeholder_content}'")
+                        else:
+                            print("  Fallback Agent: Parsed JSON from content, but 'tool_calls' list was empty or malformed after processing.")
+                    # else:
+                        # print(f"  Fallback Agent: Content was JSON, but not in expected tool_calls format. Parsed: {json.dumps(parsed_json, indent=2)}")
+
+
+                except json.JSONDecodeError:
+                    print(f"  Fallback Agent: Content looked like JSON for tool call but failed to parse: {content_str[:200]}...")
+                except Exception as e_proc:
+                    print(f"  Fallback Agent: Error processing content for tool_calls: {e_proc} on content {content_str[:200]}")
+        # --- END Reinstated Parsing ---
+
 
     except Exception as e:
-        print(f"!! Fallback Agent 調用 LLM 時發生錯誤: {e}")
+        print(f"!! Fallback Agent 調用 LLM 或解析時發生錯誤: {e}") # Modified error message
         traceback.print_exc()
-        fallback_response = AIMessage(content=f"[FALLBACK_LLM_ERROR] {e}")
+        # Ensure fallback_response_to_return is an AIMessage
+        if not isinstance(fallback_response_to_return, AIMessage):
+            fallback_response_to_return = AIMessage(content=f"[FALLBACK_LLM_ERROR_OR_PARSING] {e}")
+        else: # If it was already an AIMessage (e.g. from LLM and parsing failed later), append error
+            fallback_response_to_return.content += f" [Error during post-processing: {e}]"
+
     finally:
         # 短暫等待，避免速率限制
         await asyncio.sleep(RPM_DELAY / 2) # Shorter delay for fallback?
         print("     Fallback Agent 等待結束。")
 
-    # Fallback 不更新連續空響應計數器，讓主循環處理
-    return {"messages": [fallback_response] if fallback_response else [], "last_executed_node": "fallback_agent"}
-
-
+    return {"messages": [fallback_response_to_return] if fallback_response_to_return else [], "last_executed_node": "fallback_agent"}
 
 # =============================================================================
 # Conditional Edge Logic (修改 should_continue 處理 task_complete)
@@ -1556,9 +1817,7 @@ def should_continue(state: MCPAgentState) -> str:
     messages = state['messages']
     last_message = messages[-1] if messages else None
     target_mcp = state.get("target_mcp", "unknown")
-    # {{ edit_1 }}
     last_node = state.get("last_executed_node")
-    # {{ end_edit_1 }}
 
     # --- 優先檢查 task_complete 標誌 (通常由 agent_node_logic 中的工具結果或連續錯誤觸發) ---
     if state.get("task_complete"):
@@ -1569,80 +1828,107 @@ def should_continue(state: MCPAgentState) -> str:
         print("  消息列表為空 -> end")
         return END
 
-    # --- 處理計劃生成 (通常由 agent_node_logic 在沒有計劃時觸發) ---
+    # --- 檢查 AI 是否請求工具調用 (來自任何 Agent，包括 Fallback) ---
+    if isinstance(last_message, AIMessage) and hasattr(last_message, 'tool_calls') and last_message.tool_calls:
+        print(f"  AI請求工具 ({len(last_message.tool_calls)}個從 {last_node}) -> agent_tool_executor")
+        return "agent_tool_executor" 
+
+    # --- 處理計劃生成 (通常由 primary agent 在沒有計劃時觸發) ---
     if isinstance(last_message, AIMessage) and isinstance(last_message.content, str) and last_message.content.strip().startswith(PLAN_PREFIX):
         is_actual_plan = "無法為您的請求制定計劃" not in last_message.content and "調用規劃 LLM 時發生錯誤" not in last_message.content
         if is_actual_plan:
-            print(f"  最後消息是新生成的計劃 -> 返回 {target_mcp}_agent 執行第一步")
-            if target_mcp in ["revit", "rhino", "pinterest", "osm"]:
-                 return f"{target_mcp}_agent"
-            else:
-                 print(f"  警告: 無效的 target_mcp ('{target_mcp}')，無法返回 Agent -> end")
-                 return END # Should not happen if router works
-        else: # 處理計劃生成失敗的情況
-             print(f"  最後消息是計劃生成錯誤 ('{last_message.content[:50]}...') -> end") # Planning error should end
+            if last_node and (last_node.endswith("_agent") or last_node.endswith("_planner")):
+                 print(f"  最後消息是新生成的計劃 (來自 {last_node}) -> 返回 {target_mcp}_agent 執行第一步")
+                 if target_mcp in ["revit", "rhino", "pinterest", "osm"]:
+                     return f"{target_mcp}_agent"
+                 else:
+                     print(f"  警告: 無效的 target_mcp ('{target_mcp}') 在計劃生成後。無法返回 Agent -> end")
+                     return END 
+            else: 
+                 print(f"  !! 錯誤: 計劃意外來自非 Agent 節點 ({last_node}) -> end (異常)")
+                 return END
+        else: 
+             print(f"  最後消息是計劃生成錯誤 ('{last_message.content[:50]}...') -> end") 
              return END
 
-    # --- 檢查 AI 是否請求工具調用 (來自任何 Agent，包括 Fallback) ---
-    if isinstance(last_message, AIMessage) and hasattr(last_message, 'tool_calls') and last_message.tool_calls:
-            print(f"  AI請求工具 ({len(last_message.tool_calls)}個) -> agent_tool_executor")
-            return "agent_tool_executor"
-        
     # --- 檢查是否為工具執行結果 (ToolMessage) ---
     if isinstance(last_message, ToolMessage):
         print(f"  最後消息是 ToolMessage (來自工具 '{last_message.name}') -> 返回 {target_mcp}_agent 處理結果")
         if target_mcp in ["revit", "rhino", "pinterest", "osm"]:
-            return f"{target_mcp}_agent"
+            return f"{target_mcp}_agent" 
         else:
             print(f"  警告: 無效的 target_mcp ('{target_mcp}')，無法返回 Agent 處理工具結果 -> end")
-            return END # Should not happen
+            return END
 
-    # --- 處理 AIMessage (非計劃，非工具調用) ---
+    # --- 處理 AIMessage (非計劃，且沒有 tool_calls) ---
     if isinstance(last_message, AIMessage):
-        content_str = str(last_message.content).lower() if last_message.content else ""
+        # 確保 content_str 是實際的字串，如果 content 為 None，則預設為空字串以便安全處理
+        raw_content = last_message.content
+        content_str = str(raw_content).lower() if raw_content is not None else ""
 
-        # 首先檢查是否為 Fallback Agent 明確的結束信號
-        # {{ edit_2 }}
+        # --- 處理 Fallback Agent 的輸出 (沒有 tool_calls attribute) ---
         if last_node == "fallback_agent":
             fallback_end_keywords = [
-                "[fallback_cannot_recover]",
-                "[fallback_error]",
-                "[fallback_llm_error]",
-                "[fallback_confirmed_completion]",
+                "[fallback_cannot_recover]", "[fallback_error]", "[fallback_llm_error]",
+                "[fallback_llm_error_or_parsing]", "[fallback_confirmed_completion]",
             ]
-            is_fallback_explicit_end_signal = any(keyword in content_str for keyword in fallback_end_keywords)
-            if is_fallback_explicit_end_signal:
+            if any(keyword in content_str for keyword in fallback_end_keywords):
                 if "[fallback_confirmed_completion]" in content_str:
-                    print(f"  檢測到 Fallback Agent 確認任務成功完成 ('{last_message.content[:50]}...') -> end")
+                    print(f"  檢測到 Fallback Agent 確認任務成功完成 ('{content_str[:50]}...') -> end")
                 else:
-                    print(f"  檢測到 Fallback Agent 明確的失敗/無法恢復消息 ('{last_message.content[:50]}...') -> end")
+                    print(f"  檢測到 Fallback Agent 明確的失敗/無法恢復消息 ('{content_str[:50]}...') -> end")
                 return END
-        
-        # 其次，檢查是否為主要 Agent 的完成訊息
-        primary_agent_completion_keywords = [
-            "全部任務已完成", # Rhino/Revit
-            "圖片搜索和下載完成", # Pinterest
-            "地圖截圖已完成",   # OSM
-            # 可以根據需要添加更多 Revit/Rhino 特有的完成語句
-        ]
-        is_primary_agent_completion = False
-        if last_node and "fallback" not in last_node.lower(): # 確保不是 fallback_agent 說的
+            else:
+                print(f"  !! 錯誤: Fallback Agent ({last_node}) 輸出非工具/非明確結束信號的 AIMessage ('{content_str[:50]}...') -> end (異常)")
+                return END
+
+        # --- 處理來自 主要 Agent / Planner 的 AIMessage ---
+        if last_node and (last_node.endswith("_agent") or last_node.endswith("_planner")):
+            # 1. 檢查主要 Agent/Planner 的完成關鍵字
+            primary_agent_completion_keywords = [ "全部任務已完成", "圖片搜索和下載完成", "地圖截圖已完成", ]
             if any(keyword in content_str for keyword in primary_agent_completion_keywords):
-                is_primary_agent_completion = True
-        
-        if is_primary_agent_completion:
-            print(f"  檢測到主要 Agent ({last_node}) 的完成消息 ('{content_str[:50]}...'). 路由到 fallback_agent 進行驗證。")
-            return "fallback_agent"
+                print(f"  檢測到主要 Agent/Planner ({last_node}) 的完成消息 ('{content_str[:50]}...'). 路由到 fallback_agent 進行驗證。")
+                return "fallback_agent"
 
-        # 如果不是上述情況，則認為是需要 fallback_agent 介入的情況 (例如卡住)
-        # 或者 fallback_agent 自己輸出了非結束信號的文本，也讓它再次評估
-        print(f"  來自節點 '{last_node}' 的非工具/非計劃/非特定結束信號的 AIMessage ('{content_str[:50]}...'). 路由到 fallback_agent。")
+            # 2. 檢查主要 Agent/Planner 的內容是否為空
+            #    (沒有 tool_calls 的情況已在最前面處理)
+            if not content_str.strip(): # 如果內容為空或僅包含空白字符
+                print(f"  來自主要 Agent/Planner ({last_node}) 的 AIMessage 內容為空或僅空白。路由到 fallback_agent。")
+                return "fallback_agent"
+            
+            # 3. 如果內容非空且不是完成關鍵字，則是主要 Agent/Planner 的中間步驟文本。
+            #    路由回主要 Agent 繼續其自身邏輯。
+            print(f"  來自主要 Agent/Planner ({last_node}) 的中間文本 AIMessage ('{content_str[:50]}...'). 路由回 {target_mcp}_agent。")
+            if target_mcp in ["revit", "rhino", "pinterest", "osm"]:
+                return f"{target_mcp}_agent"
+            else: 
+                print(f"  警告: 無效的 target_mcp ('{target_mcp}') for primary agent AIMessage. 路由到 fallback_agent。")
+                return "fallback_agent"
+
+        # --- 處理來自 agent_tool_executor 的 AIMessage ---
+        # (這通常是在 agent_node_logic 處理 ToolMessage 後生成的文本消息，
+        #  例如 "screenshot saved at X", "Pinterest download complete", "OSM map ready")
+        if last_node == "agent_tool_executor":
+            # 這類消息是資訊性的。主要 Agent 需要看到它們才能繼續執行計劃。
+            # 如果這裡的消息為空，也應該路由到 fallback。
+            if not content_str.strip(): # 如果內容為空或僅包含空白字符
+                print(f"  來自 agent_tool_executor 的 AIMessage 內容為空或僅空白。路由到 fallback_agent。")
+                return "fallback_agent"
+
+            print(f"  來自 agent_tool_executor 的 AIMessage (工具結果處理後的信息) ('{content_str[:50]}...'). 路由回 {target_mcp}_agent。")
+            if target_mcp in ["revit", "rhino", "pinterest", "osm"]:
+                return f"{target_mcp}_agent"
+            else:
+                print(f"  警告: 無效的 target_mcp ('{target_mcp}') for agent_tool_executor AIMessage. 路由到 fallback_agent。")
+                return "fallback_agent"
+
+        # --- 其他 AIMessage 的捕獲 ---
+        # (例如，來自未知節點，或以上邏輯未能覆蓋的情況)
+        print(f"  來自節點 '{last_node}' 的無法分類的 AIMessage (無工具、非計劃) ('{content_str[:50]}...'). 路由到 fallback_agent。")
         return "fallback_agent"
-        # {{ end_edit_2 }}
 
-    # --- 其他意外情況 (例如，在流程中途出現 HumanMessage) ---
+    # --- 其他意外情況 ---
     elif isinstance(last_message, HumanMessage):
-        # This should ideally not happen after the initial routing.
         print("  在流程中意外出現 HumanMessage (非初始請求) -> end (異常)")
         return END
     else:
@@ -1729,11 +2015,10 @@ workflow.add_conditional_edges(
     should_continue, # Reuse the same logic
     {
         "agent_tool_executor": "agent_tool_executor", # Fallback succeeded in generating tool call
-        # If fallback fails and returns "[FALLBACK_CANNOT_RECOVER]", should_continue will return END.
-        # If fallback returns another AIMessage without tools (e.g. "I will try X"), it loops back to fallback_agent
-        # via should_continue, which is generally fine for one or two retries if needed, but
-        # the consecutive_llm_text_responses counter in agent_node_logic (if fallback uses it)
-        # or a similar counter in fallback_agent itself would prevent infinite loops.
+        "revit_agent": "revit_agent",
+        "rhino_agent": "rhino_agent",
+        "pinterest_agent": "pinterest_agent",
+        "osm_agent": "osm_agent",
         # For now, this setup relies on FALLBACK_PROMPT guiding it to either tool_call or [FALLBACK_CANNOT_RECOVER]
         "fallback_agent": "fallback_agent", # Allows fallback to re-evaluate if it produces text instead of tools/end
         END: END # If should_continue detects explicit fallback failure or other critical errors

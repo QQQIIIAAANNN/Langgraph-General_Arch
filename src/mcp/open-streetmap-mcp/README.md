@@ -13,6 +13,23 @@ An OpenStreetMap MCP server implementation that enhances LLM capabilities with l
 ### Parking Search
 ![Parking Search Use Case](demo/use-case-parking.gif)
 
+
+## Installation
+
+### In MCP Hosts like Claude Desktop, Cursor, Windsurf, etc.
+- `osm-mcp-server`: The main server, available for public use.
+  
+  ```json
+  "mcpServers": {
+    "osm-mcp-server": {
+      "command": "uvx",
+      "args": [
+        "osm-mcp-server"
+      ]
+    }
+  }
+  ```
+
 ## Features
 
 This server provides LLMs with tools to interact with OpenStreetMap data, enabling location-based applications to:
@@ -54,11 +71,6 @@ The server implements several geospatial tools:
 - `analyze_neighborhood`: Evaluate neighborhood livability for real estate
 - `find_parking_facilities`: Locate parking options near a destination
 
-## Use Cases
-
-### Real Estate Decision Making
-
-An LLM can help users evaluate potential neighborhoods for home purchases:
 
 ## Local Testing
 
@@ -133,11 +145,7 @@ client = Client("http://localhost:8000")
 results = await client.invoke_tool("geocode_address", {"address": "New York City"})
 ```
 
-## Configuration
-
-### Install
-
-#### Claude Desktop
+#### Claude Desktop config for local server
 
 On MacOS: `~/Library/Application\ Support/Claude/claude_desktop_config.json`
 On Windows: `%APPDATA%/Claude/claude_desktop_config.json`
@@ -160,20 +168,7 @@ On Windows: `%APPDATA%/Claude/claude_desktop_config.json`
   ```
 </details>
 
-<details>
-  <summary>Published Servers Configuration</summary>
-  
-  ```json
-  "mcpServers": {
-    "osm-mcp-server": {
-      "command": "uvx",
-      "args": [
-        "osm-mcp-server"
-      ]
-    }
-  }
-  ```
-</details>
+
 
 ## Development
 
@@ -213,46 +208,6 @@ npx @modelcontextprotocol/inspector uv --directory /path/to/osm-mcp-server run o
 
 Upon launching, the Inspector will display a URL that you can access in your browser to begin debugging.
 
-## Example API Usage
-
-Here's a quick example of how to use the key API endpoints from Python code:
-
-```python
-import asyncio
-from mcp.client import Client
-
-async def main():
-    client = Client("http://localhost:8000")
-    
-    # Geocode an address
-    results = await client.invoke_tool("geocode_address", {"address": "Empire State Building"})
-    print(f"Found location: {results[0]['display_name']}")
-    
-    # Get coordinates
-    lat = float(results[0]['lat'])
-    lon = float(results[0]['lon'])
-    
-    # Find nearby coffee shops
-    nearby = await client.invoke_tool(
-        "find_nearby_places",
-        {
-            "latitude": lat,
-            "longitude": lon,
-            "radius": 500,
-            "categories": ["amenity"],
-            "limit": 5
-        }
-    )
-    
-    # Print results
-    print(f"Found {nearby['total_count']} nearby places")
-    for category, subcategories in nearby["categories"].items():
-        for subcategory, places in subcategories.items():
-            print(f"  - {subcategory}: {len(places)} places")
-
-if __name__ == "__main__":
-    asyncio.run(main())
-```
 
 
 

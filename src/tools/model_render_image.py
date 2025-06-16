@@ -135,11 +135,12 @@ def model_render_image(outer_prompt: str, image_inputs: str) -> str:
         return f"Error opening or uploading image_to_process ('{source_image_full_path}'): {e}"
 
 
-    prompt["9"]["inputs"]["text"] = outer_prompt  # Set Positive Prompt (Final English ComfyUI Prompt)
-    prompt["60"]["inputs"]["image"] = comfyui_uploaded_image_name # Input Image name as known by ComfyUI
+    prompt["99"]["inputs"]["clip_l"] = outer_prompt  # Set Positive Prompt (Final English ComfyUI Prompt)
+    prompt["99"]["inputs"]["t5xxl"] = outer_prompt  # Set Positive Prompt (Final English ComfyUI Prompt)
+    prompt["36"]["inputs"]["image"] = comfyui_uploaded_image_name # Input Image name as known by ComfyUI
 
-    # # 設置 seed 為 -1（隨機種子）
-    # prompt["166"]["inputs"]["seed"] = random.randint(1, 1000000000)
+    # 設置 seed 為 -1（隨機種子）
+    prompt["25"]["inputs"]["noise_seed"] = random.randint(1, 1000000000)
 
     # 連接 WebSocket
     ws = websocket.WebSocket()
