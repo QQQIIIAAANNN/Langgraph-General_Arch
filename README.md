@@ -59,8 +59,9 @@
 
 4.  **其他安裝**:
     -   如果要完整啟用多代理的服務，建議還需額外安裝ComfyUI、Rhino mcp、Pinterest mcp、OSM mcp等工具。
-    -   MCP等工具包已經在src/mcp內。安裝與啟動建議按照相關教學進行。
+    -   ComfyUI需要安裝依賴的模型:flux1-dev.safetensors、flux-depth-controlnet-v3.safetensors、t5xxl_fp16.safetensors、clip_l.safetensors、ae.safetensors。
     -   ComfyUI: https://github.com/comfyanonymous/ComfyUI
+    -   MCP等工具包已經在src/mcp內。安裝與啟動建議按照相關教學進行。
     -   Rhino mcp: https://github.com/SerjoschDuering/rhino-mcp
     -   OSM mcp: https://github.com/jagan-shanmugam/open-streetmap-mcp
     -   Pinterest mcp: https://github.com/terryso/mcp-pinterest  
