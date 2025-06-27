@@ -38,7 +38,7 @@
   "58": {
     "inputs": {
       "model": [
-        "63",
+        "80",
         0
       ],
       "conditioning": [
@@ -93,7 +93,7 @@
   },
   "63": {
     "inputs": {
-      "unet_name": "flux1-dev.safetensors",
+      "unet_name": "flux1-dev-fp8.safetensors",
       "weight_dtype": "fp8_e4m3fn"
     },
     "class_type": "UNETLoader",
@@ -129,7 +129,7 @@
       "steps": 25,
       "denoise": 1,
       "model": [
-        "63",
+        "80",
         0
       ]
     },
@@ -140,7 +140,7 @@
   },
   "69": {
     "inputs": {
-      "noise_seed": 302671778507907
+      "noise_seed": 265631675858788
     },
     "class_type": "RandomNoise",
     "_meta": {
@@ -150,7 +150,7 @@
   "80": {
     "inputs": {
       "lora_name": "FLUX\\timber-pavilion-000012.safetensors",
-      "strength_model": 0,
+      "strength_model": 1.2000000000000002,
       "strength_clip": 1.0000000000000002,
       "model": [
         "63",
@@ -184,7 +184,7 @@
   },
   "86": {
     "inputs": {
-      "value": "exterior, 1 building, overall building, "
+      "value": "timbercurve,1 building, overall building"
     },
     "class_type": "easy string",
     "_meta": {
@@ -193,7 +193,7 @@
   },
   "87": {
     "inputs": {
-      "value": "Futuristic elderly care center, modular circular forms, seamless integration of natural light and greenery, curved surfaces from sustainable wood, dual-curved facade enhancing stability, efficient ventilation, open courtyards, translucent materials creating soft night glow, harmonious outdoor spaces, accessible pathways, promoting community interaction."
+      "value": "Aerial view of a three-story memorial tower and observation deck located in Tainan City, featuring elegant curved forms and modern aesthetics. The building is constructed primarily from CLT (cross-laminated timber), showcasing clear structural segmentation and sustainability. The design emphasizes natural ventilation and lighting, harmoniously blending with the surrounding environment. The exterior features fluid surfaces and geometric segmentation, creating visual depth from various angles. The dynamic roof garden and vertical green walls enhance ecological interaction. The structure stands elevated to prevent moisture ingress. Overall, the building presents a photorealistic, high-quality architectural rendering with a focus on sustainability and artistic value. 8K, detailed, best quality, architectural rendering"
     },
     "class_type": "easy string",
     "_meta": {

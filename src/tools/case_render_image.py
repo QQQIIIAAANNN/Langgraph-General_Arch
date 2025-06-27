@@ -93,8 +93,8 @@ def case_render_image(outer_prompt: str, i: int, strength:str) -> str:
     for iteration in range(1, i + 1):
         prompt["87"]["inputs"]["value"] = outer_prompt
         prompt["69"]["inputs"]["noise_seed"] = random.randint(1, 1000000000)
-        # prompt["80"]["inputs"]["strength_model"] = strength if strength else 0
-        prompt["80"]["inputs"]["strength_model"] = 0
+        prompt["80"]["inputs"]["strength_model"] = strength if strength else 1
+        # prompt["80"]["inputs"]["strength_model"] = 0
 
         ws = websocket.WebSocket()
         ws.connect(f"ws://{server_address}/ws?clientId={client_id}")

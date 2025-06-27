@@ -821,7 +821,7 @@ def _prepare_gemini_compatible_tools(mcp_tools: List[BaseTool]) -> List[Union[Ba
 # 圖節點 (Graph Nodes)
 # =============================================================================
 
-RPM_DELAY = 6.5 # 比 6 秒稍長一點，留點餘裕
+RPM_DELAY = 0.5 # 比 6 秒稍長一點，留點餘裕
 
 # --- Router Node (MODIFIED to handle pinterest) ---
 async def route_mcp_target(state: MCPAgentState, config: RunnableConfig) -> Dict:
